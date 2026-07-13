@@ -1,7 +1,7 @@
-"""Voice Companion backend — Step 1 skeleton.
+"""Voice Companion backend — Step 2: mode router.
 
-POST /chat accepts transcript + mode + user_id, calls Claude, returns spoken text.
-Author Mode is hardcoded here; modes/ scaffolding exists but is not wired yet.
+POST /chat accepts transcript + mode + user_id, loads the matching system
+prompt from MODE_REGISTRY, calls Claude, and returns spoken text.
 """
 import os
 from datetime import date, datetime
@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from modes.author.prompt import SYSTEM_PROMPT as AUTHOR_PROMPT
+from modes.health.prompt import SYSTEM_PROMPT as HEALTH_PROMPT
+from modes.jarvis.prompt import SYSTEM_PROMPT as JARVIS_PROMPT
+
 load_dotenv()
 
 app = FastAPI(title="Lifesight Backend")
@@ -18,24 +22,11 @@ client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-# Step 1: hardcoded Author Mode prompt. Next step: import from modes/.
-AUTHOR_SYSTEM_PROMPT = """You are Olivia, a voice-first writing assistant in Author Mode. \
-You help a visually impaired author work on their manuscript.
-
-Your replies are shown on screen AND read aloud. Write for the ear: short sentences, \
-plain text only, no markdown, bullets, headers, or emoji.
-
-Workflow:
-- CHECK: summarize or review manuscript sections the user asks about.
-- WRITE: compose prose from the user's dictation in their voice.
-- READ BACK: after any write, read back exactly what was added for verification.
-
-Hard rules:
-- Never invent manuscript content.
-- Writes require confirmation before committing.
-- Keep spoken summaries short."""
-
-SUPPORTED_MODES = {"author"}
+MODE_REGISTRY = {
+    "author": AUTHOR_PROMPT,
+    "health": HEALTH_PROMPT,
+    "jarvis": JARVIS_PROMPT,
+}
 
 
 class ChatRequest(BaseModel):
@@ -49,31 +40,41 @@ class ChatResponse(BaseModel):
     mode: str
 
 
+def _build_system_prompt(mode: str) -> str:
+    today = date.today().isoformat()
+    now_local = datetime.now().strftime("%A %B %d, %Y at %I:%M %p").replace(" 0", " ")
+    return (
+        f"{MODE_REGISTRY[mode]}\n\n"
+        f"Today's date is {today}. Current local time: {now_local}."
+    )
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
+@app.get("/modes")
+def modes():
+    return {"modes": sorted(MODE_REGISTRY)}
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
-
     mode = req.mode.lower().strip()
-    if mode not in SUPPORTED_MODES:
+    if mode not in MODE_REGISTRY:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported mode '{mode}'. Supported: {sorted(SUPPORTED_MODES)}",
+            detail=f"Unsupported mode '{mode}'. Valid modes: {sorted(MODE_REGISTRY)}",
         )
 
-    today = date.today().isoformat()
-    now_local = datetime.now().strftime("%A %B %d, %Y at %I:%M %p").replace(" 0", " ")
-    system = f"{AUTHOR_SYSTEM_PROMPT}\n\nToday's date is {today}. Current local time: {now_local}."
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
 
     message = client.messages.create(
         model=MODEL,
         max_tokens=1024,
-        system=system,
+        system=_build_system_prompt(mode),
         messages=[{"role": "user", "content": req.transcript}],
     )
 
