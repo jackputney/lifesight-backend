@@ -1,0 +1,38 @@
+Health Plan Reference
+=====================
+
+Source: uploaded by a sighted helper (not AI-generated).
+Health Mode compares all logs factually against this document.
+Never invent thresholds — only cite what appears below.
+
+---
+
+DEXA / Body Composition
+-----------------------
+[Populate from uploaded DEXA scan results and targets]
+
+Supplement Protocol
+-------------------
+[Populate from uploaded supplement schedule]
+
+Training Protocol
+-----------------
+[Populate from uploaded workout plan]
+
+Diet / Nutrition
+----------------
+[Populate from uploaded meal plan and macro targets]
+
+Hydration
+---------
+[Populate daily water target if specified in plan]
+
+Weigh-in Schedule
+-----------------
+[Populate scheduled weigh-in days/times if specified]
+
+---
+
+Note: Replace the bracketed sections above with the real protocol document.
+The full plan should be transcribed here by a sighted helper from the
+original DEXA/protocol docs on file.
