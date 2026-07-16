@@ -1,9 +1,12 @@
-"""Voice Companion backend — Step 2: mode router.
+"""Voice Companion backend — Step 3: conversation memory + Confirm Gate scaffolding.
 
-POST /chat accepts transcript + mode + user_id, loads the matching system
-prompt from MODE_REGISTRY, calls Claude, and returns spoken text.
+POST /chat routes by mode (see MODE_REGISTRY), keeps multi-turn history per
+conversation_id, and returns a pending_action slot for the Confirm Gate.
+POST /confirm resolves a pending_action by id. Storage is in-memory and does
+not survive a restart — see CONVERSATIONS and PENDING_ACTIONS below.
 """
 import os
+import uuid
 from datetime import date, datetime
 
 import anthropic
@@ -28,16 +31,37 @@ MODE_REGISTRY = {
     "jarvis": JARVIS_PROMPT,
 }
 
+# In-memory only — resets on every restart. Fine for local dev; a durable store
+# (Postgres, per the target architecture) is a separate, flagged change.
+CONVERSATIONS: dict[str, list[dict]] = {}
+PENDING_ACTIONS: dict[str, dict] = {}
+
 
 class ChatRequest(BaseModel):
     transcript: str = Field(..., min_length=1)
     mode: str = "author"
-    user_id: str = "default"
+    conversation_id: str | None = None
+
+
+class PendingAction(BaseModel):
+    action_id: str
+    description: str
 
 
 class ChatResponse(BaseModel):
-    response: str
+    reply: str
     mode: str
+    conversation_id: str
+    pending_action: PendingAction | None = None
+
+
+class ConfirmRequest(BaseModel):
+    action_id: str
+    approved: bool
+
+
+class ConfirmResponse(BaseModel):
+    result: str
 
 
 def _build_system_prompt(mode: str) -> str:
@@ -71,15 +95,50 @@ def chat(req: ChatRequest):
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
 
+    conversation_id = req.conversation_id or str(uuid.uuid4())
+    history = CONVERSATIONS.setdefault(conversation_id, [])
+    history.append({"role": "user", "content": req.transcript})
+
     message = client.messages.create(
         model=MODEL,
         max_tokens=1024,
         system=_build_system_prompt(mode),
-        messages=[{"role": "user", "content": req.transcript}],
+        messages=history,
     )
 
     text_blocks = [block.text for block in message.content if block.type == "text"]
     if not text_blocks:
         raise HTTPException(status_code=502, detail="Model returned no text")
 
-    return ChatResponse(response=text_blocks[0].strip(), mode=mode)
+    reply = text_blocks[0].strip()
+    history.append({"role": "assistant", "content": reply})
+
+    # No tool-calling is wired up yet (see README), so no code path constructs a
+    # pending_action today. The field is real, not a placeholder — it stays null
+    # until a mode actually proposes an irreversible action.
+    return ChatResponse(
+        reply=reply,
+        mode=mode,
+        conversation_id=conversation_id,
+        pending_action=None,
+    )
+
+
+@app.post("/confirm", response_model=ConfirmResponse)
+def confirm(req: ConfirmRequest):
+    action = PENDING_ACTIONS.pop(req.action_id, None)
+    if action is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No pending action with id '{req.action_id}'",
+        )
+
+    if not req.approved:
+        return ConfirmResponse(result="Cancelled. Nothing was sent or created.")
+
+    # No tool executor is wired up yet — there is currently nothing in
+    # PENDING_ACTIONS to confirm in practice. This path is real and will execute
+    # the actual action once a mode starts populating pending_action in /chat.
+    return ConfirmResponse(
+        result="Confirmed, but no tool executor is wired up yet — nothing was actually sent."
+    )
