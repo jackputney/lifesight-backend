@@ -1,0 +1,65 @@
+---
+alwaysApply: true
+---
+# LIFESIGHT Backend — Core Rules
+
+## Stack
+- Python 3.11+, FastAPI, anthropic==0.42.0, httpx==0.28.1, Pydantic 2.x.
+- Runs locally at localhost:8000 in dev. Deployed on Railway with Postgres in production.
+- Do not bump anthropic/httpx versions without checking compatibility first — these are
+  pinned because past mismatches broke the client (`unexpected keyword argument 'proxies'`).
+
+## Architecture (do not violate)
+- The iOS app talks to exactly ONE thing: this backend. Never suggest the client call
+  Claude or Google APIs directly.
+- All external tokens (Claude, Google) live server-side in env vars only. Never on device,
+  never in code, never logged.
+- The Confirm Gate is a distinct component in front of EVERY irreversible action (send
+  email, write manuscript, save health log). It returns a pending state that needs a
+  second explicit `/confirm` call. Never fold it into the tool executor or skip it for
+  "obviously safe" actions.
+- Modes are preset only: `{ name, system_prompt }` via `MODE_REGISTRY` in `main.py`. Tool
+  sets are pre-built per mode, never assigned dynamically from user voice input.
+- See `.cursor/rules/10-api-contract.mdc` for the exact request/response shapes — they
+  are frozen and shared with the iOS client. Any shape change is a cross-repo breaking
+  change, not a local refactor.
+
+## Hard security rules
+- NEVER put real personal data (names, health numbers, doc IDs, tokens) in code,
+  comments, or commits. Env vars + DB only. This repo is public.
+- NEVER hardcode secrets or API keys. Read from environment via `os.environ`.
+- Verify any new package actually exists on PyPI before adding it to requirements.txt,
+  and state the exact version you're pinning.
+- The user is visually impaired and interacts hands-free — he cannot glance at a screen
+  to catch a mistake. The Confirm Gate is his only safety check for irreversible actions.
+  Treat any code path that bypasses it as a critical bug.
+
+## Behavior
+- Be concise. Don't explain standard patterns unless asked.
+- Zero placeholders: fully implement every function, or explicitly say what's not
+  implemented yet and why (e.g. in the README's "not yet here" list) — never leave a
+  `# TODO: implement` or `pass  # rest of code here` that looks finished but isn't.
+- If a requested change matches existing code exactly, say "no changes needed" instead
+  of rewriting it.
+- If you find a security issue while working on something else, STOP and report it
+  before continuing with the original task.
+- NEVER commit or delete `.env`, `credentials.json`, `token.json`, or other config/secret
+  files without explicit confirmation first.
+- NEVER push directly to `main` on a destructive rewrite (force-push, history rewrite)
+  without explicit confirmation.
+
+## Escalation protocol — raise your hand instead of guessing
+Before implementing, if ANY of these are true, STOP and say "ESCALATE: <reason>" and
+wait for confirmation — do not write code yet:
+- The change touches auth, tokens, the Confirm Gate, or deletes/migrates data.
+- The change spans 3+ files or crosses the backend/iOS repo boundary.
+- You're less than 80% confident in the approach, or there are multiple valid designs
+  with real tradeoffs.
+- You'd have to guess at a requirement, an API contract detail, or existing behavior
+  instead of reading it from the repo or asking.
+- You notice a security risk, a race condition, or shared mutable state that isn't
+  already called out as a known limitation.
+
+When you escalate, give: (1) the tradeoffs, (2) what you'd need to proceed, (3) whether
+this warrants more careful review before continuing. Never fake confidence — "I'm not
+sure" is a valid and preferred answer over guessing on something security-sensitive.

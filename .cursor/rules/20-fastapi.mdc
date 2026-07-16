@@ -1,0 +1,31 @@
+---
+globs: "**/*.py"
+---
+# FastAPI / Python style — this repo
+
+## Patterns to follow
+- Every request and response body is a Pydantic `BaseModel` with explicit field types —
+  never accept or return a raw `dict`.
+- Route handlers raise `fastapi.HTTPException` with a specific `status_code` and a plain-
+  English `detail` string. Validate inputs and fail with 400/404 before doing any work.
+- Prefer small, pure helper functions (like `_build_system_prompt`) over inlining logic
+  in the route handler — keeps handlers readable and testable.
+- Module-level state (like `MODE_REGISTRY`, `CONVERSATIONS`, `PENDING_ACTIONS`) is fine
+  for this single-process local/dev setup, but name it in ALL_CAPS and comment that it's
+  in-memory and non-persistent, so it's never mistaken for durable storage.
+- When adding a dependency that reads per-request identity (e.g. a future
+  `get_current_user_id`), use FastAPI's `Depends()` — don't thread auth state through
+  function arguments manually.
+- Match the existing docstring style: a one-line module docstring at the top of each
+  file explaining what it does and any non-obvious constraint.
+
+## Avoid
+- No bare `except:` — catch specific exceptions, or let them propagate with FastAPI's
+  default error handling.
+- No `print()` for debugging — remove it before considering a change done, or use
+  `logging` if it needs to stay.
+- Don't reach for a database, queue, or persistence layer that isn't already in the repo
+  without flagging it first (see escalation protocol in `00-core.mdc`) — this project
+  deliberately stays in-memory/local until a real persistence need is confirmed.
+- Don't add response fields that aren't in `10-api-contract.mdc` — the iOS client's
+  JSON decoding is strict about the shapes it expects.

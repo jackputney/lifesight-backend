@@ -1,0 +1,70 @@
+---
+alwaysApply: true
+---
+# Frozen API Contract — build to these shapes exactly
+
+This contract is shared with the iOS client (`lifesight-ios`, `LifesightAPI.swift`).
+Changing a shape here is a cross-repo breaking change — flag it (see the escalation
+protocol in `00-core.mdc`) instead of changing it unilaterally.
+
+## POST /chat
+Request:
+```json
+{
+  "transcript": "schedule a call with Sam tomorrow at 2pm",
+  "mode": "jarvis",
+  "conversation_id": "abc123"
+}
+```
+`mode` is one of `"author" | "health" | "jarvis"`. `conversation_id` is `null` on the
+first message of a session.
+
+Response:
+```json
+{
+  "reply": "I've drafted that invite. Want me to send it?",
+  "mode": "jarvis",
+  "conversation_id": "abc123",
+  "pending_action": {
+    "action_id": "act_789",
+    "description": "Create calendar invite: Call with Sam, tomorrow 2:00 PM"
+  }
+}
+```
+`conversation_id` is server-generated if the request's was `null`. `pending_action` is
+`null` unless something needs confirmation. `pending_action.description` is READ ALOUD
+to the user — write it as a natural spoken sentence, not a debug string or raw data dump.
+
+## POST /confirm
+Request: `{ "action_id": "act_789", "approved": true }`
+Response: `{ "result": "Invite sent to Sam." }`
+
+`approved: false` discards the pending action entirely and must not execute anything.
+
+## GET /modes
+Response: `{ "modes": ["author", "health", "jarvis"] }`
+
+## GET /health
+Response: `{ "status": "ok" }`
+
+## Auth (not yet implemented)
+The contract's target shape includes `Authorization: Bearer <token>` on every request.
+This is NOT implemented yet — it depends on an outstanding auth-provider decision
+(Supabase vs in-house). Do not add auth checks speculatively; when the decision is made,
+that's a dedicated, flagged change, not something to bundle into an unrelated feature.
+
+## The one hard rule for Jarvis Mode (and any future irreversible action)
+Anything irreversible — sending an email, creating/modifying a calendar event, writing
+health logs, writing the manuscript — must NEVER happen on the first `/chat` pass:
+1. `/chat` drafts the action but does NOT execute it.
+2. Response includes `pending_action` with a human-readable, speakable description.
+3. The app shows/speaks a confirm screen.
+4. Only when `/confirm` arrives with `approved: true` does the action execute.
+5. If a connection drops mid-action, the next reply must say explicitly whether
+   anything was actually sent or created — never leave it ambiguous.
+
+## Conversation memory
+`conversation_id` ties multi-turn exchanges together. The backend stores history keyed
+by this id (in-memory for now — see `main.py` `CONVERSATIONS`, not yet persisted across
+restarts). The app sends `null` to start fresh (e.g. switching modes) and echoes back
+whatever id the server returns on every subsequent message.
