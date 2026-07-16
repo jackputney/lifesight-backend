@@ -4,6 +4,9 @@ POST /chat routes by mode (see MODE_REGISTRY), keeps multi-turn history per
 conversation_id, and returns a pending_action slot for the Confirm Gate.
 POST /confirm resolves a pending_action by id. Storage is in-memory and does
 not survive a restart — see CONVERSATIONS and PENDING_ACTIONS below.
+
+CORS is wide open (allow_origins=["*"]) for local dev so the iOS Simulator
+can reach localhost:8000 — tighten this before deploying anywhere public.
 """
 import os
 import uuid
@@ -12,6 +15,7 @@ from datetime import date, datetime
 import anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from modes.author.prompt import SYSTEM_PROMPT as AUTHOR_PROMPT
@@ -21,6 +25,16 @@ from modes.jarvis.prompt import SYSTEM_PROMPT as JARVIS_PROMPT
 load_dotenv()
 
 app = FastAPI(title="Lifesight Backend")
+
+# Wide open for local dev only (Simulator/browser calls from any origin). Lock
+# this down to the real app's origin(s) before deploying anywhere public.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
