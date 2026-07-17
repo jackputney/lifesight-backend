@@ -1,7 +1,11 @@
-# LifeSite — Architecture & Decisions
+# LifeSight — Architecture & Decisions
+
+**Naming (settled):** the product is **LifeSight**; the AI agent/voice persona is
+**Olivia**. "author" / "health" / "jarvis" are internal mode keys — `jarvis`
+stays the key for the executive-assistant area (Jack's existing identifier).
 
 Voice-first assistant for a near-blind primary user. Three modes share one
-FastAPI backend and one "Olivia" voice identity: **author** (manuscript in
+FastAPI backend and one **Olivia** voice identity: **author** (manuscript in
 Google Docs), **health** (log against a plan), **jarvis** (calendar/email).
 Accessibility (VoiceOver, spoken confirmation) is the dominating constraint
 everywhere, not just in Jarvis.
@@ -53,7 +57,7 @@ per-mode toolsets. Do not rewrite `confirm_match.py` / `spoken_readback.py`.
 - [ ] Real Supabase JWT verification (flip `AUTH_MODE=real`) + iOS Apple flow.
 - [ ] Port the shared confirm-gate + agent loop + Jarvis tools.
 
-## Open item
-**Naming.** `lifesight-backend` / `lifesign-IOS` / persona "Olivia" /
-"LifeSite"/"Jarvis" are all in play. Settle ONE canonical name with Jack before
-it bakes into bundle IDs, API namespaces, and the `source_mode='jarvis'` enum.
+## Build order
+The shared confirm-gate (`confirm_match.py` + `spoken_readback.py` +
+`pending_actions`) is sequenced **ahead of** per-mode tools, since all three
+modes depend on it — rather than building it per-mode later.
