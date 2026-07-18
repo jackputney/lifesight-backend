@@ -47,11 +47,32 @@ Response: `{ "modes": ["author", "health", "jarvis"] }`
 ## GET /health
 Response: `{ "status": "ok" }`
 
-## Auth (not yet implemented)
-The contract's target shape includes `Authorization: Bearer <token>` on every request.
-This is NOT implemented yet — it depends on an outstanding auth-provider decision
-(Supabase vs in-house). Do not add auth checks speculatively; when the decision is made,
-that's a dedicated, flagged change, not something to bundle into an unrelated feature.
+## GET /me
+Response: `{ "user_id": "<uuid>" }` — resolved identity for the current auth token.
+
+## POST /devices, GET /devices, DELETE /devices/{device_id}
+Push-notification target registration, one row per device per user.
+- `POST /devices` request: `{ "device_id": str, "push_token": str|null, "platform": "ios"|"android"|"web" }`
+  → returns the stored `DeviceOut` row (`device_id, user_id, push_token, platform, last_seen`).
+- `GET /devices` → `list[DeviceOut]` for the current user.
+- `DELETE /devices/{device_id}` → `204` on success, `404` if not found for this user.
+
+## Auth — implemented, dev mode by default
+Every request (`/chat`, `/confirm`, `/me`, `/devices/*`) resolves identity via
+`Authorization: Bearer <token>` through `Depends(get_current_user_id)` in
+`shared/auth.py`. Decision is frozen (see `CONTEXT.md`): **Supabase Auth + Sign in
+with Apple** — no typed password, no CAPTCHA (the accessible path for a near-blind
+user). Supabase issues an HS256 JWT whose `sub` claim is the `auth.users(id)` UUID.
+- `AUTH_MODE=dev` (default): any Bearer token, or none at all, resolves to a fixed
+  dev UUID. This is what local/CI testing runs against.
+- `AUTH_MODE=real`: verifies the Supabase JWT signature, audience, and expiry.
+  Requires `SUPABASE_JWT_SECRET` in the environment. Not yet tested against a live
+  Supabase project.
+- Never decode or inspect tokens outside `shared/auth.py` — every route depends on
+  `get_current_user_id` and nothing else touches the header. The dev/real swap must
+  stay confined to that one file.
+- The iOS client must never assert its own `user_id` in a request body — identity is
+  always derived from the token server-side.
 
 ## The one hard rule for Jarvis Mode (and any future irreversible action)
 Anything irreversible — sending an email, creating/modifying a calendar event, writing

@@ -17,10 +17,14 @@ Full detail lives in `.cursor/rules/10-api-contract.mdc` in this repo. Summary:
 
 - `POST /chat {transcript, mode, conversation_id}` → `{reply, mode, conversation_id, pending_action}`
 - `POST /confirm {action_id, approved}` → `{result}`
+- `GET /me` → `{user_id}`
+- `POST /devices`, `GET /devices`, `DELETE /devices/{device_id}` — push-token registration
 - `GET /modes` → `{modes: [...]}`
 - `GET /health` → `{status: "ok"}`
-- Auth (`Authorization: Bearer <token>`) is planned but NOT yet implemented — an open
-  decision, not an oversight.
+- Auth: `Authorization: Bearer <token>` on every request, resolved via
+  `Depends(get_current_user_id)` (`shared/auth.py`). `AUTH_MODE=dev` (default) always
+  resolves to a fixed dev UUID; `AUTH_MODE=real` verifies a Supabase JWT. Frozen decision:
+  Supabase Auth + Sign in with Apple, no password — see `CONTEXT.md`.
 
 ## The Confirm Gate — non-negotiable
 The user cannot glance at a screen to catch a mistake. Every irreversible action (send

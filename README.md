@@ -1,18 +1,30 @@
-# Lifesight Backend — Step 3: Conversation Memory + Confirm Gate Scaffolding
+# Lifesight Backend — Auth, Devices, Conversation Memory & Confirm Gate
 
-Builds on Step 2. `/chat` now takes a `conversation_id` and keeps multi-turn
-history per conversation (in-memory, `CONVERSATIONS` in `main.py`) — the
-model sees prior turns instead of treating every message as brand new. The
-response shape also matches the frozen API contract shared with the iOS
-app (see `.cursor/rules/10-api-contract.mdc` and `AGENTS.md`): the reply
-field is now `reply` (was `response`), and every response includes
-`conversation_id` and a `pending_action` slot.
+Every route now resolves identity via `Depends(get_current_user_id)`
+(`shared/auth.py`) instead of trusting a client-supplied `user_id`. Auth is
+stubbed: `AUTH_MODE=dev` (the default) resolves every request to a fixed dev
+UUID; `AUTH_MODE=real` verifies a Supabase-issued JWT. Swapping modes touches
+only `shared/auth.py` — see that file and `CONTEXT.md` for the frozen auth
+decision (Supabase + Sign in with Apple).
 
-A new `POST /confirm` endpoint resolves a pending action by id — this is
-the Confirm Gate's second half. No mode populates `pending_action` yet
-(no tool-calling is wired up), so it's always `null` today; the endpoint
-and data shape exist and work, they just have nothing to confirm until a
-mode actually proposes an irreversible action.
+On top of that: `/chat` takes a `conversation_id` and keeps multi-turn history
+per conversation (in-memory, `CONVERSATIONS` in `main.py`, scoped to the
+requesting user). Response shape matches the frozen API contract shared with
+the iOS app (`.cursor/rules/10-api-contract.mdc`, `AGENTS.md`): `reply`,
+`conversation_id`, and a `pending_action` slot. `POST /confirm` resolves a
+pending action by id — the Confirm Gate's second half. No mode populates
+`pending_action` yet (no tool-calling is wired up), so it's always `null`
+today; the shapes exist and work; `main.py`'s in-memory `PENDING_ACTIONS`
+mirrors the `pending_actions` table shape (status, expiry, payload) drafted
+in `migrations/002_core_schema.sql`, so wiring it to Postgres later won't
+change route signatures.
+
+`/me` returns resolved identity. `/devices` (register/list/delete) upserts
+push-notification targets per user — in-memory stub backed by
+`migrations/001_users_devices.sql`, same swap-later pattern as conversations.
+
+See `CONTEXT.md` for the full set of frozen architecture decisions (auth,
+Confirm Gate, sync policy for health logs vs. the manuscript).
 
 ## Setup (run once)
 
@@ -40,7 +52,8 @@ mode actually proposes an irreversible action.
 
    Then open `.env` and replace the placeholder with your real Anthropic
    API key (starts with `sk-ant-...`). Get one from [console.anthropic.com](https://console.anthropic.com)
-   if you don't have one yet.
+   if you don't have one yet. Leave `AUTH_MODE` unset (defaults to `dev`) unless
+   you're specifically testing real Supabase JWT verification.
 
 4. Load the `.env` file before running (FastAPI doesn't do this
    automatically) — the easiest way is to export it in your shell:
@@ -66,6 +79,13 @@ Uvicorn running on http://127.0.0.1:8000
 ## Test it
 
 In a second terminal window, with the server still running:
+
+```bash
+curl -s http://localhost:8000/me | python3 -m json.tool
+```
+
+In dev mode (default), every request resolves to the same fixed dev UUID —
+this confirms the auth plumbing works end to end without a real token.
 
 ```bash
 curl -X POST http://localhost:8000/chat \
@@ -130,6 +150,16 @@ curl -X POST http://localhost:8000/confirm \
 Should return a 404 — there's nothing to confirm yet since no mode creates
 pending actions.
 
+Try registering and listing a device:
+
+```bash
+curl -s -X POST http://localhost:8000/devices \
+  -H "Content-Type: application/json" \
+  -d '{"device_id": "test-device-1", "platform": "ios"}' | python3 -m json.tool
+
+curl -s http://localhost:8000/devices | python3 -m json.tool
+```
+
 Also try:
 
 ```bash
@@ -142,19 +172,24 @@ Should return: `{"status":"ok"}` and `{"modes":["author","health","jarvis"]}`
 ## Project layout
 
 ```
-main.py                  # /chat + /confirm, MODE_REGISTRY, in-memory state
-requirements.txt
-requirements-dev.txt     # + pre-commit, detect-secrets
-shared/identity.py       # Olivia shared preamble
+main.py                    # /chat, /confirm, /me, /devices, MODE_REGISTRY, in-memory state
+shared/auth.py              # get_current_user_id (AUTH_MODE=dev|real)
+shared/identity.py          # Olivia shared preamble
 modes/
-  author/prompt.py       # check / write / read-back
-  health/prompt.py       # logs against plan
-  jarvis/prompt.py       # Oliver's area, confirm-gate rules
+  author/prompt.py          # check / write / read-back
+  health/prompt.py          # logs against plan
+  jarvis/prompt.py          # Oliver's area, confirm-gate rules
+migrations/
+  001_users_devices.sql     # users + devices (drafted, not yet run against a DB)
+  002_core_schema.sql        # conversations, pending_actions, health, writing, etc.
 docs/
   health-plan-reference.txt
-AGENTS.md                 # cross-repo contract, shared with lifesight-ios
-.cursor/rules/             # Cursor guardrails (architecture, contract, style)
-.pre-commit-config.yaml    # detect-secrets hook
+CONTEXT.md                  # frozen architecture decisions (auth, Confirm Gate, sync)
+AGENTS.md                   # cross-repo contract, shared with lifesight-ios
+.cursor/rules/               # Cursor guardrails (architecture, contract, style)
+.pre-commit-config.yaml      # detect-secrets hook
+requirements.txt
+requirements-dev.txt         # + pre-commit, detect-secrets
 ```
 
 ## What's NOT here yet (by design)
@@ -162,13 +197,16 @@ AGENTS.md                 # cross-repo contract, shared with lifesight-ios
 - No Google Docs reading/writing for Author Mode
 - No tool-calling in any mode, so `pending_action` is always `null` — the
   Confirm Gate's shapes exist end-to-end, but nothing populates them yet
-- No Postgres / durable storage — `CONVERSATIONS` and `PENDING_ACTIONS`
-  are in-memory dicts that reset on every server restart
+- No Postgres / durable storage — `CONVERSATIONS`, `PENDING_ACTIONS`, and
+  `_devices` are in-memory dicts that reset on every server restart, even
+  though their shapes mirror the drafted migrations
 - No Calendar/Gmail for Jarvis Mode (Oliver's area)
-- No auth (`Authorization: Bearer <token>`) — an open decision (Supabase
-  vs in-house), not an oversight; see `.cursor/rules/10-api-contract.mdc`
-- No auth/security on the endpoint itself (fine for local testing only —
-  we'll need to lock this down before deploying anywhere public)
+- `AUTH_MODE=real` (actual Supabase JWT verification) is implemented in
+  `shared/auth.py` but untested against a live Supabase project; no iOS Sign
+  in with Apple flow yet either
+- No auth/security beyond the Bearer-token check itself (fine for local
+  testing only — rate limiting, HTTPS, etc. come before deploying anywhere
+  public)
 
 ## If something goes wrong
 
@@ -181,3 +219,6 @@ AGENTS.md                 # cross-repo contract, shared with lifesight-ios
   `requirements.txt` (`pip install -r requirements.txt` again).
 - **Port 8000 already in use** → another process is using it; either stop
   it or run `uvicorn main:app --reload --port 8001` instead.
+- **401 "Missing bearer token"** → you set `AUTH_MODE=real` without sending
+  an `Authorization: Bearer <token>` header, or without `SUPABASE_JWT_SECRET`
+  configured. Unset `AUTH_MODE` (or set it to `dev`) for local testing.
