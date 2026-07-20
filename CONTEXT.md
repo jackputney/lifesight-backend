@@ -52,8 +52,10 @@ per-mode toolsets. Do not rewrite `confirm_match.py` / `spoken_readback.py`.
 - [x] Auth injection (`shared/auth.py`), `/me`, `/devices` wired into the mode
       router; `user_id` removed from `/chat` body (identity from token).
 - [x] Migrations `001_users_devices.sql` (Supabase), `002_core_schema.sql`
-      (full schema above). **Drafted — not yet run against a database.**
-- [ ] Wire devices/DB to Postgres (asyncpg), replace in-memory `_devices` stub.
+      (full schema above), applied by `scripts/run_migrations.py`.
+- [x] Postgres wired (asyncpg, `shared/db.py`): conversations/messages,
+      pending-action resolution, and devices are DB-backed; in-memory dicts
+      removed. `DATABASE_URL` is now required to start the server.
 - [ ] Real Supabase JWT verification (flip `AUTH_MODE=real`) + iOS Apple flow.
 - [ ] Port the shared confirm-gate + agent loop + Jarvis tools.
 

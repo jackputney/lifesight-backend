@@ -55,6 +55,23 @@ Confirm Gate, sync policy for health logs vs. the manuscript).
    if you don't have one yet. Leave `AUTH_MODE` unset (defaults to `dev`) unless
    you're specifically testing real Supabase JWT verification.
 
+   Also set `DATABASE_URL` — the server won't start without it. Get it from
+   the Supabase dashboard: **Connect** (top of the project page) → **Connection
+   string** → copy the **Session pooler** URI (the direct connection is
+   IPv6-only, which most home networks can't reach) and swap in your database
+   password.
+
+3b. Create the database tables (run once per Supabase project, and again any
+   time a new migration file lands):
+
+   ```bash
+   python scripts/run_migrations.py --seed-dev-user
+   ```
+
+   `--seed-dev-user` inserts the fixed `AUTH_MODE=dev` UUID into `auth.users`
+   so foreign keys resolve during local dev. Skip that flag on a production
+   project — there, real rows come from Sign in with Apple.
+
 4. Load the `.env` file before running (FastAPI doesn't do this
    automatically) — the easiest way is to export it in your shell:
 
@@ -172,9 +189,11 @@ Should return: `{"status":"ok"}` and `{"modes":["author","health","jarvis"]}`
 ## Project layout
 
 ```
-main.py                    # /chat, /confirm, /me, /devices, MODE_REGISTRY, in-memory state
+main.py                    # /chat, /confirm, /me, /devices, MODE_REGISTRY
 shared/auth.py              # get_current_user_id (AUTH_MODE=dev|real)
+shared/db.py                # asyncpg pool + every SQL query (routes never touch SQL)
 shared/identity.py          # Olivia shared preamble
+scripts/run_migrations.py   # applies migrations/*.sql to DATABASE_URL
 modes/
   author/prompt.py          # check / write / read-back
   health/prompt.py          # logs against plan
@@ -196,10 +215,8 @@ requirements-dev.txt         # + pre-commit, detect-secrets
 
 - No Google Docs reading/writing for Author Mode
 - No tool-calling in any mode, so `pending_action` is always `null` — the
-  Confirm Gate's shapes exist end-to-end, but nothing populates them yet
-- No Postgres / durable storage — `CONVERSATIONS`, `PENDING_ACTIONS`, and
-  `_devices` are in-memory dicts that reset on every server restart, even
-  though their shapes mirror the drafted migrations
+  Confirm Gate's shapes exist end-to-end (including its `pending_actions`
+  table), but nothing creates rows yet
 - No Calendar/Gmail for Jarvis Mode (Oliver's area)
 - `AUTH_MODE=real` (actual Supabase JWT verification) is implemented in
   `shared/auth.py` but untested against a live Supabase project; no iOS Sign

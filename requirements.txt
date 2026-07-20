@@ -5,4 +5,4 @@ python-dotenv==1.0.1
 httpx==0.28.1
 pydantic==2.10.4
 pyjwt==2.10.1              # real-mode Supabase JWT verification (shared/auth.py)
-# asyncpg==0.30.0         # add when the devices/DB layer is wired to Postgres
+asyncpg==0.30.0            # Postgres storage layer (shared/db.py)

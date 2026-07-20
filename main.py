@@ -13,17 +13,19 @@ POST /confirm resolves a pending action by id (the Confirm Gate's second
 half). No mode populates pending_action yet (no tool-calling is wired up),
 so it's always null in /chat responses today.
 
-Storage (CONVERSATIONS, PENDING_ACTIONS, _devices) is in-memory and does not
-survive a restart. Field shapes mirror the Postgres tables drafted in
-migrations/002_core_schema.sql (conversations/messages, pending_actions) so
-swapping to real DB calls later touches storage only, not route signatures —
-same pattern _devices already uses for migrations/001_users_devices.sql.
+Storage is Postgres via shared/db.py (asyncpg), backed by migrations
+001_users_devices.sql and 002_core_schema.sql run against a Supabase
+project. DATABASE_URL must be set; startup fails fast with a readable
+error otherwise. Routes never touch SQL — they call shared.db functions,
+same pattern shared/auth.py uses for identity.
 
 CORS is wide open (allow_origins=["*"]) for local dev so the iOS Simulator
 can reach localhost:8000 — tighten this before deploying anywhere public.
 """
+import asyncio
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from typing import Optional
 from uuid import UUID
@@ -37,11 +39,20 @@ from pydantic import BaseModel, Field
 from modes.author.prompt import SYSTEM_PROMPT as AUTHOR_PROMPT
 from modes.health.prompt import SYSTEM_PROMPT as HEALTH_PROMPT
 from modes.jarvis.prompt import SYSTEM_PROMPT as JARVIS_PROMPT
+from shared import db
 from shared.auth import get_current_user_id
 
 load_dotenv()
 
-app = FastAPI(title="Lifesight Backend")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await db.init_pool()
+    yield
+    await db.close_pool()
+
+
+app = FastAPI(title="Lifesight Backend", lifespan=lifespan)
 
 # Wide open for local dev only (Simulator/browser calls from any origin). Lock
 # this down to the real app's origin(s) before deploying anywhere public.
@@ -61,19 +72,6 @@ MODE_REGISTRY = {
     "health": HEALTH_PROMPT,
     "jarvis": JARVIS_PROMPT,
 }
-
-# In-memory only — resets on every restart. A durable store (Postgres, per
-# migrations/002_core_schema.sql) is a separate, flagged change.
-# CONVERSATIONS mirrors conversations/messages: keyed by conversation_id,
-# scoped to the user who started it.
-CONVERSATIONS: dict[str, dict] = {}  # conversation_id -> {user_id, mode, messages}
-
-# PENDING_ACTIONS mirrors the pending_actions table shape (status, expiry,
-# payload) even though nothing populates it yet — see ChatResponse note below.
-PENDING_ACTIONS: dict[str, dict] = {}  # action_id -> pending_actions-shaped row
-
-_devices: dict[tuple[str, str], dict] = {}  # (user_id, device_id) -> row
-
 
 class ChatRequest(BaseModel):
     transcript: str = Field(..., min_length=1)
@@ -154,7 +152,7 @@ async def me(user_id: str = Depends(get_current_user_id)):
 # ---------------------------------------------------------------------------
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
+async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     mode = req.mode.lower().strip()
     if mode not in MODE_REGISTRY:
         raise HTTPException(
@@ -168,20 +166,28 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     conversation_id = req.conversation_id
     if conversation_id is None:
         conversation_id = str(uuid.uuid4())
-        CONVERSATIONS[conversation_id] = {"user_id": user_id, "mode": mode, "messages": []}
+        await db.create_conversation(conversation_id, user_id, mode)
     else:
-        convo = CONVERSATIONS.get(conversation_id)
+        try:
+            uuid.UUID(conversation_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="conversation_id must be a UUID")
+        convo = await db.get_conversation(conversation_id)
         if convo is None:
-            # Client sent an id we've never seen (e.g. after a server restart) —
-            # start fresh under that id rather than erroring the user out.
-            CONVERSATIONS[conversation_id] = {"user_id": user_id, "mode": mode, "messages": []}
-        elif convo["user_id"] != user_id:
+            # Client sent an id we've never seen (e.g. minted before the DB
+            # existed) — start fresh under that id rather than erroring out.
+            await db.create_conversation(conversation_id, user_id, mode)
+        elif str(convo["user_id"]) != user_id:
             raise HTTPException(status_code=403, detail="conversation_id does not belong to this user")
 
-    history = CONVERSATIONS[conversation_id]["messages"]
+    history = await db.load_messages(conversation_id)
     history.append({"role": "user", "content": req.transcript})
+    await db.append_message(conversation_id, "user", req.transcript)
 
-    message = client.messages.create(
+    # The Anthropic SDK call is blocking; run it off the event loop so one
+    # long generation doesn't stall every other request.
+    message = await asyncio.to_thread(
+        client.messages.create,
         model=MODEL,
         max_tokens=1024,
         system=_build_system_prompt(mode),
@@ -193,7 +199,7 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
         raise HTTPException(status_code=502, detail="Model returned no text")
 
     reply = text_blocks[0].strip()
-    history.append({"role": "assistant", "content": reply})
+    await db.append_message(conversation_id, "assistant", reply)
 
     # No tool-calling is wired up yet (see README), so no code path constructs a
     # pending_action today. The field is real, not a placeholder — it stays null
@@ -207,31 +213,33 @@ def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
 
 
 @app.post("/confirm", response_model=ConfirmResponse)
-def confirm(req: ConfirmRequest, user_id: str = Depends(get_current_user_id)):
-    action = PENDING_ACTIONS.get(req.action_id)
+async def confirm(req: ConfirmRequest, user_id: str = Depends(get_current_user_id)):
+    action = await db.get_pending_action(req.action_id)
     if action is None:
         raise HTTPException(
             status_code=404,
             detail=f"No pending action with id '{req.action_id}'",
         )
-    if action["user_id"] != user_id:
+    if str(action["user_id"]) != user_id:
         raise HTTPException(status_code=403, detail="Pending action does not belong to this user")
     if action["status"] != "pending":
         raise HTTPException(status_code=409, detail=f"Pending action already {action['status']}")
     if datetime.now(timezone.utc) > action["expires_at"]:
-        action["status"] = "expired"
+        await db.resolve_pending_action(req.action_id, "expired")
         raise HTTPException(status_code=410, detail="Pending action expired before it was confirmed")
 
-    action["status"] = "confirmed" if req.approved else "rejected"
-    action["confirmed_via"] = "click"
-    action["resolved_at"] = datetime.now(timezone.utc)
+    await db.resolve_pending_action(
+        req.action_id,
+        "confirmed" if req.approved else "rejected",
+        confirmed_via="click",
+    )
 
     if not req.approved:
         return ConfirmResponse(result="Cancelled. Nothing was sent or created.")
 
     # No tool executor is wired up yet — there is currently no code path that
-    # populates PENDING_ACTIONS, so this branch has nothing real to confirm in
-    # practice. It will execute the actual action once a mode's tool-calling
+    # creates pending_actions rows, so this branch has nothing real to confirm
+    # in practice. It will execute the actual action once a mode's tool-calling
     # starts creating rows here.
     return ConfirmResponse(
         result="Confirmed, but no tool executor is wired up yet — nothing was actually sent."
@@ -241,9 +249,7 @@ def confirm(req: ConfirmRequest, user_id: str = Depends(get_current_user_id)):
 # ---------------------------------------------------------------------------
 # Devices (push-notification targets per user)
 # ---------------------------------------------------------------------------
-# In-memory stub so the API runs today. Swap _devices for real DB calls
-# (asyncpg) once the database is up — route signatures and auth wiring stay
-# identical. Backed by migrations/001_users_devices.sql.
+# Backed by the devices table (migrations/001_users_devices.sql).
 
 @app.post("/devices", response_model=DeviceOut)
 async def register_device(
@@ -252,20 +258,12 @@ async def register_device(
 ):
     """Upsert a device for the current user. Called by the mobile app on launch
     and whenever the push token rotates."""
-    row = {
-        "device_id": body.device_id,
-        "user_id": user_id,
-        "push_token": body.push_token,
-        "platform": body.platform,
-        "last_seen": datetime.now(timezone.utc),
-    }
-    _devices[(user_id, body.device_id)] = row
-    return row
+    return await db.upsert_device(user_id, body.device_id, body.push_token, body.platform)
 
 
 @app.get("/devices", response_model=list[DeviceOut])
 async def list_devices(user_id: str = Depends(get_current_user_id)):
-    return [r for (uid, _), r in _devices.items() if uid == user_id]
+    return await db.list_devices(user_id)
 
 
 @app.delete("/devices/{device_id}", status_code=204)
@@ -273,6 +271,5 @@ async def remove_device(
     device_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    if (user_id, device_id) not in _devices:
+    if not await db.delete_device(user_id, device_id):
         raise HTTPException(status_code=404, detail="Device not found")
-    del _devices[(user_id, device_id)]
