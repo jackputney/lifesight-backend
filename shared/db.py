@@ -15,6 +15,7 @@ cache. Harmless on a direct connection.
 """
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -109,6 +110,39 @@ async def append_message(conversation_id: str, role: str, content: Any) -> None:
 # Pending actions — the Confirm Gate (002: pending_actions)
 # ---------------------------------------------------------------------------
 
+async def create_pending_action(
+    user_id: str,
+    conversation_id: Optional[str],
+    source_mode: str,
+    action_type: str,
+    payload: Any,
+    description: str,
+    expires_at: datetime,
+) -> str:
+    """Insert a pending confirm-gate row; returns the new action id."""
+    row = await pool().fetchrow(
+        """
+        INSERT INTO pending_actions (
+            user_id, conversation_id, source_mode, action_type,
+            payload, description, expires_at
+        )
+        VALUES (
+            $1::uuid, $2::uuid, $3, $4,
+            $5::jsonb, $6, $7
+        )
+        RETURNING id
+        """,
+        user_id,
+        conversation_id,
+        source_mode,
+        action_type,
+        json.dumps(payload),
+        description,
+        expires_at,
+    )
+    return str(row["id"])
+
+
 async def get_pending_action(action_id: str) -> Optional[dict]:
     try:
         uuid.UUID(action_id)
@@ -135,6 +169,77 @@ async def resolve_pending_action(
         WHERE id = $1::uuid
         """,
         action_id, status, confirmed_via, datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Memories (002: memories)
+# ---------------------------------------------------------------------------
+
+async def save_memory(user_id: str, content: str) -> str:
+    """Store a long-term memory; returns the new memory id."""
+    row = await pool().fetchrow(
+        """
+        INSERT INTO memories (user_id, content)
+        VALUES ($1::uuid, $2)
+        RETURNING id
+        """,
+        user_id, content,
+    )
+    return str(row["id"])
+
+
+def _query_tokens(query: str) -> list[str]:
+    return [t.lower() for t in re.findall(r"\w+", query)]
+
+
+async def recall_memories(
+    user_id: str, query: str, limit: int = 20
+) -> list[dict]:
+    """Token-match memories for this user; ranked by hit count."""
+    tokens = _query_tokens(query)
+    if not tokens:
+        return []
+
+    rows = await pool().fetch(
+        """
+        SELECT id, user_id, content, created_at
+        FROM memories WHERE user_id = $1::uuid
+        """,
+        user_id,
+    )
+
+    scored: list[tuple[int, dict]] = []
+    for row in rows:
+        content = (row["content"] or "").lower()
+        hits = sum(1 for token in tokens if token in content)
+        if hits:
+            scored.append((hits, dict(row)))
+
+    scored.sort(key=lambda item: (item[0], str(item[1]["id"])), reverse=True)
+    return [row for _, row in scored[:limit]]
+
+
+# ---------------------------------------------------------------------------
+# Action log (002: action_log)
+# ---------------------------------------------------------------------------
+
+async def log_action(
+    user_id: str,
+    mode: str,
+    tool_name: str,
+    args: Any,
+    result_summary: Optional[str],
+    confirmed: bool,
+) -> None:
+    await pool().execute(
+        """
+        INSERT INTO action_log (
+            user_id, mode, tool_name, args_json, result_summary, confirmed
+        )
+        VALUES ($1::uuid, $2, $3, $4::jsonb, $5, $6)
+        """,
+        user_id, mode, tool_name, json.dumps(args), result_summary, confirmed,
     )
 
 
