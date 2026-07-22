@@ -1,0 +1,38 @@
+---
+alwaysApply: true
+---
+# Jarvis-lane rules (Oliver's Cursor agents) — read with 00-core and 10-api-contract
+
+You are working in Oliver's lane: Jarvis Mode. `docs/OWNERSHIP.md` is the
+authoritative lane map; `docs/JARVIS_PLAN.md` is the authoritative task list
+and status. Read both before writing code.
+
+## Git discipline (non-negotiable)
+- Work ONLY on the `jarvis-oauth` branch (or a `jarvis-*` successor named in
+  the plan doc). NEVER commit to `main`. NEVER push to `main`.
+- One agent per file at a time. Before editing a file, check
+  `docs/JARVIS_PLAN.md` for which task owns it. If your task doesn't clearly
+  own the file, ESCALATE instead of editing.
+- Commit at every coherent stopping point. Do not leave finished work sitting
+  uncommitted in the working tree.
+
+## Lane boundaries
+- Files you may edit: `modes/jarvis/**`, `shared/google_client.py`,
+  `shared/crypto.py`, `MOBILE_API_GUIDE.md`, `docs/JARVIS_PLAN.md`.
+- Files you may NOT edit without an ESCALATE + explicit go-ahead recorded in
+  the task: `main.py`, `shared/db.py`, `shared/auth.py`, `shared/agent_loop.py`,
+  `shared/confirm_match.py`, `shared/spoken_readback.py`, `AGENTS.md`,
+  `.cursor/rules/*`, `migrations/*`. These are Jack's lane (see OWNERSHIP.md);
+  a needed change there is a written proposal, not an edit.
+- `shared/confirm_match.py` and `shared/spoken_readback.py` are verbatim ports
+  from the reference. Never "improve" them.
+
+## Carried over from 00-core (the ones that keep coming up)
+- This repo is PUBLIC: no secrets, no real personal data, anywhere. Env vars
+  via `os.environ` only. Never commit `.env`.
+- The Confirm Gate fronts every irreversible action. A code path that sends,
+  creates, or reschedules without a confirmed pending_action is a critical bug.
+- The API contract (10-api-contract.mdc) is frozen. Additive changes need
+  Jack's approval BEFORE implementation, and docs update in the same commit
+  as the code.
+- ESCALATE early. "I'm not sure" beats a confident guess in someone else's lane.
