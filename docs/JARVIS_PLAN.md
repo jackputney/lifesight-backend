@@ -34,6 +34,23 @@ branch per `docs/OWNERSHIP.md`.
       `execute_confirmed_action` ready for the `/confirm` side.
 - [x] **Phase 3 proposal** — written for Jack at
       `docs/JARVIS_PHASE3_PROPOSAL.md`. Do not implement wiring until he says go.
+- [x] **Scope union on re-consent** — `save_credentials` now unions newly
+      granted scopes with the row's existing set instead of overwriting, so a
+      narrower reconnect on one mode can't drop another mode's access (e.g.
+      Jarvis reconnecting must not strip Author's future Docs scope). Done in
+      `google_client.py`, not the upsert SQL, to stay out of Jack's `db.py`.
+
+## Open question with Jack
+- **`oauth_credentials.provider` shape** (he asked 2026-07-22): vendor-level
+  (one `google` row per user, merged scope superset) vs. per-feature rows.
+  Recommended answer: vendor-level — it's what the table comment ("under one
+  grant"), the `UNIQUE (user_id, provider)` constraint, and the current code
+  (`PROVIDER = "google"`, `include_granted_scopes=true`) already assume, and it
+  means one consent screen for a hands-free user instead of one per feature.
+  The scope-union fix above is safe under either answer. Follow-up for him:
+  the canonical `SCOPES` list currently lives in Jarvis's `google_client.py`
+  and has no Docs scope — when Author-Docs is built, that shared union needs a
+  home neither lane has to reach across to edit.
 
 ## Next (in order)
 - [ ] **Manual OAuth consent (TEST account)** — GET `/oauth/google/authorize`,

@@ -110,29 +110,45 @@ def exchange_code(code: str):
 # ---------------------------------------------------------------------------
 
 async def save_credentials(user_id: str, creds) -> None:
-    """Encrypt and upsert tokens for this user. Keeps prior refresh_token if
-    Google omitted a new one on re-consent."""
+    """Encrypt and upsert tokens for this user.
+
+    `provider` is the vendor, not a feature: one 'google' row per user holds
+    a single grant shared by every mode (Jarvis's Calendar/Gmail/Contacts
+    today, Author's Docs later). Two things therefore survive a re-consent:
+
+    - the prior refresh_token, when Google omits a new one;
+    - previously granted scopes, unioned with this grant's. A connect that
+      requests a narrower set must never shrink what another mode already
+      depends on — losing Docs from the row because Jarvis reconnected would
+      silently break Author.
+
+    The union happens here rather than in the upsert SQL so the stored row is
+    always the authoritative full scope set.
+    """
     access = creds.token
     if not access:
         raise GoogleClientError("Google returned no access token")
 
+    existing = await db.get_oauth_credentials(user_id, PROVIDER)
+
     refresh = creds.refresh_token
-    if not refresh:
-        existing = await db.get_oauth_credentials(user_id, PROVIDER)
-        if existing and existing.get("refresh_token_enc"):
-            refresh = decrypt_token(existing["refresh_token_enc"])
+    if not refresh and existing and existing.get("refresh_token_enc"):
+        refresh = decrypt_token(existing["refresh_token_enc"])
 
     expires_at = creds.expiry
     if expires_at is not None and expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
 
-    scopes = list(creds.scopes) if creds.scopes else list(SCOPES)
+    granted = set(creds.scopes) if creds.scopes else set(SCOPES)
+    if existing and existing.get("scopes"):
+        granted |= set(existing["scopes"])
+
     await db.upsert_oauth_credentials(
         user_id=user_id,
         provider=PROVIDER,
         access_token_enc=encrypt_token(access),
         refresh_token_enc=encrypt_token(refresh) if refresh else None,
-        scopes=scopes,
+        scopes=sorted(granted),
         expires_at=expires_at,
     )
     _clear_services(user_id)
