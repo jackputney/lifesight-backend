@@ -192,12 +192,14 @@ Should return: `{"status":"ok"}` and `{"modes":["author","health","jarvis"]}`
 main.py                    # /chat, /confirm, /me, /devices, MODE_REGISTRY
 shared/auth.py              # get_current_user_id (AUTH_MODE=dev|real)
 shared/db.py                # asyncpg pool + every SQL query (routes never touch SQL)
+shared/agent_loop.py        # mode-agnostic tool-use loop (not wired into /chat yet)
 shared/identity.py          # Olivia shared preamble
 scripts/run_migrations.py   # applies migrations/*.sql to DATABASE_URL
 modes/
   author/prompt.py          # check / write / read-back
   health/prompt.py          # logs against plan
   jarvis/prompt.py          # Oliver's area, confirm-gate rules
+  jarvis/tools.py           # non-Google tools: memories + reminders (not wired yet)
 migrations/
   001_users_devices.sql     # users + devices (drafted, not yet run against a DB)
   002_core_schema.sql        # conversations, pending_actions, health, writing, etc.
@@ -214,9 +216,15 @@ requirements-dev.txt         # + pre-commit, detect-secrets
 ## What's NOT here yet (by design)
 
 - No Google Docs reading/writing for Author Mode
-- No tool-calling in any mode, so `pending_action` is always `null` — the
-  Confirm Gate's shapes exist end-to-end (including its `pending_actions`
-  table), but nothing creates rows yet
+- Tool-calling is not wired into `/chat` yet, so `pending_action` is always
+  `null` — the agent loop (`shared/agent_loop.py`) and Jarvis's non-Google
+  tools (`modes/jarvis/tools.py`: memories + reminders) exist, but `main.py`
+  still makes a plain text-only Claude call; wiring them together is the next
+  step and needs review first
+- Reminders never FIRE: `create_reminder` stores a row and `manage_reminders`
+  lists/cancels, but there is deliberately no scheduler yet — there's no
+  push-notification channel to deliver a fired reminder to, so a scheduler
+  would fire into the void. Delivery + scheduler land together
 - No Calendar/Gmail for Jarvis Mode (Oliver's area)
 - `AUTH_MODE=real` (actual Supabase JWT verification) is implemented in
   `shared/auth.py` but untested against a live Supabase project; no iOS Sign

@@ -21,10 +21,15 @@ Full detail lives in `.cursor/rules/10-api-contract.mdc` in this repo. Summary:
 - `POST /devices`, `GET /devices`, `DELETE /devices/{device_id}` — push-token registration
 - `GET /modes` → `{modes: [...]}`
 - `GET /health` → `{status: "ok"}`
-- Auth: `Authorization: Bearer <token>` on every request, resolved via
-  `Depends(get_current_user_id)` (`shared/auth.py`). `AUTH_MODE=dev` (default) always
-  resolves to a fixed dev UUID; `AUTH_MODE=real` verifies a Supabase JWT. Frozen decision:
-  Supabase Auth + Sign in with Apple, no password — see `CONTEXT.md`.
+- `GET /oauth/google/authorize` → `{authorization_url}` (Bearer auth; client opens URL in browser)
+- `GET /oauth/google/callback` — Google redirect; signed `state` carries identity; `200` HTML on success
+- Auth: `Authorization: Bearer <token>` on every request except `/oauth/google/callback`,
+  resolved via `Depends(get_current_user_id)` (`shared/auth.py`). `AUTH_MODE=dev` (default)
+  always resolves to a fixed dev UUID; `AUTH_MODE=real` verifies a Supabase JWT. Frozen
+  decision: Supabase Auth + Sign in with Apple, no password — see `CONTEXT.md`.
+
+iOS-facing walkthrough of the same contract (including the Google connect sequence):
+`MOBILE_API_GUIDE.md`.
 
 ## The Confirm Gate — non-negotiable
 The user cannot glance at a screen to catch a mistake. Every irreversible action (send

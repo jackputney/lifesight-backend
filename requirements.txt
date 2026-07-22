@@ -6,3 +6,7 @@ httpx==0.28.1
 pydantic==2.10.4
 pyjwt==2.10.1              # real-mode Supabase JWT verification (shared/auth.py)
 asyncpg==0.30.0            # Postgres storage layer (shared/db.py)
+cryptography==44.0.2       # Fernet token encryption (shared/crypto.py) — verified on PyPI
+google-api-python-client==2.156.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0

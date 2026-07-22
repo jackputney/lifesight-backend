@@ -57,12 +57,41 @@ Push-notification target registration, one row per device per user.
 - `GET /devices` → `list[DeviceOut]` for the current user.
 - `DELETE /devices/{device_id}` → `204` on success, `404` if not found for this user.
 
+## GET /oauth/google/authorize
+Starts the Google connect flow for Jarvis (Calendar + Gmail + People under one
+grant). This is a normal authenticated JSON request — **not** a browser 302 —
+so Bearer works under real auth (SFSafariViewController cannot attach headers).
+
+Request: `Authorization: Bearer <token>` (same as `/me`). No body.
+
+Response `200`:
+```json
+{ "authorization_url": "https://accounts.google.com/o/oauth2/auth?..." }
+```
+The client opens `authorization_url` in SFSafariViewController / ASWebAuthenticationSession.
+The URL embeds a signed `state` (HMAC via `OAUTH_STATE_SECRET`) that carries
+`user_id` + expiry — identity for the callback hop.
+
+## GET /oauth/google/callback
+Google redirects the browser here after consent. **No Bearer auth** — identity
+comes from verifying the signed `state` query param.
+
+Query (from Google): `code`, `state`, optional `error`.
+
+- Success `200` `text/html`: short page — "Google connected. You can close this
+  window and return to Lifesight." Side effect: exchanges `code`, Fernet-encrypts
+  tokens (`GOOGLE_TOKEN_ENCRYPTION_KEY`), upserts `oauth_credentials` on
+  `(user_id, provider)`.
+- Failure `400`: readable message (denied consent, bad/expired state, exchange
+  failure). Never returns tokens in the body.
+
 ## Auth — implemented, dev mode by default
-Every request (`/chat`, `/confirm`, `/me`, `/devices/*`) resolves identity via
-`Authorization: Bearer <token>` through `Depends(get_current_user_id)` in
-`shared/auth.py`. Decision is frozen (see `CONTEXT.md`): **Supabase Auth + Sign in
-with Apple** — no typed password, no CAPTCHA (the accessible path for a near-blind
-user). Supabase issues an HS256 JWT whose `sub` claim is the `auth.users(id)` UUID.
+Every request (`/chat`, `/confirm`, `/me`, `/devices/*`, `/oauth/google/authorize`)
+resolves identity via `Authorization: Bearer <token>` through
+`Depends(get_current_user_id)` in `shared/auth.py`. Decision is frozen (see
+`CONTEXT.md`): **Supabase Auth + Sign in with Apple** — no typed password, no
+CAPTCHA (the accessible path for a near-blind user). Supabase issues an HS256
+JWT whose `sub` claim is the `auth.users(id)` UUID.
 - `AUTH_MODE=dev` (default): any Bearer token, or none at all, resolves to a fixed
   dev UUID. This is what local/CI testing runs against.
 - `AUTH_MODE=real`: verifies the Supabase JWT signature, audience, and expiry.
@@ -73,6 +102,8 @@ user). Supabase issues an HS256 JWT whose `sub` claim is the `auth.users(id)` UU
   stay confined to that one file.
 - The iOS client must never assert its own `user_id` in a request body — identity is
   always derived from the token server-side.
+- Exception: `/oauth/google/callback` has no Bearer — Google's redirect cannot send
+  one. Identity is taken only from the signed `state` minted by authorize.
 
 ## The one hard rule for Jarvis Mode (and any future irreversible action)
 Anything irreversible — sending an email, creating/modifying a calendar event, writing

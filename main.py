@@ -1,4 +1,4 @@
-"""Voice Companion backend — mode router + identity/devices + Confirm Gate.
+"""Voice Companion backend — mode router + identity/devices + Confirm Gate + Google OAuth.
 
 POST /chat routes {transcript, mode, conversation_id} to the matching mode
 system prompt via MODE_REGISTRY and calls Claude, keeping multi-turn history
@@ -12,6 +12,10 @@ real Supabase JWT verification touches only that file.
 POST /confirm resolves a pending action by id (the Confirm Gate's second
 half). No mode populates pending_action yet (no tool-calling is wired up),
 so it's always null in /chat responses today.
+
+GET /oauth/google/authorize returns {authorization_url} (Bearer JSON — not a
+302) so iOS can open Google consent in SFSafariViewController. Callback
+exchanges the code, encrypts tokens, and upserts oauth_credentials.
 
 Storage is Postgres via shared/db.py (asyncpg), backed by migrations
 001_users_devices.sql and 002_core_schema.sql run against a Supabase
@@ -32,8 +36,9 @@ from uuid import UUID
 
 import anthropic
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from modes.author.prompt import SYSTEM_PROMPT as AUTHOR_PROMPT
@@ -41,6 +46,8 @@ from modes.health.prompt import SYSTEM_PROMPT as HEALTH_PROMPT
 from modes.jarvis.prompt import SYSTEM_PROMPT as JARVIS_PROMPT
 from shared import db
 from shared.auth import get_current_user_id
+from shared.crypto import verify_oauth_state
+from shared import google_client
 
 load_dotenv()
 
@@ -115,6 +122,10 @@ class DeviceOut(BaseModel):
     push_token: Optional[str]
     platform: str
     last_seen: datetime
+
+
+class GoogleAuthorizeOut(BaseModel):
+    authorization_url: str
 
 
 def _build_system_prompt(mode: str) -> str:
@@ -273,3 +284,65 @@ async def remove_device(
 ):
     if not await db.delete_device(user_id, device_id):
         raise HTTPException(status_code=404, detail="Device not found")
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth (Jarvis) — JSON authorize URL + browser callback
+# ---------------------------------------------------------------------------
+# Authorize is a normal authenticated JSON request so Bearer works under
+# real auth. The app then opens authorization_url in SFSafariViewController
+# (no header needed — signed state carries identity). Callback is option A:
+# plain HTML success page (no deep link yet).
+
+_OAUTH_SUCCESS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Google connected</title></head>
+<body>
+  <p>Google connected. You can close this window and return to Lifesight.</p>
+</body>
+</html>
+"""
+
+
+@app.get("/oauth/google/authorize", response_model=GoogleAuthorizeOut)
+async def google_authorize(user_id: str = Depends(get_current_user_id)):
+    """Return Google's consent URL. Client opens it in a browser session."""
+    try:
+        url = google_client.build_authorization_url(user_id)
+    except google_client.GoogleClientError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return GoogleAuthorizeOut(authorization_url=url)
+
+
+@app.get("/oauth/google/callback")
+async def google_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+):
+    """Google redirects here. No Bearer — identity comes from signed state."""
+    if error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Google authorization was denied or failed ({error}).",
+        )
+    if not code or not state:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing code or state from Google callback.",
+        )
+    try:
+        user_id = verify_oauth_state(state)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        await google_client.complete_oauth(user_id, code)
+    except google_client.GoogleClientError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return HTMLResponse(content=_OAUTH_SUCCESS_HTML, status_code=200)

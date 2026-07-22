@@ -221,6 +221,77 @@ async def recall_memories(
 
 
 # ---------------------------------------------------------------------------
+# Reminders (002: reminders) — stored rows only; nothing fires them yet
+# ---------------------------------------------------------------------------
+
+def _reminder_row(row: asyncpg.Record) -> dict:
+    return {
+        "id": str(row["id"]),
+        "description": row["description"],
+        "fire_at": row["fire_at"].isoformat(),
+        "condition": json.loads(row["condition_json"]) if row["condition_json"] else None,
+        "status": row["status"],
+    }
+
+
+async def create_reminder(
+    user_id: str,
+    description: str,
+    fire_at: datetime,
+    condition: Optional[dict] = None,
+) -> str:
+    """Insert a pending reminder; returns the new reminder id."""
+    row = await pool().fetchrow(
+        """
+        INSERT INTO reminders (user_id, description, fire_at, condition_json)
+        VALUES ($1::uuid, $2, $3, $4::jsonb)
+        RETURNING id
+        """,
+        user_id, description, fire_at,
+        json.dumps(condition) if condition else None,
+    )
+    return str(row["id"])
+
+
+async def get_reminder(user_id: str, reminder_id: str) -> Optional[dict]:
+    try:
+        uuid.UUID(reminder_id)
+    except ValueError:
+        return None  # malformed id can't exist
+    row = await pool().fetchrow(
+        """
+        SELECT id, description, fire_at, condition_json, status
+        FROM reminders WHERE id = $1::uuid AND user_id = $2::uuid
+        """,
+        reminder_id, user_id,
+    )
+    return _reminder_row(row) if row else None
+
+
+async def list_reminders(user_id: str, status: str = "pending") -> list[dict]:
+    rows = await pool().fetch(
+        """
+        SELECT id, description, fire_at, condition_json, status
+        FROM reminders WHERE user_id = $1::uuid AND status = $2
+        ORDER BY fire_at
+        """,
+        user_id, status,
+    )
+    return [_reminder_row(r) for r in rows]
+
+
+async def set_reminder_status(user_id: str, reminder_id: str, status: str) -> None:
+    await pool().execute(
+        """
+        UPDATE reminders SET status = $3,
+               fired_at = CASE WHEN $3 = 'fired' THEN now() ELSE fired_at END
+        WHERE id = $1::uuid AND user_id = $2::uuid
+        """,
+        reminder_id, user_id, status,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Action log (002: action_log)
 # ---------------------------------------------------------------------------
 
@@ -280,5 +351,65 @@ async def delete_device(user_id: str, device_id: str) -> bool:
     result = await pool().execute(
         "DELETE FROM devices WHERE user_id = $1::uuid AND device_id = $2",
         user_id, device_id,
+    )
+    return result == "DELETE 1"
+
+
+# ---------------------------------------------------------------------------
+# OAuth credentials (002: oauth_credentials) — encrypted tokens at rest
+# ---------------------------------------------------------------------------
+
+async def get_oauth_credentials(
+    user_id: str, provider: str = "google"
+) -> Optional[dict]:
+    row = await pool().fetchrow(
+        """
+        SELECT id, user_id, provider, access_token_enc, refresh_token_enc,
+               scopes, expires_at, updated_at
+        FROM oauth_credentials
+        WHERE user_id = $1::uuid AND provider = $2
+        """,
+        user_id, provider,
+    )
+    return dict(row) if row else None
+
+
+async def upsert_oauth_credentials(
+    user_id: str,
+    provider: str,
+    access_token_enc: str,
+    refresh_token_enc: Optional[str],
+    scopes: Optional[list[str]],
+    expires_at: Optional[datetime],
+) -> dict:
+    """Insert or update the single (user_id, provider) credential row."""
+    row = await pool().fetchrow(
+        """
+        INSERT INTO oauth_credentials (
+            user_id, provider, access_token_enc, refresh_token_enc,
+            scopes, expires_at, updated_at
+        )
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, now())
+        ON CONFLICT (user_id, provider) DO UPDATE
+        SET access_token_enc  = EXCLUDED.access_token_enc,
+            refresh_token_enc = COALESCE(
+                EXCLUDED.refresh_token_enc, oauth_credentials.refresh_token_enc
+            ),
+            scopes            = EXCLUDED.scopes,
+            expires_at        = EXCLUDED.expires_at,
+            updated_at        = now()
+        RETURNING id, user_id, provider, access_token_enc, refresh_token_enc,
+                  scopes, expires_at, updated_at
+        """,
+        user_id, provider, access_token_enc, refresh_token_enc,
+        scopes, expires_at,
+    )
+    return dict(row)
+
+
+async def delete_oauth_credentials(user_id: str, provider: str = "google") -> bool:
+    result = await pool().execute(
+        "DELETE FROM oauth_credentials WHERE user_id = $1::uuid AND provider = $2",
+        user_id, provider,
     )
     return result == "DELETE 1"
