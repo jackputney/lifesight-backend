@@ -13,6 +13,7 @@ import base64
 import hashlib
 import hmac
 import os
+import secrets
 import time
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -55,9 +56,15 @@ def _state_secret() -> bytes:
 
 
 def sign_oauth_state(user_id: str) -> str:
-    """Build a signed, url-safe state embedding user_id + expiry."""
+    """Build a signed, url-safe state embedding user_id + nonce + expiry.
+
+    The nonce is a one-time random value (HMAC of user_id + nonce + expiry per
+    Jack's OAuth approval). It is not server-stored; uniqueness alone blocks
+    trivial replay of a captured state blob within the expiry window.
+    """
     expiry = int(time.time()) + _OAUTH_STATE_MAX_AGE_SECONDS
-    payload = f"{user_id}.{expiry}"
+    nonce = secrets.token_urlsafe(16)
+    payload = f"{user_id}.{nonce}.{expiry}"
     sig = hmac.new(_state_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     raw = f"{payload}.{sig}".encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
@@ -73,12 +80,14 @@ def verify_oauth_state(state: str) -> str:
     except (ValueError, UnicodeDecodeError) as exc:
         raise ValueError("Malformed OAuth state") from exc
 
-    parts = raw.rsplit(".", 2)
-    if len(parts) != 3:
+    parts = raw.rsplit(".", 3)
+    if len(parts) != 4:
         raise ValueError("Malformed OAuth state")
-    user_id, expiry_str, sig = parts
+    user_id, nonce, expiry_str, sig = parts
+    if not nonce:
+        raise ValueError("Malformed OAuth state")
 
-    payload = f"{user_id}.{expiry_str}"
+    payload = f"{user_id}.{nonce}.{expiry_str}"
     expected = hmac.new(
         _state_secret(), payload.encode("utf-8"), hashlib.sha256
     ).hexdigest()

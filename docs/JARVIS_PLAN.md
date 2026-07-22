@@ -22,25 +22,25 @@ branch per `docs/OWNERSHIP.md`.
       (per-user, DB-backed tokens), `/oauth/google/authorize` (Bearer JSON →
       `{authorization_url}`) and `/oauth/google/callback` (signed state,
       option-A HTML). Contract docs + `MOBILE_API_GUIDE.md` updated in lockstep.
+- [x] **Add nonce to OAuth state** — HMAC of `user_id` + nonce + expiry in
+      `shared/crypto.py`. No external API change (state stays opaque).
+- [x] **OAuth path smoke test** — authorize URL + signed state verify via
+      TestClient; Fernet encrypt/decrypt; DB reachable. Interactive Google
+      consent with the TEST account (row in `oauth_credentials` + forced
+      refresh) still needs a manual browser pass — no credentials row yet.
+- [x] **Phase 5** — ten Google-backed tools in `modes/jarvis/tools.py`
+      (schemas + dispatch from the reference, calling `shared/google_client.py`).
+      Irreversible three create `pending_actions` via `db.create_pending_action`;
+      `execute_confirmed_action` ready for the `/confirm` side.
+- [x] **Phase 3 proposal** — written for Jack at
+      `docs/JARVIS_PHASE3_PROPOSAL.md`. Do not implement wiring until he says go.
 
 ## Next (in order)
-- [ ] **Add nonce to OAuth state** — Jack's approval specified HMAC of
-      user_id + nonce + expiry; current state is user_id + expiry only.
-      Small change in `shared/crypto.py`, no interface change.
-- [ ] **End-to-end OAuth test** — run the server, GET /oauth/google/authorize
-      (dev auth), complete consent with the TEST Google account (never Jock's
-      real account, per AGENTS.md), verify encrypted row lands in
-      `oauth_credentials`, verify refresh works after expiry.
-- [ ] **Phase 5** — the ten Google-backed tools in `modes/jarvis/tools.py`
-      (schemas + dispatch from the reference's `app/tools.py`, calling
-      `shared/google_client.py`). The three irreversible ones
-      (`create_calendar_event`, `send_email`, `reschedule_event`) create
-      pending_actions via `db.create_pending_action` — never execute directly.
-      Include `execute_confirmed_action` for the /confirm side.
-- [ ] **WAIT FOR JACK, then Phase 3** — wiring `/chat` to the agent loop and
-      `/confirm` to the executor is main.py + Confirm Gate internals = Jack's
-      lane. He said he'll come back with specific integration asks once his
-      gate reconciliation is done. Prepare a proposal; do not implement first.
+- [ ] **Manual OAuth consent (TEST account)** — GET `/oauth/google/authorize`,
+      complete Google consent, confirm encrypted `oauth_credentials` row, force
+      refresh after local expiry. Never use Jock's real account.
+- [ ] **WAIT FOR JACK, then Phase 3** — wire `/chat` → agent loop and
+      `/confirm` → `execute_confirmed_action` per the proposal. Jack's lane.
 - [ ] **Phase 6 (with Jack)** — voice-confirm endpoints
       (`/spoken-readback`, `/match-confirmation`) — contract additions,
       same proposal-first process.

@@ -45,7 +45,7 @@ therefore:
    request (URLSession with Bearer).
 2. **Backend** returns `200 {"authorization_url": "https://accounts.google.com/..."}`.
    The URL already includes a signed `state` (HMAC, `OAUTH_STATE_SECRET`) that
-   embeds `user_id` + expiry.
+   embeds `user_id` + nonce + expiry.
 3. **App** opens `authorization_url` in SFSafariViewController (or
    ASWebAuthenticationSession). No auth header on that hop.
 4. User consents on Google’s screen. Google redirects the browser to

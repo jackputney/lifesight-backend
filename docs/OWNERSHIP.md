@@ -35,7 +35,7 @@ shared layer is stable.**
 
 ## Standing exceptions already granted
 - Jack approved the OAuth endpoint shapes, callback option A, signed state
-  (HMAC of user_id + nonce + expiry — nonce still TODO), and full
+  (HMAC of user_id + nonce + expiry — nonce implemented on `jarvis-oauth`), and full
   Calendar/Gmail/People scopes (2026-07-22). The lockstep-docs condition applies.
 - `shared/db.py` currently contains Jarvis-added reminders CRUD (branch only).
   Flagged for Jack at merge: keep there, or relocate to a Jarvis-owned module.
