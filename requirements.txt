@@ -6,3 +6,7 @@ httpx==0.28.1
 pydantic==2.10.4
 pyjwt==2.10.1              # real-mode Supabase JWT verification (shared/auth.py)
 asyncpg==0.30.0            # Postgres storage layer (shared/db.py)
+cryptography==49.0.0       # encrypt oauth_credentials tokens at rest (shared/crypto.py)
+google-auth==2.56.2                # Google OAuth token/credential objects
+google-auth-oauthlib==1.4.0        # Google OAuth authorization-code flow
+google-api-python-client==2.198.0  # Docs + Drive API clients (shared/google_docs.py)

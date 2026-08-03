@@ -150,12 +150,19 @@ async def get_pending_action(action_id: str) -> Optional[dict]:
         return None  # malformed id can't exist; /confirm 404s the same either way
     row = await pool().fetchrow(
         """
-        SELECT id, user_id, status, expires_at
+        SELECT id, user_id, conversation_id, source_mode, action_type,
+               payload, description, status, expires_at
         FROM pending_actions WHERE id = $1::uuid
         """,
         action_id,
     )
-    return dict(row) if row else None
+    if row is None:
+        return None
+    result = dict(row)
+    # payload comes back as raw jsonb text, same as content_json in
+    # load_messages — decode it here so every caller gets a plain dict.
+    result["payload"] = json.loads(result["payload"]) if result["payload"] else None
+    return result
 
 
 async def resolve_pending_action(
@@ -282,3 +289,95 @@ async def delete_device(user_id: str, device_id: str) -> bool:
         user_id, device_id,
     )
     return result == "DELETE 1"
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth credentials (002: oauth_credentials)
+# ---------------------------------------------------------------------------
+# Tokens in access_token_enc/refresh_token_enc are opaque ciphertext to this
+# module — callers encrypt/decrypt with shared/crypto.py. This function never
+# sees or logs plaintext.
+
+async def save_oauth_credentials(
+    user_id: str,
+    provider: str,
+    access_token_enc: str,
+    refresh_token_enc: Optional[str],
+    scopes: list[str],
+    expires_at: Optional[datetime],
+) -> None:
+    """Upsert this user's OAuth credentials for a provider. A re-consent that
+    comes back without a new refresh token (Google only issues one on first
+    consent) keeps the previously stored one rather than nulling it out."""
+    await pool().execute(
+        """
+        INSERT INTO oauth_credentials (
+            user_id, provider, access_token_enc, refresh_token_enc, scopes, expires_at
+        )
+        VALUES ($1::uuid, $2, $3, $4, $5, $6)
+        ON CONFLICT (user_id, provider) DO UPDATE
+        SET access_token_enc = EXCLUDED.access_token_enc,
+            refresh_token_enc = COALESCE(EXCLUDED.refresh_token_enc, oauth_credentials.refresh_token_enc),
+            scopes = EXCLUDED.scopes,
+            expires_at = EXCLUDED.expires_at,
+            updated_at = now()
+        """,
+        user_id, provider, access_token_enc, refresh_token_enc, scopes, expires_at,
+    )
+
+
+async def get_oauth_credentials(user_id: str, provider: str = "google") -> Optional[dict]:
+    """Returns the row with tokens still encrypted — caller decrypts."""
+    row = await pool().fetchrow(
+        """
+        SELECT user_id, provider, access_token_enc, refresh_token_enc, scopes, expires_at
+        FROM oauth_credentials WHERE user_id = $1::uuid AND provider = $2
+        """,
+        user_id, provider,
+    )
+    return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Writing documents (002: writing_documents) — Google Docs is source of truth
+# ---------------------------------------------------------------------------
+
+async def create_writing_document(
+    user_id: str, google_doc_id: str, title: str, doc_type: str = "manuscript"
+) -> str:
+    """Register a Google Doc as this user's tracked writing document. Returns
+    the new writing_documents row id."""
+    row = await pool().fetchrow(
+        """
+        INSERT INTO writing_documents (user_id, google_doc_id, title, doc_type)
+        VALUES ($1::uuid, $2, $3, $4)
+        RETURNING id
+        """,
+        user_id, google_doc_id, title, doc_type,
+    )
+    return str(row["id"])
+
+
+async def get_writing_document(user_id: str, doc_type: str = "manuscript") -> Optional[dict]:
+    """Most recently created non-deleted document of this type for the user.
+    One document per type today; picking among several is a future feature,
+    not a bug in this query."""
+    row = await pool().fetchrow(
+        """
+        SELECT id, user_id, google_doc_id, title, doc_type, last_known_revision_id
+        FROM writing_documents
+        WHERE user_id = $1::uuid AND doc_type = $2 AND deleted_at IS NULL
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        user_id, doc_type,
+    )
+    return dict(row) if row else None
+
+
+async def update_writing_document_revision(document_id: str, revision_id: str) -> None:
+    """Stamp the latest known Docs revisionId after a write, so a future read
+    can detect the doc changed elsewhere (a web edit) since our last write."""
+    await pool().execute(
+        "UPDATE writing_documents SET last_known_revision_id = $2, updated_at = now() WHERE id = $1::uuid",
+        document_id, revision_id,
+    )
