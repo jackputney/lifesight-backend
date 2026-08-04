@@ -8,9 +8,12 @@ from typing import Any
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+from shared.mail_calendar.sanitize import plain_text
 from shared.mail_calendar.types import (
+    CalendarAttendee,
     CalendarEvent,
     CalendarEventSummary,
+    EventListOut,
     FreeBusyOut,
     FreeBusySlot,
 )
@@ -30,9 +33,15 @@ class GoogleCalendarProvider:
         time_max: str,
         max_results: int = 50,
         calendar_id: str = "primary",
-    ) -> list[CalendarEventSummary]:
+        page_token: str | None = None,
+    ) -> EventListOut:
         return await asyncio.to_thread(
-            self._list_events_sync, time_min, time_max, max_results, calendar_id
+            self._list_events_sync,
+            time_min,
+            time_max,
+            max_results,
+            calendar_id,
+            page_token,
         )
 
     def _list_events_sync(
@@ -41,33 +50,36 @@ class GoogleCalendarProvider:
         time_max: str,
         max_results: int,
         calendar_id: str,
-    ) -> list[CalendarEventSummary]:
+        page_token: str | None,
+    ) -> EventListOut:
         svc = self._service()
-        result = (
-            svc.events()
-            .list(
-                calendarId=calendar_id,
-                timeMin=time_min,
-                timeMax=time_max,
-                maxResults=max(1, min(max_results, 100)),
-                singleEvents=True,
-                orderBy="startTime",
-            )
-            .execute()
-        )
+        kwargs: dict[str, Any] = {
+            "calendarId": calendar_id,
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "maxResults": max(1, min(int(max_results), 100)),
+            "singleEvents": True,
+            "orderBy": "startTime",
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        result = svc.events().list(**kwargs).execute()
         out: list[CalendarEventSummary] = []
         for item in result.get("items") or []:
             out.append(
                 CalendarEventSummary(
                     id=item["id"],
                     calendar_id=calendar_id,
-                    summary=item.get("summary"),
+                    summary=plain_text(item.get("summary"), max_len=500),
                     start=_event_time(item.get("start")),
                     end=_event_time(item.get("end")),
                     status=item.get("status"),
                 )
             )
-        return out
+        return EventListOut(
+            items=out,
+            next_page_token=result.get("nextPageToken"),
+        )
 
     async def get_event(
         self,
@@ -80,17 +92,16 @@ class GoogleCalendarProvider:
     def _get_event_sync(self, event_id: str, calendar_id: str) -> CalendarEvent:
         svc = self._service()
         item = svc.events().get(calendarId=calendar_id, eventId=event_id).execute()
-        attendees = item.get("attendees") or []
         return CalendarEvent(
             id=item["id"],
             calendar_id=calendar_id,
-            summary=item.get("summary"),
-            description=item.get("description"),
+            summary=plain_text(item.get("summary"), max_len=500),
+            description=plain_text(item.get("description")),
             start=_event_time(item.get("start")),
             end=_event_time(item.get("end")),
             status=item.get("status"),
-            location=item.get("location"),
-            attendees=list(attendees),
+            location=plain_text(item.get("location"), max_len=500),
+            attendees=_normalize_attendees(item.get("attendees") or []),
         )
 
     async def freebusy(
@@ -126,6 +137,22 @@ class GoogleCalendarProvider:
             time_min=time_min,
             time_max=time_max,
         )
+
+
+def _normalize_attendees(raw: list[Any]) -> list[CalendarAttendee]:
+    out: list[CalendarAttendee] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            CalendarAttendee(
+                email=plain_text(item.get("email"), max_len=320),
+                display_name=plain_text(item.get("displayName"), max_len=200),
+                response_status=item.get("responseStatus"),
+                optional=bool(item.get("optional") or False),
+            )
+        )
+    return out
 
 
 def _event_time(node: Any) -> str | None:

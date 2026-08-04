@@ -353,6 +353,81 @@ async def delete_oauth_credentials(user_id: str, provider: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# OAuth transactions (005) — ephemeral PKCE / state (not credentials)
+# ---------------------------------------------------------------------------
+
+async def create_oauth_transaction(
+    *,
+    state: str,
+    user_id: str,
+    provider: str,
+    code_verifier_enc: str,
+    app_return_uri: str,
+    expires_at: datetime,
+) -> None:
+    await pool().execute(
+        """
+        INSERT INTO oauth_transactions (
+            state, user_id, provider, code_verifier_enc, app_return_uri, expires_at
+        )
+        VALUES ($1, $2::uuid, $3, $4, $5, $6)
+        """,
+        state,
+        user_id,
+        provider,
+        code_verifier_enc,
+        app_return_uri,
+        expires_at,
+    )
+
+
+async def get_oauth_transaction(state: str) -> Optional[dict]:
+    row = await pool().fetchrow(
+        """
+        SELECT state, user_id, provider, code_verifier_enc, app_return_uri,
+               created_at, expires_at, consumed_at
+        FROM oauth_transactions WHERE state = $1
+        """,
+        state,
+    )
+    return dict(row) if row else None
+
+
+async def consume_oauth_transaction(state: str) -> Optional[dict]:
+    """Atomically mark a transaction consumed. Returns the row if newly consumed."""
+    row = await pool().fetchrow(
+        """
+        UPDATE oauth_transactions
+        SET consumed_at = now()
+        WHERE state = $1
+          AND consumed_at IS NULL
+          AND expires_at > now()
+        RETURNING state, user_id, provider, code_verifier_enc, app_return_uri,
+                  created_at, expires_at, consumed_at
+        """,
+        state,
+    )
+    return dict(row) if row else None
+
+
+async def delete_oauth_transaction(state: str) -> None:
+    await pool().execute("DELETE FROM oauth_transactions WHERE state = $1", state)
+
+
+async def purge_expired_oauth_transactions() -> int:
+    result = await pool().execute(
+        """
+        DELETE FROM oauth_transactions
+        WHERE expires_at <= now() OR consumed_at IS NOT NULL
+        """
+    )
+    try:
+        return int(result.split()[-1])
+    except (IndexError, ValueError):
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Writing documents (002: writing_documents) — Google Docs is source of truth
 # ---------------------------------------------------------------------------
 

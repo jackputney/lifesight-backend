@@ -1,26 +1,27 @@
 """Mail & Calendar HTTP API — Google read-only foundation.
 
 No send/archive/delete, no event mutations, no Confirm Gate / pending_action.
-Never returns OAuth tokens to the client.
+Never returns OAuth tokens or authorization codes to the client.
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import RedirectResponse
 
 from shared.auth import get_current_user_id
-from shared.mail_calendar import oauth, service
+from shared.mail_calendar import bounds, oauth, service, transactions
 from shared.mail_calendar.types import (
     CalendarEvent,
-    CalendarEventSummary,
+    ConnectIn,
     ConnectOut,
     ConnectionStatus,
     DisconnectOut,
+    EventListOut,
     FreeBusyOut,
     MailCalendarStatusOut,
+    MailListOut,
     MailMessage,
-    MailMessageSummary,
 )
 
 router = APIRouter(prefix="/mail-calendar", tags=["mail-calendar"])
@@ -44,13 +45,22 @@ async def mail_calendar_status(user_id: str = Depends(get_current_user_id)):
 
 
 @router.post("/connect", response_model=ConnectOut)
-async def mail_calendar_connect(user_id: str = Depends(get_current_user_id)):
+async def mail_calendar_connect(
+    body: ConnectIn,
+    user_id: str = Depends(get_current_user_id),
+):
     try:
-        state = oauth.sign_oauth_state(user_id)
-        url = oauth.build_authorization_url(state)
+        started = await oauth.start_authorization(
+            user_id, app_return_uri=body.app_return_uri
+        )
     except oauth.OAuthConfigError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return ConnectOut(authorization_url=url, state=state)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ConnectOut(
+        authorization_url=started["authorization_url"],
+        state=started["state"],
+    )
 
 
 @router.get("/oauth/callback")
@@ -59,49 +69,76 @@ async def mail_calendar_oauth_callback(
     state: str | None = None,
     error: str | None = None,
 ):
-    """Browser callback — identity from signed state only (no Bearer header)."""
+    """Browser callback — identity from signed state; redirect to app (no tokens)."""
     if error:
-        return HTMLResponse(
-            content=_html_page("Mail & Calendar connection failed", error),
-            status_code=400,
-        )
+        return await _redirect_or_error(state, status="error", detail=error)
+
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing code or state")
 
     try:
-        user_id = oauth.verify_oauth_state(state)
+        tokens = await oauth.complete_authorization(code=code, state=state)
     except oauth.OAuthConfigError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except oauth.OAuthFlowError as exc:
+        if exc.app_return_uri:
+            return RedirectResponse(
+                oauth.build_app_redirect(
+                    exc.app_return_uri, status="error", detail=str(exc)
+                ),
+                status_code=302,
+            )
+        return await _redirect_or_error(state, status="error", detail=str(exc))
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
-        tokens = oauth.exchange_code(code, state)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return await _redirect_or_error(state, status="error", detail=str(exc))
     except Exception as exc:
-        raise HTTPException(
-            status_code=502,
+        return await _redirect_or_error(
+            state,
+            status="error",
             detail=f"Token exchange failed: {type(exc).__name__}",
-        ) from exc
+        )
 
     access = tokens.get("access_token")
     if not access:
-        raise HTTPException(status_code=502, detail="Google returned no access token")
+        return RedirectResponse(
+            oauth.build_app_redirect(
+                tokens["app_return_uri"],
+                status="error",
+                detail="Google returned no access token",
+            ),
+            status_code=302,
+        )
 
     await service.persist_tokens(
-        user_id,
+        tokens["user_id"],
         access_token=access,
         refresh_token=tokens.get("refresh_token"),
         scopes=list(tokens.get("scopes") or oauth.READ_SCOPES),
         expiry=tokens.get("expiry"),
     )
-    return HTMLResponse(
-        content=_html_page(
-            "Mail & Calendar connected",
-            "You can close this window and return to LifeSight.",
-        )
+    # Redirect must never include access/refresh tokens or the auth code.
+    return RedirectResponse(
+        oauth.build_app_redirect(tokens["app_return_uri"], status="connected"),
+        status_code=302,
     )
+
+
+async def _redirect_or_error(
+    state: str | None, *, status: str, detail: str
+) -> RedirectResponse:
+    return_uri = None
+    if state:
+        row = await transactions.get(state)
+        if row:
+            return_uri = row.get("app_return_uri")
+            # Best-effort cleanup on failure paths.
+            await transactions.delete(state)
+    if return_uri:
+        return RedirectResponse(
+            oauth.build_app_redirect(return_uri, status=status, detail=detail),
+            status_code=302,
+        )
+    raise HTTPException(status_code=400, detail=detail)
 
 
 @router.post("/disconnect", response_model=DisconnectOut)
@@ -110,15 +147,27 @@ async def mail_calendar_disconnect(user_id: str = Depends(get_current_user_id)):
     return DisconnectOut()
 
 
-@router.get("/mail", response_model=list[MailMessageSummary])
+@router.get("/mail", response_model=MailListOut)
 async def mail_list(
-    q: str | None = Query(default=None, description="Gmail search query"),
-    max_results: int = Query(default=20, ge=1, le=50),
+    q: str | None = Query(default=None, description="Provider search query"),
+    max_results: int = Query(default=bounds.DEFAULT_MAIL_PAGE_SIZE),
+    page_token: str | None = Query(default=None),
     user_id: str = Depends(get_current_user_id),
 ):
     try:
+        query = bounds.clamp_search_query(q)
+        size = bounds.clamp_page_size(
+            max_results,
+            default=bounds.DEFAULT_MAIL_PAGE_SIZE,
+            maximum=bounds.MAX_MAIL_PAGE_SIZE,
+        )
+    except bounds.BoundsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
         provider = await service.get_mail_provider(user_id)
-        return await provider.list_messages(query=q, max_results=max_results)
+        return await provider.list_messages(
+            query=query, max_results=size, page_token=page_token
+        )
     except service.MailCalendarError as exc:
         raise _map_mc_error(exc) from exc
 
@@ -132,21 +181,32 @@ async def mail_get(message_id: str, user_id: str = Depends(get_current_user_id))
         raise _map_mc_error(exc) from exc
 
 
-@router.get("/events", response_model=list[CalendarEventSummary])
+@router.get("/events", response_model=EventListOut)
 async def events_list(
     time_min: str = Query(..., description="RFC3339 lower bound"),
     time_max: str = Query(..., description="RFC3339 upper bound"),
-    max_results: int = Query(default=50, ge=1, le=100),
+    max_results: int = Query(default=bounds.DEFAULT_EVENTS_PAGE_SIZE),
+    page_token: str | None = Query(default=None),
     calendar_id: str = Query(default="primary"),
     user_id: str = Depends(get_current_user_id),
 ):
     try:
+        tmin, tmax = bounds.validate_time_range(time_min, time_max)
+        size = bounds.clamp_page_size(
+            max_results,
+            default=bounds.DEFAULT_EVENTS_PAGE_SIZE,
+            maximum=bounds.MAX_EVENTS_PAGE_SIZE,
+        )
+    except bounds.BoundsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
         provider = await service.get_calendar_provider(user_id)
         return await provider.list_events(
-            time_min=time_min,
-            time_max=time_max,
-            max_results=max_results,
+            time_min=tmin,
+            time_max=tmax,
+            max_results=size,
             calendar_id=calendar_id,
+            page_token=page_token,
         )
     except service.MailCalendarError as exc:
         raise _map_mc_error(exc) from exc
@@ -173,22 +233,15 @@ async def freebusy(
     user_id: str = Depends(get_current_user_id),
 ):
     try:
+        tmin, tmax = bounds.validate_time_range(time_min, time_max)
+    except bounds.BoundsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
         provider = await service.get_calendar_provider(user_id)
         return await provider.freebusy(
-            time_min=time_min,
-            time_max=time_max,
+            time_min=tmin,
+            time_max=tmax,
             calendar_id=calendar_id,
         )
     except service.MailCalendarError as exc:
         raise _map_mc_error(exc) from exc
-
-
-def _html_page(title: str, body: str) -> str:
-    # Minimal HTML for the browser OAuth return — not an iOS surface.
-    safe_title = title.replace("<", "&lt;")
-    safe_body = body.replace("<", "&lt;")
-    return (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        f"<title>{safe_title}</title></head><body>"
-        f"<h1>{safe_title}</h1><p>{safe_body}</p></body></html>"
-    )

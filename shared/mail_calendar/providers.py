@@ -6,10 +6,10 @@ from typing import Protocol, runtime_checkable
 
 from shared.mail_calendar.types import (
     CalendarEvent,
-    CalendarEventSummary,
+    EventListOut,
     FreeBusyOut,
+    MailListOut,
     MailMessage,
-    MailMessageSummary,
 )
 
 
@@ -20,7 +20,8 @@ class MailProvider(Protocol):
         *,
         query: str | None = None,
         max_results: int = 20,
-    ) -> list[MailMessageSummary]:
+        page_token: str | None = None,
+    ) -> MailListOut:
         ...
 
     async def get_message(self, message_id: str) -> MailMessage:
@@ -36,7 +37,8 @@ class CalendarProvider(Protocol):
         time_max: str,
         max_results: int = 50,
         calendar_id: str = "primary",
-    ) -> list[CalendarEventSummary]:
+        page_token: str | None = None,
+    ) -> EventListOut:
         ...
 
     async def get_event(

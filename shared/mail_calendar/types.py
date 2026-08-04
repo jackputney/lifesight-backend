@@ -1,9 +1,8 @@
-"""Public Mail & Calendar types (no tokens on the wire)."""
+"""Provider-neutral Mail & Calendar DTOs (no raw Google payloads, no tokens)."""
 
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -22,10 +21,16 @@ class MailCalendarStatusOut(BaseModel):
     detail: str | None = None
 
 
+class ConnectIn(BaseModel):
+    """Client tells the backend where to send the user after OAuth (allowlisted)."""
+
+    app_return_uri: str
+
+
 class ConnectOut(BaseModel):
     authorization_url: str
-    # Opaque state for debugging only — browser round-trips it via Google.
-    # Not a secret the client must store; server validates HMAC on callback.
+    # Opaque state for debugging — browser round-trips it via Google.
+    # Not a secret the client must store; server validates HMAC + single-use txn.
     state: str
 
 
@@ -50,8 +55,21 @@ class MailMessage(BaseModel):
     from_address: str | None = None
     to_addresses: list[str] = Field(default_factory=list)
     date: str | None = None
+    # Plain / sanitized text only — never untrusted raw HTML.
     body_text: str | None = None
     snippet: str | None = None
+
+
+class MailListOut(BaseModel):
+    items: list[MailMessageSummary] = Field(default_factory=list)
+    next_page_token: str | None = None
+
+
+class CalendarAttendee(BaseModel):
+    email: str | None = None
+    display_name: str | None = None
+    response_status: str | None = None
+    optional: bool = False
 
 
 class CalendarEventSummary(BaseModel):
@@ -72,7 +90,12 @@ class CalendarEvent(BaseModel):
     end: str | None = None
     status: str | None = None
     location: str | None = None
-    attendees: list[dict[str, Any]] = Field(default_factory=list)
+    attendees: list[CalendarAttendee] = Field(default_factory=list)
+
+
+class EventListOut(BaseModel):
+    items: list[CalendarEventSummary] = Field(default_factory=list)
+    next_page_token: str | None = None
 
 
 class FreeBusySlot(BaseModel):

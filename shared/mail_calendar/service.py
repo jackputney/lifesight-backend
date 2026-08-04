@@ -1,4 +1,15 @@
-"""Connection lifecycle + credential loading for Mail & Calendar."""
+"""Connection lifecycle + credential loading for Mail & Calendar.
+
+Status mapping (connection check / refresh):
+- missing credentials → disconnected
+- valid or successfully refreshed access token → connected_read
+- revoked / rejected refresh token → reauth_required
+- temporary provider/network failure during refresh → error
+
+Encryption: tokens are Fernet-encrypted and keyed by (user_id, provider).
+Key rotation is incomplete — see oauth.ENCRYPTION_KEY_ROTATION_STATUS
+(no key-version column on oauth_credentials yet).
+"""
 
 from __future__ import annotations
 
