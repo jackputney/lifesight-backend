@@ -41,6 +41,16 @@ from modes.mail_calendar.prompt import TOOLS as MAIL_CALENDAR_TOOLS
 from routers.v2 import router as v2_router
 from shared import db
 from shared.auth import get_current_user_id
+from shared.research import (
+    ResearchFactCheck,
+    ResearchResult,
+    ResearchSource,
+    extract_claim,
+    get_research_provider,
+    sanitize_research,
+    unavailable_turn,
+    wants_research,
+)
 
 load_dotenv()
 
@@ -131,43 +141,13 @@ class VisualPanel(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
-class ResearchSource(BaseModel):
-    """Public Brainstorm citation fields (no snippet in the initial iOS contract)."""
-    title: str
-    url: str
-    publisher: str | None = None
-    retrieved_at: str
-
-
-class ResearchFactCheck(BaseModel):
-    claim: str
-    verdict: str  # supported | partially_supported | not_supported | inconclusive
-    confidence: float
-
-
-class ResearchResult(BaseModel):
-    """Additive Brainstorm research payload. Separate from visual_panel.
-
-    Ordinary non-research turns use research=null on ChatResponse.
-    fact_check is only valid when status == \"completed\" and a real web
-    search ran; completed research must include at least one source
-    (enforced when providers populate this object in a later slice).
-    """
-    status: str  # not_requested | completed | failed | unavailable
-    query: str | None = None
-    summary: str | None = None
-    uncertainty: str | None = None
-    sources: list[ResearchSource] = Field(default_factory=list)
-    fact_check: ResearchFactCheck | None = None
-
-
 class ChatResponse(BaseModel):
     reply: str
     mode: str
     conversation_id: str
     pending_action: PendingAction | None = None
     visual_panel: VisualPanel | None = None
-    # Default null for all modes until Brainstorm research ships.
+    # Additive Brainstorm field — null for ordinary turns and all other modes.
     research: ResearchResult | None = None
 
 
@@ -364,9 +344,37 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     history.append({"role": "user", "content": req.transcript})
     await db.append_message(conversation_id, "user", req.transcript)
 
-    reply, pending_action = await _run_model_turn(
-        mode=mode, conversation_id=conversation_id, history=history, user_id=user_id
-    )
+    research: ResearchResult | None = None
+    pending_action: PendingAction | None = None
+
+    # Brainstorm research is opt-in via explicit verify/research/check language.
+    # No Confirm Gate — read-only. Other modes never attach a research object.
+    if mode == "brainstorm" and wants_research(req.transcript):
+        provider = get_research_provider()
+        if provider is None:
+            turn = unavailable_turn(
+                req.transcript,
+                reason=(
+                    "I can't look that up right now — web research isn't available. "
+                    "We can keep brainstorming without a live search."
+                ),
+            )
+        else:
+            turn = await provider.research(
+                req.transcript,
+                claim=extract_claim(req.transcript),
+            )
+        reply = turn.reply
+        # Re-sanitize every provider payload so unsupported statuses / sneaky
+        # fact_check objects cannot reach the client. Treat unavailable as
+        # "no real web-search call"; completed/failed as a real attempt.
+        provider_called = turn.research.status != "unavailable"
+        research = sanitize_research(turn.research, provider_called=provider_called)
+        await db.append_message(conversation_id, "assistant", reply)
+    else:
+        reply, pending_action = await _run_model_turn(
+            mode=mode, conversation_id=conversation_id, history=history, user_id=user_id
+        )
 
     return ChatResponse(
         reply=reply,
@@ -374,7 +382,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
         conversation_id=conversation_id,
         pending_action=pending_action,
         visual_panel=None,
-        research=None,
+        research=research,
     )
 
 

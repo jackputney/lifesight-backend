@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import unittest
 
-from main import ChatResponse, ResearchFactCheck, ResearchResult, ResearchSource
+from main import ChatResponse
+from shared.research import ResearchFactCheck, ResearchResult, ResearchSource
 
 
 class ChatResponseResearchTests(unittest.TestCase):
