@@ -29,11 +29,15 @@ from pydantic import BaseModel, Field
 
 from modes.author.prompt import SYSTEM_PROMPT as AUTHOR_PROMPT
 from modes.author.prompt import TOOLS as AUTHOR_TOOLS
+from modes.brainstorm.prompt import SYSTEM_PROMPT as BRAINSTORM_PROMPT
+from modes.brainstorm.prompt import TOOLS as BRAINSTORM_TOOLS
 from modes.diet.prompt import SYSTEM_PROMPT as DIET_PROMPT
 from modes.diet.prompt import TOOLS as DIET_TOOLS
 from modes.fitness.prompt import SYSTEM_PROMPT as FITNESS_PROMPT
 from modes.fitness.prompt import TOOLS as FITNESS_TOOLS
 from modes.jarvis.prompt import SYSTEM_PROMPT as JARVIS_PROMPT
+from modes.mail_calendar.prompt import SYSTEM_PROMPT as MAIL_CALENDAR_PROMPT
+from modes.mail_calendar.prompt import TOOLS as MAIL_CALENDAR_TOOLS
 from routers.v2 import router as v2_router
 from shared import db
 from shared.auth import get_current_user_id
@@ -67,26 +71,37 @@ MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 # v2 chat modes. health is retired (superseded by fitness + diet).
 # jarvis source stays in MODE_REGISTRY / modes/jarvis/ so code is not deleted,
-# but it is hidden from the public /modes list (see PUBLIC_MODE_IDS).
+# but it is hidden from the public /modes list (see PUBLIC_MODE_IDS) and must
+# not be reused for mail_calendar.
 # settings is an iOS screen, not a chat mode.
 MODE_REGISTRY = {
     "fitness": FITNESS_PROMPT,
     "diet": DIET_PROMPT,
     "author": AUTHOR_PROMPT,
+    "brainstorm": BRAINSTORM_PROMPT,
+    "mail_calendar": MAIL_CALENDAR_PROMPT,
     "jarvis": JARVIS_PROMPT,
 }
 
-# Authoritative public v2 mode list — what GET /modes returns and what the
-# iOS Home/Sidebar may show. Intentionally excludes jarvis (legacy, hidden)
-# and health (retired).
-PUBLIC_MODE_IDS: tuple[str, ...] = ("author", "diet", "fitness")
+# Authoritative public v2 mode list — exact Home/Sidebar order. Do not sort.
+# Excludes jarvis (legacy, hidden) and health (retired).
+PUBLIC_MODE_IDS: tuple[str, ...] = (
+    "fitness",
+    "diet",
+    "author",
+    "brainstorm",
+    "mail_calendar",
+)
 
 # Per-mode Anthropic tool schemas. Modes with no tools simply aren't a key
 # here — _run_model_turn treats a missing/empty list as "no tools offered".
+# brainstorm / mail_calendar register empty tool lists until later slices.
 MODE_TOOLS: dict[str, list[dict]] = {
     "author": AUTHOR_TOOLS,
     "fitness": FITNESS_TOOLS,
     "diet": DIET_TOOLS,
+    "brainstorm": BRAINSTORM_TOOLS,
+    "mail_calendar": MAIL_CALENDAR_TOOLS,
 }
 
 # A voice confirm that never arrives shouldn't stay "pending" forever. Passed
@@ -296,10 +311,13 @@ def health():
 
 @app.get("/modes")
 def modes():
-    """Public mode catalog for clients. Sorted for a stable wire order.
-    Does not list every key in MODE_REGISTRY — jarvis remains routable if
-    somehow requested, but is not advertised."""
-    return {"modes": sorted(PUBLIC_MODE_IDS)}
+    """Public mode catalog for clients.
+
+    Order is product-significant (Home card order). Do not alphabetically
+    sort. jarvis remains in MODE_REGISTRY for legacy/debug but is not
+    advertised here.
+    """
+    return {"modes": list(PUBLIC_MODE_IDS)}
 
 
 @app.get("/me")
