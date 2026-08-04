@@ -5,7 +5,7 @@
 | Role | Commit | Notes |
 |------|--------|--------|
 | **Backend application contract** | `613e6e389902ba88fd0be3e2df29ee4a6f9e9a04` | Runtime code that was smoke-tested |
-| **This documentation** | `d94e1bb7e5b7819157e36f3f6249c6608e0c9e11` (first docs commit); **superseded by the commit that lands this revision** | Docs-only; no runtime change |
+| **This documentation** | `a93b12651d2279cb135b0463fed0bff9b8b2bb47` (refines `d94e1bb`) | Docs-only; runtime still `613e6e3` |
 
 iOS should pin decoding and UX assumptions to **app commit `613e6e3`** until a later app commit + matching contract note supersede it.
 
