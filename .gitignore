@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.db
+
+# Generated TTS audio (scripts/tts_smoke.py). Never commit — this repo is
+# public and synthesized speech is the primary user's voice + content.
+tts_samples/
+*.mp3
