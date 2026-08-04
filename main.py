@@ -38,6 +38,7 @@ from modes.fitness.prompt import TOOLS as FITNESS_TOOLS
 from modes.jarvis.prompt import SYSTEM_PROMPT as JARVIS_PROMPT
 from modes.mail_calendar.prompt import SYSTEM_PROMPT as MAIL_CALENDAR_PROMPT
 from modes.mail_calendar.prompt import TOOLS as MAIL_CALENDAR_TOOLS
+from routers.mail_calendar import router as mail_calendar_router
 from routers.v2 import router as v2_router
 from shared import db
 from shared.auth import get_current_user_id
@@ -75,6 +76,7 @@ app.add_middleware(
 )
 
 app.include_router(v2_router)
+app.include_router(mail_calendar_router)
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
