@@ -1,22 +1,22 @@
 # v2 iOS contract note (backend → iOS handoff)
 
-**Against commit:** `613e6e389902ba88fd0be3e2df29ee4a6f9e9a04` (`v2-rebuild`)  
-**Status:** foundation smoke-tested against this exact commit. Not production-ready.  
-**Do not treat this as frozen until the mode-registry decision below is accepted.**
+## Version ownership (pin against this)
+
+| Role | Commit | Notes |
+|------|--------|--------|
+| **Backend application contract** | `613e6e389902ba88fd0be3e2df29ee4a6f9e9a04` | Runtime code that was smoke-tested |
+| **This documentation** | `d94e1bb7e5b7819157e36f3f6249c6608e0c9e11` (first docs commit); **superseded by the commit that lands this revision** | Docs-only; no runtime change |
+
+iOS should pin decoding and UX assumptions to **app commit `613e6e3`** until a later app commit + matching contract note supersede it.
+
+**Status:** foundation smoke-tested against `613e6e3`. Not production-ready.  
+**Not frozen:** public mode list, weight units, and several schema proposals below still need product/engineering approval.
 
 ---
 
-## 1. Authoritative active v2 modes (proposed)
+## 1. Public mode list — UNRESOLVED (runtime ≠ recommendation)
 
-| Mode | Active in v2 client? | Notes |
-|------|----------------------|--------|
-| `fitness` | **Yes** | New |
-| `diet` | **Yes** | New (supersedes half of old `health`) |
-| `author` | **Yes** | Postgres chapters/scenes; Google Docs gone |
-| `health` | **No** | Retired from backend `MODE_REGISTRY` |
-| `jarvis` | **Legacy only** | Code stays on disk; **should not** be shown in v2 UI |
-
-### Current backend behavior (as of this commit)
+### Runtime today (`613e6e3`)
 
 `GET /modes` returns:
 
@@ -24,34 +24,32 @@
 {"modes":["author","diet","fitness","jarvis"]}
 ```
 
-That still **advertises** `jarvis` because it remains in `MODE_REGISTRY`.  
-**Recommendation (not yet implemented):** separate public list from on-disk registry:
+`health` is **not** in `MODE_REGISTRY` (retired from routing).  
+`jarvis` **is still advertised** because it remains in `MODE_REGISTRY`.
+
+### Recommendation (not implemented — needs product approval)
+
+| Mode | Proposed client visibility | Notes |
+|------|----------------------------|--------|
+| `fitness` | Active | New |
+| `diet` | Active | New |
+| `author` | Active | Postgres chapters/scenes |
+| `health` | Hidden / retired | Removed from backend registry |
+| `jarvis` | Hidden legacy | Keep `modes/jarvis/` on disk; omit from `/modes` |
+
+Proposed code shape after approval:
 
 ```text
 PUBLIC_MODE_IDS = ["fitness", "diet", "author"]
 ```
 
-and have `/modes` return only those. Keep `modes/jarvis/` untouched.
-
-### iOS instruction (product decision needed)
-
-Until product explicitly agrees, frontend and backend are misaligned with older iOS docs that say `author / health / jarvis`.
-
-**Proposed superseding rule for iOS:**
-
-```text
-Active v2 modes: fitness, diet, author.
-Health is retired.
-Jarvis remains legacy code but is not shown in the v2 client.
-```
-
-Do not finish iOS navigation/mode cards until this is accepted.
+Until product explicitly approves this, **do not finish iOS navigation/mode cards** as if the recommendation were already live. Treat the mode list as **unresolved**.
 
 ---
 
 ## 2. `visual_panel` schema
 
-Additive optional field on `ChatResponse` and on some domain responses (e.g. `/workouts/voice-log`):
+Additive optional field on `ChatResponse` and some domain responses (e.g. `/workouts/voice-log`):
 
 ```ts
 visual_panel: { type: string, data: object } | null
@@ -61,11 +59,11 @@ visual_panel: { type: string, data: object } | null
 
 - Decode as optional.
 - If `null` / absent → no panel.
-- If `type` is unknown → **ignore** (do not crash); still show `reply` text.
+- If `type` is **unknown** → **ignore safely** (do not crash); still show `reply` text.
 
 ### Supported type today: `workout_sets`
 
-Exact shape returned by `/workouts/voice-log` against this commit:
+Exact shape returned by `/workouts/voice-log` against `613e6e3`:
 
 ```json
 {
@@ -86,152 +84,159 @@ Exact shape returned by `/workouts/voice-log` against this commit:
 }
 ```
 
-#### `sets[]` field contract (current implementation)
+#### `sets[]` fields (current implementation)
 
 | Field | Type | Required | Notes |
 |-------|------|----------|--------|
 | `id` | string (UUID) | yes | `set_logs.id` |
-| `exercise_id` | string (UUID) | yes | Today: `planned_exercises.id` (unstable across plan re-uploads — see exercises proposal) |
+| `exercise_id` | string (UUID) | yes | Today: `planned_exercises.id` (unstable across plan re-uploads) |
 | `exercise_name` | string | yes | Display name at log time |
-| `set_number` | integer | yes | 1-based; order in array is meaningful (log order) |
-| `reps` | integer \| null | yes (nullable) | Parsed from utterance; may be null if unclear |
-| `weight` | number \| null | yes (nullable) | **Decimal allowed** (JSON number). Bodyweight / omitted → `null` (not `0`) |
+| `set_number` | integer | yes | 1-based; array order is meaningful |
+| `reps` | integer \| null | yes (nullable) | May be null if parse unclear |
+| `weight` | number \| null | yes (nullable) | Decimal allowed |
 
-#### Not yet in the payload (gaps — do not invent on iOS)
+#### Not in payload yet
 
 | Field | Status |
 |-------|--------|
-| `unit` | **Not sent.** Implicit convention today: pounds (`lb`) for loaded lifts. Must be added before multi-unit support. |
-| `is_pr` | **Not sent.** PR text is in `pr_announcements[]` / `reply` only. |
-
-When units are added, expected shape:
-
-```json
-"weight": 135.0,
-"unit": "lb"
-```
-
-Allowed units (proposed): `"lb" | "kg" | null` (`null` only when `weight` is null).
+| `unit` / `weight_unit` | **Not sent** |
+| `is_pr` | **Not sent** (PR text in `pr_announcements` / `reply`) |
+| `load_type` | **Not sent** (see bodyweight rules below) |
 
 ---
 
-## 3. `health_metrics` rules (not ready for iOS display)
+## 3. Weight / units — do not assume `lb`
+
+### Current (`613e6e3`)
+
+- `"weight": 135` is a bare number.
+- **No unit field is sent.**
+- Backend engineers may *think* in pounds for gym bars; that is **not** an authoritative API guarantee.
+
+### iOS rules until a unit field ships
+
+1. **Do not** display `"lb"` or `"kg"` as if the server said so.
+2. Prefer showing the raw number only, or withhold production-facing weight captions.
+3. Do not hardcode a unit in Swift models as required.
+
+### Target shape (not implemented)
+
+```json
+"weight": 135.0,
+"weight_unit": "lb"
+```
+
+Proposed enum: `"lb" | "kg" | null` (`null` only when `weight` is null).
+
+---
+
+## 4. Bodyweight / load semantics
+
+### Current (`613e6e3`)
+
+- Ordinary bodyweight or omitted load → `"weight": null` (not `0`).
+- No way to express weighted or assisted bodyweight separately from external load.
+
+### Required distinctions (future contract — document now, implement later)
+
+| Case | Meaning | Future payload sketch |
+|------|---------|------------------------|
+| Plain bodyweight | e.g. pull-up, no added load | `"load_type": "bodyweight", "weight": null, "weight_unit": null` |
+| Weighted bodyweight | bodyweight + external load | `"load_type": "weighted_bodyweight", "weight": 45, "weight_unit": "lb"` |
+| Assisted | machine/band assistance | `"load_type": "assistance", "weight": 50, "weight_unit": "lb"` |
+| External only | barbell / dumbbell | `"load_type": "external", "weight": 135, "weight_unit": "lb"` |
+
+Until `load_type` exists, iOS must treat `weight: null` as “no external load recorded,” **not** as a fully specified bodyweight taxonomy.
+
+---
+
+## 5. `health_metrics` — add `unit` before production Terra
 
 Columns today: `metric_type`, `value`, `value_json`, `source_device`, `recorded_at` — **no `unit`**.
 
-### Intended semantics (proposal — not implemented)
+### Rules (proposal)
 
 | Field | Rule |
 |-------|------|
-| `value` | Normalized scalar summary when one number is meaningful; nullable |
-| `value_json` | Structured detail (sleep stages, HR series, etc.); nullable |
-| Both set | `value` is primary summary for lists/tiles; `value_json` is supplemental detail |
-| `unit` | **Required for client display** — must be added before iOS renders metrics |
-| `metric_type` | Free string (no enum migration); pair with `unit` for display |
+| `value` | Normalized scalar when one number is meaningful; nullable |
+| `value_json` | Structured detail; nullable |
+| Both set | `value` = primary summary; `value_json` = supplemental |
+| `unit` | **Required before production Terra ingestion**, not only before UI — store unambiguous units at write time |
 
-Example target record:
+Without units at ingest, kg/lb, m/mi, s/min, mg/dL/mmol/L collisions become permanent.
 
-```json
-{
-  "metric_type": "resting_heart_rate",
-  "value": 52,
-  "unit": "bpm",
-  "value_json": null,
-  "source_device": "Garmin",
-  "recorded_at": "2026-08-04T08:30:00Z"
-}
-```
+**Recommendation:** land `ALTER TABLE health_metrics ADD COLUMN unit TEXT` (or equivalent) **before** production wearable traffic. See also note in `docs/proposed/004_stable_exercises_catalog.sql`.
 
 **iOS: do not build health metric UI against the current schema.**
 
 ---
 
-## 4. Public JSON names vs DB columns
+## 6. Public JSON names vs DB columns
 
-APIs already use the clearer names (not the old spec shorthand):
-
-| Concept | JSON / API field |
-|---------|------------------|
+| Concept | API field |
+|---------|-----------|
 | Plan day ordering | `sort_order` |
 | Session calendar day | `session_date` |
-| Food row time (DB) | `logged_at` (not exposed on draft JSON today) |
+| Food row time (DB) | `logged_at` (not on draft JSON today) |
 
-Food draft JSON fields: `method`, `matched_food_name`, `calories`, `protein_g`, `carbs_g`, `fat_g`, `confidence`, `raw_input_ref`.
+Food draft JSON: `method`, `matched_food_name`, `calories`, `protein_g`, `carbs_g`, `fat_g`, `confidence`, `raw_input_ref`.
 
 ---
 
-## 5. Confirm Gate (what iOS can rely on)
+## 7. Confirm Gate
 
 | Action | Uses Confirm Gate? |
 |--------|--------------------|
-| `POST /food/entries` | **Yes** — returns `pending_action`; save on `/confirm` |
-| `POST /workouts/voice-log` | **No** — writes immediately; `pending_action: null` |
+| `POST /food/entries` | **Yes** |
+| `POST /workouts/voice-log` | **No** — `"pending_action": null` |
 | Ordinary scene CRUD | **No** |
-| Destructive author (e.g. delete scene) | **Yes** (via pending action) |
+| Destructive author (e.g. delete scene) | **Yes** |
 
-Verified against this commit: approve, reject, reconfirm, invalid id, cross-user → 403.
+### HTTP semantics (verified unless noted)
+
+| Case | HTTP | Body |
+|------|------|------|
+| Cross-user pending action | **403** | `{"detail":"Pending action does not belong to this user"}` |
+| Unknown / malformed / already resolved / expired | **200** | `{"result":"That action is no longer pending."}` |
+
+The 200 collapse is deliberate (VoiceOver-friendly; avoids ID oracle). iOS must not expect 404/409.
+
+### TTL
+
+- Default: **10 minutes** (`PENDING_ACTION_TTL` in `main.py`).
+- Enforced on `/confirm` (mark `expired`, no side effects).
+- No background sweeper yet.
+- **Not integration-tested** yet — see test plan below.
 
 ---
 
-## 6. Auth / Terra (labels for iOS planning)
+## 8. Auth / Terra labels
 
 | Area | Label |
 |------|--------|
-| `/auth/*` + `AUTH_MODE=real` | **Implemented, not integration-tested** |
-| Terra connect + webhook | **Incomplete** — do not wire production wearable UI yet |
-
-Authorization logic was smoke-tested in **development mode** (fixed / seeded UUIDs ending `…0001` / `…0002`). That proves user-isolation checks in Confirm Gate code paths. It does **not** prove real Supabase JWT parsing, signature validation, expiry, Apple exchange, or magic-link.
-
----
-
-## 7. Confirm Gate HTTP semantics (explicit)
-
-### Cross-user
-`POST /confirm` on another user's pending action → **HTTP 403**  
-```json
-{"detail":"Pending action does not belong to this user"}
-```
-
-### Unknown / expired / already-resolved (deliberate collapse)
-These all return **HTTP 200** with the same spoken-friendly body (no execution):
-
-```json
-{"result":"That action is no longer pending."}
-```
-
-Applies to:
-- nonexistent / malformed action IDs,
-- already confirmed or rejected,
-- pending rows whose `expires_at` has passed (flipped to `expired` on the confirm attempt).
-
-This is intentional: one VoiceOver-friendly line; avoids revealing whether an ID ever existed. iOS should **not** expect 404/409 for these cases.
-
-### TTL (server-side)
-- Default TTL: **10 minutes** (`PENDING_ACTION_TTL` in `main.py`).
-- Enforced on `/confirm`: if `status == pending` and `now > expires_at`, the row is marked `expired` and the response is the same “no longer pending” 200 — **no side effects**.
-- There is **no background sweeper/cron** yet; expiry is checked at confirm time. Client-side timers are UX only; the server remains the authority.
-- TTL expiry was **not** integration-tested in the post-commit suite (approve/reject/duplicate/cross-user were). Treat TTL as implemented-in-code, evidence pending.
-
-### Workout sets vs Confirm Gate
-`POST /workouts/voice-log` writes immediately and returns `"pending_action": null`. Proven against `613e6e3`.
+| `/auth/*` + `AUTH_MODE=real` | Implemented, **not** integration-tested |
+| Dev-mode user isolation (`…0001` / `…0002`) | Smoke-tested (Confirm Gate 403) |
+| Real Supabase JWT / Apple / magic-link | **Unverified** |
+| Terra | **Incomplete** — do not wire production wearable UI |
 
 ---
 
-## 8. Weight / units (current vs required)
+## 9. Pending-action TTL — integration test plan (not yet run)
 
-| Topic | Current (613e6e3) | Contract direction |
-|-------|-------------------|--------------------|
-| Loaded weight | JSON number, e.g. `135` or `135.5` | Decimal allowed |
-| Bodyweight / omitted | `null` (not `0`) | Keep |
-| Unit in payload | **Absent** | Must add `unit`: `"lb" \| "kg" \| null` before multi-unit UI |
-| Implicit assumption today | pounds (`lb`) for gym bars | Documented interim only — do not hardcode forever on iOS without `unit` |
+Goal: prove server-side expiry without relying on the iOS timer.
 
-Until `unit` ships, iOS may display an interim “lb” label only if product accepts that interim; safer to show the number without a unit caption.
+1. **Short TTL harness** — temporarily override TTL to ~5–10 seconds *in a test-only path*, or insert a `pending_actions` row with `expires_at` in the past / near future via SQL (preferred: no production code change).
+2. **Before expiry** — `POST /confirm` `approved: true` on a fresh food pending action → executes (200 Saved).
+3. **After expiry** — create pending action; wait or set `expires_at` in the past; `POST /confirm` → **200** `"That action is no longer pending."`; verify **no** `food_entries` row written.
+4. **Expired + approve vs reject** — both must be no-ops with the same 200 body.
+5. **Cross-user + expired** — other user's expired action → still **403** (ownership before / as well as expiry; document actual order if it differs).
+6. **Idempotency** — second confirm after expiry → same 200 body.
+7. **No indefinite usability** — expired row `status` is `expired` in DB after the confirm attempt (or equivalent), not left `pending` forever after a confirm touch.
+
+Do not claim TTL proven until this plan has exact status codes/bodies recorded against a known app commit.
 
 ---
 
-## 9. `/modes` / Jarvis (product decision still open)
+## 10. Stable exercises catalog
 
-**As of 613e6e3, `/modes` still exposes `jarvis`.**  
-Recommended public registry (not coded yet): `fitness`, `diet`, `author` only.  
-`modes/jarvis/` stays on disk. This remains the largest cross-repo blocker.
+Proposal lives at `docs/proposed/004_stable_exercises_catalog.sql` — **do not apply** until schema review completes. Backfill / identity rules are expanded in that file.

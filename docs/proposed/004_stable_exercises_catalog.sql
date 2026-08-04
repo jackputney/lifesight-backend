@@ -1,12 +1,46 @@
 -- PROPOSED — DO NOT APPLY until reviewed.
--- Not under migrations/*.sql so scripts/run_migrations.py will not pick it up.
+-- Path: docs/proposed/ (NOT migrations/) so run_migrations.py will not pick it up.
 --
--- Problem: personal_records.exercise_id / set_logs.exercise_id currently FK to
--- planned_exercises(id). Re-uploading or regenerating a plan creates new
--- planned_exercises rows, so "Bench Press" gets a new identity and PRs /
--- history fragment.
+-- Describes intended schema after app commit 613e6e3.
+-- Companion contract: docs/V2_IOS_CONTRACT_NOTE.md
 --
--- Direction: stable exercises catalog; plan rows and logs reference that.
+-- Problem: personal_records.exercise_id / set_logs.exercise_id FK to
+-- planned_exercises(id). Re-upload/regenerate plan → new IDs → PR/history break.
+--
+-- Direction: stable exercises catalog; plan/log/PR rows reference that.
+
+-- =====================================================================
+-- Backfill / identity rules (review these before applying anything)
+-- =====================================================================
+--
+-- Scope of catalog IDs
+--   * System-wide rows: exercises.user_id IS NULL (shared canonical names).
+--   * User-private / custom: exercises.user_id = owner (never merge across users).
+--
+-- Canonicalization (automatic, conservative)
+--   * Trim, collapse whitespace, casefold for matching only.
+--   * Do NOT strip equipment words automatically ("Barbell Bench Press" ≠
+--     "Bench Press") — those are aliases or manual merges, not auto-collapses.
+--
+-- Aliases
+--   * exercise_aliases holds alternate strings ("BB Bench", "Flat Barbell Bench").
+--   * Matching order: exact canonical → alias → leave unmatched.
+--
+-- Ambiguous matches
+--   * If multiple catalog rows score equally, DO NOT auto-merge.
+--   * Leave catalog_exercise_id NULL and queue for manual review.
+--
+-- Unmatched / custom
+--   * Create a user-private exercises row with canonical_name = source name.
+--   * Keep logging/PRs usable immediately; promote to system canonical later
+--     only via explicit admin/user action.
+--
+-- Deletes
+--   * Once referenced by set_logs or personal_records, catalog delete is
+--     prohibited (RESTRICT) or soft-delete only — never hard-delete in place.
+--
+-- Cutover uniqueness (after backfill)
+--   UNIQUE (user_id, catalog_exercise_id, rep_range) on personal_records.
 
 -- Stable catalog -----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS exercises (
@@ -33,28 +67,29 @@ CREATE INDEX IF NOT EXISTS idx_exercise_aliases_alias
     ON exercise_aliases (lower(alias));
 
 -- planned_exercises: keep prescription fields; point at stable exercise ----
--- Step A (additive, non-breaking): add nullable catalog FK
 ALTER TABLE planned_exercises
     ADD COLUMN IF NOT EXISTS catalog_exercise_id UUID REFERENCES exercises(id);
 
--- set_logs / personal_records: add catalog FK alongside legacy column ------
 ALTER TABLE set_logs
     ADD COLUMN IF NOT EXISTS catalog_exercise_id UUID REFERENCES exercises(id);
 
 ALTER TABLE personal_records
     ADD COLUMN IF NOT EXISTS catalog_exercise_id UUID REFERENCES exercises(id);
 
--- Backfill sketch (run after deploying code that writes catalog ids):
---   1) For each distinct planned_exercises.name per user, upsert exercises.
+-- Backfill procedure sketch:
+--   1) For each distinct (user_id, planned_exercises.name), try alias/canonical
+--      match; else create user-private exercises row.
 --   2) SET planned_exercises.catalog_exercise_id from that map.
---   3) SET set_logs.catalog_exercise_id / personal_records.catalog_exercise_id
---      from their planned_exercises row (or name match).
---   4) After backfill + code cutover, drop old exercise_id FKs to
---      planned_exercises and rename catalog_exercise_id → exercise_id.
---
--- Do NOT collapse PR uniqueness onto planned_exercises.id.
--- Target UNIQUE for PRs after cutover:
---   UNIQUE (user_id, catalog_exercise_id, rep_range)
+--   3) Propagate to set_logs / personal_records via planned_exercises or
+--      conservative name match; leave NULL if ambiguous.
+--   4) Manual review queue for NULL catalog_exercise_id with volume > 0.
+--   5) After code cutover, drop FKs to planned_exercises.id and rename
+--      catalog_exercise_id → exercise_id; enforce PR UNIQUE above.
 
--- Optional later: unit on health_metrics (separate small migration)
+-- =====================================================================
+-- health_metrics.unit — recommend BEFORE production Terra ingestion
+-- (separate small migration is fine; listed here so it is not forgotten)
+-- =====================================================================
 -- ALTER TABLE health_metrics ADD COLUMN IF NOT EXISTS unit TEXT;
+-- Store unit at write time (kg/lb, m/mi, s/min, bpm, mg/dL, …).
+-- Do not wait until UI work; ambiguous stored values are hard to repair.
