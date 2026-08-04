@@ -654,11 +654,11 @@ async def manuscripts_list_chapters(
     ]
 
 
-@router.post("/author/brainstorm")
-async def author_brainstorm(
+async def _run_author_brainstorm_session(
     body: BrainstormRequest,
-    user_id: str = Depends(get_current_user_id),
-):
+    user_id: str,
+) -> dict:
+    """Manuscript-linked plot/character pairing (not global Brainstorm mode)."""
     ms = await db.get_manuscript(body.manuscript_id, user_id)
     if ms is None:
         raise HTTPException(status_code=404, detail="Manuscript not found")
@@ -695,7 +695,31 @@ async def author_brainstorm(
         "brainstorm_session_id": str(session["id"]),
         "pending_action": None,
         "visual_panel": None,
+        "research": None,
     }
+
+
+@router.post("/author/brainstorm-session")
+async def author_brainstorm_session(
+    body: BrainstormRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Canonical Author plot/character brainstorm session endpoint."""
+    return await _run_author_brainstorm_session(body, user_id)
+
+
+@router.post("/author/brainstorm", include_in_schema=False)
+async def author_brainstorm_compat(
+    body: BrainstormRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Compatibility alias for `/author/brainstorm-session`.
+
+    Retained while any client or prompt may still call the old path.
+    Searched before rename: no iOS caller; docs/prompts updated to the new
+    path. Remove this alias only after an explicit deprecation pass.
+    """
+    return await _run_author_brainstorm_session(body, user_id)
 
 
 # ---------------------------------------------------------------------------

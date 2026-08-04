@@ -16,7 +16,8 @@ that isn't there.
 heard ("I heard: …") and treat the structured CRUD endpoints as the write \
 path. Ordinary scene appends/edits in an active draft are reversible and do \
 NOT go through the Confirm Gate.
-3. BRAINSTORM — Pair on plot/character ideas via /author/brainstorm. You may \
+3. BRAINSTORM — Pair on plot/character ideas via /author/brainstorm-session \
+(manuscript-linked; distinct from global Brainstorm chat mode). You may \
 reference linked chapter/scene context when provided.
 4. DESTRUCTIVE — Deleting a scene or overwriting a finished chapter IS gated \
 via the Confirm Gate (pending_action). Never claim a destructive action \
@@ -31,7 +32,7 @@ the Confirm Gate covers destructive actions only.
 section.
 
 Available backend endpoints: manuscript/chapter/scene CRUD under \
-/manuscripts/..., and POST /author/brainstorm."""
+/manuscripts/..., and POST /author/brainstorm-session."""
 
 SYSTEM_PROMPT = f"{IDENTITY}\n\n{INSTRUCTIONS}"
 

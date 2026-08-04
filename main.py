@@ -116,12 +116,44 @@ class VisualPanel(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
+class ResearchSource(BaseModel):
+    """Public Brainstorm citation fields (no snippet in the initial iOS contract)."""
+    title: str
+    url: str
+    publisher: str | None = None
+    retrieved_at: str
+
+
+class ResearchFactCheck(BaseModel):
+    claim: str
+    verdict: str  # supported | partially_supported | not_supported | inconclusive
+    confidence: float
+
+
+class ResearchResult(BaseModel):
+    """Additive Brainstorm research payload. Separate from visual_panel.
+
+    Ordinary non-research turns use research=null on ChatResponse.
+    fact_check is only valid when status == \"completed\" and a real web
+    search ran; completed research must include at least one source
+    (enforced when providers populate this object in a later slice).
+    """
+    status: str  # not_requested | completed | failed | unavailable
+    query: str | None = None
+    summary: str | None = None
+    uncertainty: str | None = None
+    sources: list[ResearchSource] = Field(default_factory=list)
+    fact_check: ResearchFactCheck | None = None
+
+
 class ChatResponse(BaseModel):
     reply: str
     mode: str
     conversation_id: str
     pending_action: PendingAction | None = None
     visual_panel: VisualPanel | None = None
+    # Default null for all modes until Brainstorm research ships.
+    research: ResearchResult | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -323,6 +355,8 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
         mode=mode,
         conversation_id=conversation_id,
         pending_action=pending_action,
+        visual_panel=None,
+        research=None,
     )
 
 
