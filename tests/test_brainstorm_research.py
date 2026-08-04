@@ -9,16 +9,23 @@ import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from main import app
+from shared.anthropic_research import AnthropicResearchProvider
 from shared.research import (
+    MAX_PUBLIC_SOURCES,
+    MAX_RESEARCH_QUERY_LENGTH,
     ResearchFactCheck,
     ResearchResult,
     ResearchSource,
     ResearchTurn,
+    clamp_research_query,
     clear_research_provider_override,
+    is_safe_http_url,
     sanitize_research,
+    sanitize_source_url,
     set_research_provider_for_tests,
     utc_now_iso,
     wants_research,
@@ -37,7 +44,7 @@ class FakeResearchProvider:
         return self._turn
 
 
-def _completed_turn(query: str = "fact-check: the sky is blue") -> ResearchTurn:
+def _completed_turn(query: str = "fact-check this: the sky is blue") -> ResearchTurn:
     return ResearchTurn(
         reply="Sources say the daytime sky appears blue due to Rayleigh scattering.",
         research=sanitize_research(
@@ -69,13 +76,89 @@ class IntentTests(unittest.TestCase):
     def test_ordinary_discussion_does_not_want_research(self) -> None:
         self.assertFalse(wants_research("What if the mentor is lying?"))
         self.assertFalse(wants_research("Help me poke holes in this idea."))
+        self.assertFalse(wants_research("Please check my reasoning on this plot beat."))
+        self.assertFalse(wants_research("Can you check this idea with me?"))
+        self.assertFalse(wants_research("Does that logic check out?"))
+        self.assertFalse(wants_research("Just check."))  # bare check insufficient
+        self.assertFalse(wants_research("I'll check tomorrow."))
 
     def test_explicit_phrases_want_research(self) -> None:
-        self.assertTrue(wants_research("Please fact-check that the FDA was founded in 1906."))
+        self.assertTrue(wants_research("Fact-check this: the FDA was founded in 1906."))
+        self.assertTrue(wants_research("Please verify this online."))
+        self.assertTrue(wants_research("Search the web for when the FDA was founded."))
+        self.assertTrue(wants_research("Look this up for me."))
+        self.assertTrue(wants_research("Research this claim about boiling water."))
+        self.assertTrue(wants_research("Check whether this is true: water boils at 100C."))
+        self.assertTrue(wants_research("Find sources for this claim."))
         self.assertTrue(wants_research("Can you research when the FDA was founded?"))
         self.assertTrue(wants_research("Verify this claim for me."))
         self.assertTrue(wants_research("Look up the founding year of the FDA."))
         self.assertTrue(wants_research("Check whether water boils at 100C at sea level."))
+
+
+class UrlSanitizeTests(unittest.TestCase):
+    def test_only_http_https_allowed(self) -> None:
+        self.assertTrue(is_safe_http_url("https://example.com/a"))
+        self.assertTrue(is_safe_http_url("http://example.com/a"))
+        self.assertFalse(is_safe_http_url("javascript:alert(1)"))
+        self.assertFalse(is_safe_http_url("data:text/html,hi"))
+        self.assertFalse(is_safe_http_url("file:///etc/passwd"))
+        self.assertFalse(is_safe_http_url("ftp://example.com/a"))
+        self.assertFalse(is_safe_http_url("not a url"))
+        self.assertFalse(is_safe_http_url("https://"))
+        self.assertIsNone(sanitize_source_url("javascript:void(0)"))
+        self.assertEqual(sanitize_source_url("https://ok.example/x"), "https://ok.example/x")
+
+    def test_sanitize_drops_unsafe_urls_and_caps_sources(self) -> None:
+        sources = [
+            ResearchSource(
+                title="bad",
+                url="javascript:alert(1)",
+                publisher=None,
+                retrieved_at=utc_now_iso(),
+            ),
+            ResearchSource(
+                title="file",
+                url="file:///tmp/x",
+                publisher=None,
+                retrieved_at=utc_now_iso(),
+            ),
+        ]
+        for i in range(8):
+            sources.append(
+                ResearchSource(
+                    title=f"ok{i}",
+                    url=f"https://example.com/{i}",
+                    publisher="example.com",
+                    retrieved_at=utc_now_iso(),
+                )
+            )
+        out = sanitize_research(
+            ResearchResult(status="completed", query="q", sources=sources),
+            provider_called=True,
+        )
+        self.assertEqual(out.status, "completed")
+        self.assertEqual(len(out.sources), MAX_PUBLIC_SOURCES)
+        self.assertTrue(all(s.url.startswith("https://") for s in out.sources))
+
+    def test_completed_with_only_unsafe_urls_becomes_failed(self) -> None:
+        out = sanitize_research(
+            ResearchResult(
+                status="completed",
+                query="q",
+                sources=[
+                    ResearchSource(
+                        title="bad",
+                        url="data:text/plain,hi",
+                        publisher=None,
+                        retrieved_at=utc_now_iso(),
+                    )
+                ],
+            ),
+            provider_called=True,
+        )
+        self.assertEqual(out.status, "failed")
+        self.assertEqual(out.sources, [])
 
 
 class SanitizeTests(unittest.TestCase):
@@ -148,6 +231,104 @@ class SanitizeTests(unittest.TestCase):
             self.assertIsNone(out.fact_check)
             self.assertEqual(out.sources, [])
 
+    def test_query_is_clamped(self) -> None:
+        long_q = "x" * (MAX_RESEARCH_QUERY_LENGTH + 50)
+        out = sanitize_research(
+            ResearchResult(
+                status="failed",
+                query=long_q,
+                sources=[],
+            ),
+            provider_called=True,
+        )
+        self.assertEqual(len(out.query or ""), MAX_RESEARCH_QUERY_LENGTH)
+        self.assertEqual(len(clamp_research_query(long_q)), MAX_RESEARCH_QUERY_LENGTH)
+
+
+class AnthropicProviderBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_api_key_unavailable(self) -> None:
+        provider = AnthropicResearchProvider(api_key="")
+        turn = await provider.research("Fact-check this: water boils at 100C.")
+        self.assertEqual(turn.research.status, "unavailable")
+        self.assertIsNone(turn.research.fact_check)
+
+    async def test_timeout_returns_failed(self) -> None:
+        provider = AnthropicResearchProvider(api_key="test-key", timeout=0.01)  # pragma: allowlist secret
+
+        async def _boom(**_kwargs):
+            raise httpx.TimeoutException("timed out")
+
+        with patch.object(provider, "_messages_create", side_effect=_boom):
+            turn = await provider.research("Search the web for boiling point of water.")
+        self.assertEqual(turn.research.status, "failed")
+        self.assertIsNone(turn.research.fact_check)
+        self.assertIn("timed out", (turn.research.uncertainty or "").lower())
+
+    async def test_malformed_response_returns_failed(self) -> None:
+        provider = AnthropicResearchProvider(api_key="test-key")  # pragma: allowlist secret
+
+        async def _bad(**_kwargs):
+            return "not-a-dict"
+
+        with patch.object(provider, "_messages_create", side_effect=_bad):
+            turn = await provider.research("Find sources for this claim.")
+        self.assertEqual(turn.research.status, "failed")
+        self.assertIsNone(turn.research.fact_check)
+
+    async def test_zero_valid_sources_returns_failed(self) -> None:
+        provider = AnthropicResearchProvider(api_key="test-key")  # pragma: allowlist secret
+
+        async def _empty_sources(**_kwargs):
+            return {
+                "content": [
+                    {
+                        "type": "web_search_tool_result",
+                        "content": [
+                            {
+                                "type": "web_search_result",
+                                "title": "Bad",
+                                "url": "javascript:alert(1)",
+                            }
+                        ],
+                    },
+                    {"type": "text", "text": "No good sources."},
+                ]
+            }
+
+        with patch.object(provider, "_messages_create", side_effect=_empty_sources):
+            turn = await provider.research("Fact-check this: anything.")
+        self.assertEqual(turn.research.status, "failed")
+        self.assertEqual(turn.research.sources, [])
+        self.assertIsNone(turn.research.fact_check)
+
+    async def test_valid_sources_may_complete_and_cap_at_five(self) -> None:
+        provider = AnthropicResearchProvider(api_key="test-key")  # pragma: allowlist secret
+
+        async def _many(**_kwargs):
+            results = [
+                {
+                    "type": "web_search_result",
+                    "title": f"S{i}",
+                    "url": f"https://example.com/{i}",
+                }
+                for i in range(8)
+            ]
+            return {
+                "content": [
+                    {"type": "web_search_tool_result", "content": results},
+                    {
+                        "type": "text",
+                        "text": "Summary.\nFACT_CHECK: supported| 0.7| claim",
+                    },
+                ]
+            }
+
+        with patch.object(provider, "_messages_create", side_effect=_many):
+            turn = await provider.research("Fact-check this: claim.")
+        self.assertEqual(turn.research.status, "completed")
+        self.assertEqual(len(turn.research.sources), MAX_PUBLIC_SOURCES)
+        self.assertIsNotNone(turn.research.fact_check)
+
 
 class BrainstormChatResearchTests(unittest.TestCase):
     def tearDown(self) -> None:
@@ -181,7 +362,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
                 resp = client.post(
                     "/chat",
                     json={
-                        "transcript": "What if we reverse the plot twist?",
+                        "transcript": "Please check my reasoning on this twist.",
                         "mode": "brainstorm",
                         "conversation_id": None,
                     },
@@ -222,7 +403,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
                 resp = client.post(
                     "/chat",
                     json={
-                        "transcript": "Please fact-check: the sky is blue.",
+                        "transcript": "Please fact-check this: the sky is blue.",
                         "mode": "brainstorm",
                         "conversation_id": None,
                     },
@@ -262,7 +443,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
         failed = ResearchTurn(
             reply="Search failed.",
             research=sanitize_research(
-                ResearchResult(status="failed", query="look up X", sources=[]),
+                ResearchResult(status="failed", query="look this up", sources=[]),
                 provider_called=True,
             ),
         )
@@ -274,7 +455,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
                 resp = client.post(
                     "/chat",
                     json={
-                        "transcript": "Look up the boiling point of water.",
+                        "transcript": "Look this up: boiling point of water.",
                         "mode": "brainstorm",
                         "conversation_id": None,
                     },
@@ -311,7 +492,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
                 resp = client.post(
                     "/chat",
                     json={
-                        "transcript": "Research the founding of the FDA.",
+                        "transcript": "Research this: founding of the FDA.",
                         "mode": "brainstorm",
                         "conversation_id": None,
                     },
@@ -355,7 +536,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
                 resp = client.post(
                     "/chat",
                     json={
-                        "transcript": "Please fact-check my form on bench press.",
+                        "transcript": "Please fact-check this: my form on bench press.",
                         "mode": "fitness",
                         "conversation_id": None,
                     },
@@ -388,8 +569,8 @@ class BrainstormChatResearchTests(unittest.TestCase):
         injected = ResearchTurn(
             reply="still searching",
             research=ResearchResult(
-                status="running",  # not a public status
-                query="check this",
+                status="running",
+                query="check whether this is true",
                 sources=[
                     ResearchSource(
                         title="T",
@@ -403,11 +584,6 @@ class BrainstormChatResearchTests(unittest.TestCase):
                 ),
             ),
         )
-        # Provider returns unsanitized payload; chat path must sanitize.
-        # Simulate a careless provider by wrapping sanitize at the edge in chat:
-        # we sanitize in AnthropicResearchProvider / Fake should sanitize before return.
-        # This test asserts sanitize_research itself rejects injection; chat uses
-        # provider output as-is only if already sanitized — harden chat to sanitize.
         set_research_provider_for_tests(FakeResearchProvider(injected))
         prev = os.environ.get("ANTHROPIC_API_KEY")
         os.environ["ANTHROPIC_API_KEY"] = "unittest-placeholder"  # pragma: allowlist secret
@@ -416,7 +592,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
                 resp = client.post(
                     "/chat",
                     json={
-                        "transcript": "Check this claim for me.",
+                        "transcript": "Check whether this is true.",
                         "mode": "brainstorm",
                         "conversation_id": None,
                     },

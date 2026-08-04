@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
@@ -21,17 +22,45 @@ ALLOWED_VERDICTS = frozenset(
     {"supported", "partially_supported", "not_supported", "inconclusive"}
 )
 
-# Explicit research / verification asks only — ordinary brainstorm discussion
-# must not trigger a provider call.
+# Provider / public-wire bounds
+MAX_RESEARCH_QUERY_LENGTH = 500
+MAX_PUBLIC_SOURCES = 5
+DEFAULT_RESEARCH_TIMEOUT_SECONDS = 30.0
+
+# Conversational "check" phrasing that is NOT an online verification ask.
+_NON_RESEARCH_CHECK = re.compile(
+    r"(?i)\b("
+    r"check\s+my\s+(reasoning|logic|thinking|idea|ideas|work|math|argument)"
+    r"|check\s+this\s+(idea|reasoning|logic|thinking|argument|out)"
+    r"|does\s+(?:that|this|the)\s+logic\s+check\s+out"
+    r"|logic\s+check\s+out"
+    r"|sanity[\s-]?check"
+    r"|double[\s-]?check\s+my"
+    r")\b"
+)
+
+# Explicit online verification / research asks only.
+# Bare "check" alone is intentionally insufficient.
 _RESEARCH_INTENT = re.compile(
     r"(?i)\b("
-    r"fact[\s-]?check(?:ing|ed|s)?"
-    r"|verify(?:ing|ied|ies)?"
-    r"|research(?:ing|ed)?"
-    r"|look(?:ing)?\s+(?:\w+\s+){0,3}up"
-    r"|look\s*up"
-    r"|check(?:ing|ed|s)?"
-    r")\b"
+    r"fact[\s-]?check(?:\s+\w+){0,6}"
+    r"|verify(?:\s+\w+){0,4}\s+online"
+    r"|verify\s+this\b"
+    r"|verify\s+(?:that|whether|if)\b"
+    r"|search\s+the\s+web"
+    r"|search\s+online"
+    r"|look(?:\s+\w+){0,3}\s+up"
+    r"|look\s*up\b"
+    r"|research\s+this\b"
+    r"|research\s+(?:that|whether|if|the|when|who|what|where|why|how)\b"
+    r"|(?:please|can you|could you)\s+research\b"
+    r"|check\s+whether\b"
+    r"|check\s+if\s+(?:this|that|it)\s+is\s+true"
+    r"|check\s+(?:if|whether)\s+this\s+is\s+true"
+    r"|check\s+that\s+this\s+is\s+true"
+    r"|find\s+sources?\s+for\b"
+    r"|find\s+(?:me\s+)?sources?\b"
+    r")"
 )
 
 
@@ -111,8 +140,11 @@ def get_research_provider() -> ResearchProvider | None:
 
 
 def wants_research(transcript: str) -> bool:
+    """True only for explicit online verification / research asks."""
     text = (transcript or "").strip()
     if not text:
+        return False
+    if _NON_RESEARCH_CHECK.search(text):
         return False
     return _RESEARCH_INTENT.search(text) is not None
 
@@ -122,13 +154,47 @@ def extract_claim(transcript: str) -> str | None:
     text = (transcript or "").strip()
     if not text:
         return None
-    if re.search(r"(?i)\bfact[\s-]?check|verify\b", text):
-        return text
+    if re.search(r"(?i)\bfact[\s-]?check|verify\b|find\s+sources?\b", text):
+        return clamp_research_query(text)
     return None
+
+
+def clamp_research_query(query: str) -> str:
+    text = (query or "").strip()
+    if len(text) <= MAX_RESEARCH_QUERY_LENGTH:
+        return text
+    return text[:MAX_RESEARCH_QUERY_LENGTH].rstrip()
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def is_safe_http_url(url: str) -> bool:
+    """Accept only http(s) URLs with a non-empty host. Reject other schemes."""
+    raw = (url or "").strip()
+    if not raw or any(ch.isspace() for ch in raw):
+        return False
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if not parsed.netloc:
+        return False
+    # Reject credentials-in-URL oddities and empty hosts after @.
+    host = parsed.hostname
+    if not host:
+        return False
+    return True
+
+
+def sanitize_source_url(url: str) -> str | None:
+    raw = (url or "").strip()
+    if not is_safe_http_url(raw):
+        return None
+    return raw
 
 
 def sanitize_research(
@@ -140,17 +206,17 @@ def sanitize_research(
 
     - Unsupported status values are rejected (mapped to failed).
     - fact_check only when status==completed and provider_called.
-    - completed requires ≥1 source and a real provider call.
+    - completed requires ≥1 valid http(s) source and a real provider call.
+    - At most MAX_PUBLIC_SOURCES are returned.
     - Source snippets are never accepted on the public wire.
     """
     status = result.status if result.status in ALLOWED_RESEARCH_STATUSES else "failed"
 
     sources: list[ResearchSource] = []
     for raw in result.sources or []:
-        # Drop any accidental snippet-like extras by reconstructing the public shape.
         title = (raw.title or "").strip() or "Untitled source"
-        url = (raw.url or "").strip()
-        if not url:
+        url = sanitize_source_url(raw.url or "")
+        if url is None:
             continue
         sources.append(
             ResearchSource(
@@ -160,6 +226,8 @@ def sanitize_research(
                 retrieved_at=raw.retrieved_at or utc_now_iso(),
             )
         )
+        if len(sources) >= MAX_PUBLIC_SOURCES:
+            break
 
     fact_check = result.fact_check
     if fact_check is not None:
@@ -174,6 +242,10 @@ def sanitize_research(
             verdict=verdict,
             confidence=conf,
         )
+
+    query = result.query
+    if query is not None:
+        query = clamp_research_query(query) or None
 
     if not provider_called:
         # No real web-search op ⇒ never completed / never fact_check.
@@ -193,7 +265,7 @@ def sanitize_research(
 
     return ResearchResult(
         status=status,
-        query=result.query,
+        query=query,
         summary=result.summary,
         uncertainty=result.uncertainty,
         sources=sources if status == "completed" else [],
@@ -207,12 +279,29 @@ def unavailable_turn(query: str, *, reason: str) -> ResearchTurn:
         research=sanitize_research(
             ResearchResult(
                 status="unavailable",
-                query=query,
+                query=clamp_research_query(query) or None,
                 summary=None,
                 uncertainty="Live web research is not configured.",
                 sources=[],
                 fact_check=None,
             ),
             provider_called=False,
+        ),
+    )
+
+
+def failed_turn(query: str, *, reply: str, uncertainty: str) -> ResearchTurn:
+    return ResearchTurn(
+        reply=reply,
+        research=sanitize_research(
+            ResearchResult(
+                status="failed",
+                query=clamp_research_query(query) or None,
+                summary=None,
+                uncertainty=uncertainty,
+                sources=[],
+                fact_check=None,
+            ),
+            provider_called=True,
         ),
     )

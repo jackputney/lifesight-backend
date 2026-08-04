@@ -45,6 +45,7 @@ from shared.research import (
     ResearchFactCheck,
     ResearchResult,
     ResearchSource,
+    clamp_research_query,
     extract_claim,
     get_research_provider,
     sanitize_research,
@@ -361,7 +362,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
             )
         else:
             turn = await provider.research(
-                req.transcript,
+                clamp_research_query(req.transcript),
                 claim=extract_claim(req.transcript),
             )
         reply = turn.reply
