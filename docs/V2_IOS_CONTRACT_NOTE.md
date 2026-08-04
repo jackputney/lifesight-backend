@@ -4,34 +4,91 @@
 
 | Role | Commit | Notes |
 |------|--------|--------|
-| **Backend application contract** | `613e6e389902ba88fd0be3e2df29ee4a6f9e9a04` | Runtime code that was smoke-tested |
-| **This documentation** | `a93b12651d2279cb135b0463fed0bff9b8b2bb47` (refines `d94e1bb`) | Docs-only; runtime still `613e6e3` |
+| **Backend application runtime** | `d5d150e627351d9759d1ca82e8a50511cadd6f93` | Public `/modes` = fitness/diet/author only; jarvis hidden |
+| **This documentation track** | *(docs commit after review)* | Brainstorm + Mail & Calendar contract approved; **not in runtime yet** |
 
-iOS should pin decoding and UX assumptions to **app commit `613e6e3`** until a later app commit + matching contract note supersede it.
+iOS Home today may still show three modes until slice 2. Pin new five-mode /
+`research` decoding to the backend commit that lands slice 1+, not to
+`d5d150e` alone.
 
-**Status:** foundation smoke-tested against `613e6e3`. Not production-ready.  
-**Resolved:** public mode list is `fitness` / `diet` / `author` (see §1).  
-**Not frozen:** weight units and several schema proposals below still need product/engineering approval.
+**Status:** foundation smoke-tested against `613e6e3` / modes pin `d5d150e`.  
+**Resolved (product):** five-mode ordered catalog + Brainstorm `research` +
+Mail & Calendar Confirm Gate scope — see
+[`V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md`](./V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md).  
+**Runtime today:** still three modes until slice 1.  
+**Not frozen:** weight units, exercises catalog, Terra units (below).
 
 ---
 
-## 1. Public mode list — RESOLVED
+## 1. Public mode list
 
-`GET /modes` returns exactly:
+### Target (approved — not yet runtime)
+
+```json
+{"modes":["fitness","diet","author","brainstorm","mail_calendar"]}
+```
+
+Order is significant. Clients use this array for enabled modes and Home card
+order. No alphabetical re-sort on the server.
+
+| Mode | Visibility | Notes |
+|------|------------|--------|
+| `fitness` | Active | |
+| `diet` | Active | |
+| `author` | Active | |
+| `brainstorm` | Active (after slice 1) | Global voice research/discussion; not Author plot sessions |
+| `mail_calendar` | Active (after slice 1) | Google-first; new `mail_calendar` code only |
+| `health` | Retired | |
+| `jarvis` | Hidden legacy | Isolated; never advertised; do not reuse for `mail_calendar` |
+
+### Runtime today (`d5d150e`)
 
 ```json
 {"modes":["author","diet","fitness"]}
 ```
 
-| Mode | Client visibility | Notes |
-|------|-------------------|--------|
-| `fitness` | Active | Visible in `/modes` and iOS UI |
-| `diet` | Active | Visible in `/modes` and iOS UI |
-| `author` | Active | Visible in `/modes` and iOS UI |
-| `health` | Retired | Not in `MODE_REGISTRY` or `/modes` |
-| `jarvis` | Hidden legacy | Stays in `MODE_REGISTRY` / `modes/jarvis/`; omitted from `/modes` |
+(alphabetically sorted three-mode list — superseded by the ordered five-mode
+target above once slice 1 lands.)
 
-Implemented as `PUBLIC_MODE_IDS = ("author", "diet", "fitness")` in `main.py`.
+### iOS voice aliases (native — slice 2)
+
+`mail_calendar` must resolve: mail, calendar, email, schedule, “mail and
+calendar” / “mail & calendar”. Do not rely on first-word display-name matching
+alone. Icons, empty states, a11y labels, and aliases stay on device; `/modes`
+drives availability/order.
+
+Full Brainstorm / Mail & Calendar wire rules:
+[`V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md`](./V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md).
+
+---
+
+## 1b. Additive `research` on `/chat` (approved — not yet runtime)
+
+Optional / nullable; separate from `visual_panel`.
+
+```ts
+research: {
+  status: "not_requested" | "completed" | "failed" | "unavailable",
+  query?: string,
+  summary?: string,
+  uncertainty?: string,
+  sources: { title: string, url: string, publisher: string | null, retrieved_at: string }[],
+  fact_check: {
+    claim: string,
+    verdict: "supported" | "partially_supported" | "not_supported" | "inconclusive",
+    confidence: number  // 0..1
+  } | null
+} | null
+```
+
+- No `running` until streaming exists.
+- No public `snippet` on sources for the initial iOS contract.
+- `fact_check` only when `status == "completed"` and a real web search ran.
+- Never show “Fact-checked” unless `completed` **and** sources non-empty.
+- Do not speak raw URLs through VoiceOver.
+
+Author plot endpoint rename (before global Brainstorm ships):
+`POST /author/brainstorm` → `POST /author/brainstorm-session`.
 
 ---
 
@@ -179,6 +236,9 @@ Food draft JSON: `method`, `matched_food_name`, `calories`, `protein_g`, `carbs_
 | `POST /workouts/voice-log` | **No** — `"pending_action": null` |
 | Ordinary scene CRUD | **No** |
 | Destructive author (e.g. delete scene) | **Yes** |
+| Mail & Calendar send / delete / archive / event mutate / invite / RSVP | **Yes** (when MC ships) |
+| Mail & Calendar read / search / draft / free-busy | **No** |
+| Brainstorm web research | **No** |
 
 ### HTTP semantics (verified unless noted)
 
@@ -228,3 +288,23 @@ Do not claim TTL proven until this plan has exact status codes/bodies recorded a
 ## 10. Stable exercises catalog
 
 Proposal lives at `docs/proposed/004_stable_exercises_catalog.sql` — **do not apply** until schema review completes. Backfill / identity rules are expanded in that file.
+
+---
+
+## 11. Implementation slices (Brainstorm / Mail & Calendar)
+
+See [`V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md`](./V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md) §6.
+
+| Slice | What |
+|------:|------|
+| 0 | Contract docs (this track) |
+| 1 | Backend empty mode registration + ordered `/modes` + Author endpoint rename + `research: null` on model |
+| 2 | iOS five modes + voice aliases |
+| 3 | Backend Brainstorm `ResearchProvider` (Anthropic first) |
+| 4 | iOS citation / fact-check UI |
+| 5 | Backend MC Google OAuth + read tools |
+| 6 | Backend MC Confirm Gate writes |
+| 7 | iOS MC connection / draft / pending states |
+
+Do not start slices 3 or 5 until slice 0 is reviewed. Do not change `Mode.swift`
+until slice 1 contract/runtime registration is approved to proceed.

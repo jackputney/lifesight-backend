@@ -7,8 +7,13 @@ This contract is shared with the iOS client (`lifesight-ios`, `LifesightAPI.swif
 Changing a shape here is a cross-repo breaking change — flag it (see the escalation
 protocol in `00-core.mdc`) instead of changing it unilaterally.
 
-v2 knowingly extends the prior frozen contract with an additive optional
-`visual_panel` field and new mode strings. See `CONTEXT.md` / `AGENTS.md`.
+v2 knowingly extends the prior frozen contract with additive optional
+`visual_panel` and `research` fields and expanded mode strings. See
+`CONTEXT.md`, `AGENTS.md`, and
+`docs/V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md`.
+
+**Runtime note:** until slice 1 lands, live `/modes` may still return only
+`fitness`/`diet`/`author`. The shapes below are the **approved target contract**.
 
 ## POST /chat
 Request:
@@ -19,9 +24,11 @@ Request:
   "conversation_id": "abc123"
 }
 ```
-`mode` for active clients is one of `"fitness" | "diet" | "author"`. (`jarvis`
-remains registered server-side for legacy routing but is hidden from `GET /modes`
-and the iOS UI. `health` is retired.)
+`mode` for active clients is one of
+`"fitness" | "diet" | "author" | "brainstorm" | "mail_calendar"`.
+(`jarvis` may remain registered server-side for legacy/debug routing but is
+hidden from `GET /modes` and the iOS UI; never silently reused for
+`mail_calendar`. `health` is retired.)
 `conversation_id` is `null` on the first message of a session.
 
 Response:
@@ -34,14 +41,48 @@ Response:
   "visual_panel": {
     "type": "workout_sets",
     "data": {}
-  }
+  },
+  "research": null
 }
 ```
 `conversation_id` is server-generated if the request's was `null`.
 `pending_action` is `null` unless something irreversible needs confirmation.
 `pending_action.description` is READ ALOUD — a natural spoken sentence.
-`visual_panel` is optional/nullable (`{type, data} | null`). Older clients that
-ignore unknown fields remain compatible when it is absent or null.
+`visual_panel` is optional/nullable (`{type, data} | null`).
+`research` is optional/nullable and **separate from** `visual_panel`. Older
+clients that ignore unknown fields remain compatible when either field is
+absent or null.
+
+### `research` (Brainstorm; usually null elsewhere)
+```json
+{
+  "status": "completed",
+  "query": "…",
+  "summary": "…",
+  "uncertainty": "…",
+  "sources": [
+    {
+      "title": "…",
+      "url": "https://…",
+      "publisher": "…",
+      "retrieved_at": "2026-08-04T20:00:00Z"
+    }
+  ],
+  "fact_check": {
+    "claim": "…",
+    "verdict": "supported",
+    "confidence": 0.72
+  }
+}
+```
+- `status`: `"not_requested" | "completed" | "failed" | "unavailable"`
+  (no `running` until streaming research exists).
+- Public sources: `title`, `url`, `publisher`, `retrieved_at` — **no** `snippet`
+  in the initial iOS contract.
+- `fact_check` only when `status == "completed"` and a real web-search ran.
+- `verdict`: `"supported" | "partially_supported" | "not_supported" | "inconclusive"`.
+- First research provider: Anthropic native web search behind a
+  `ResearchProvider` abstraction (Tavily/Brave later).
 
 ## POST /confirm
 Request: `{ "action_id": "act_789", "approved": true }`
@@ -50,8 +91,11 @@ Response: `{ "result": "Saved: …" }`
 `approved: false` discards the pending action entirely and must not execute anything.
 
 ## GET /modes
-Response: `{ "modes": ["author", "diet", "fitness"] }`
-(`jarvis` is not advertised; `health` is retired.)
+Response (exact order — do not alphabetically sort):
+`{ "modes": ["fitness", "diet", "author", "brainstorm", "mail_calendar"] }`
+
+(`jarvis` is not advertised; `health` is retired. String array is fine for v1;
+structured mode-config may come later.)
 
 ## GET /health
 Response: `{ "status": "ok" }`
@@ -81,8 +125,11 @@ Every authenticated request resolves identity via
 Unchanged from v1 device registration shapes.
 
 ## Confirm Gate scope (v2)
-Irreversible/destructive only: e.g. `save_food_entry`, `delete_scene`. Ordinary
-workout set logs and reversible scene edits do **not** create `pending_action`.
+Irreversible/destructive only: e.g. `save_food_entry`, `delete_scene`, and
+Mail & Calendar send / delete / archive / event create-update-delete /
+attendee invite / invitation response. Ordinary workout set logs, reversible
+scene edits, Brainstorm research, and mail/calendar read-search-draft /
+free-busy do **not** create `pending_action`.
 
 ## Domain endpoints (summary)
 - Fitness: `POST /workouts/session/start`, `POST /workouts/voice-log`,
@@ -90,8 +137,11 @@ workout set logs and reversible scene edits do **not** create `pending_action`.
 - Diet: `POST /food/photo|barcode|voice` (drafts), `POST /food/entries` (stages
   Confirm Gate pending action)
 - Author: manuscript/chapter/scene CRUD under `/manuscripts/...`,
-  `POST /author/brainstorm`
+  `POST /author/brainstorm-session` (rename from `/author/brainstorm` before
+  global Brainstorm mode ships)
 - Wearables: `POST /wearables/connect`, `POST /wearables/terra/webhook`
+- Mail & Calendar: Google-first under `mail_calendar` packages (OAuth + tools
+  in later slices; not via legacy Jarvis modules)
 
 ## Conversation memory
 `conversation_id` ties multi-turn exchanges together. History is Postgres-backed.

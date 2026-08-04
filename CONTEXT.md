@@ -1,8 +1,9 @@
 # LifeSight — Architecture & Decisions (v2)
 
 **Naming (settled):** the product is **LifeSight**; the AI agent/voice persona is
-**Olivia**. Chat mode keys (v2): `fitness`, `diet`, `author`. `jarvis` remains
-in the repo as an inert registry entry (not actively developed this pass).
+**Olivia**. Chat mode keys (v2, approved order): `fitness`, `diet`, `author`,
+`brainstorm`, `mail_calendar`. `health` is retired. `jarvis` remains in the repo
+as isolated legacy code (not in `/modes`, not reused for Mail & Calendar).
 `settings` is an iOS screen, not a chat mode.
 
 Voice-first assistant for a near-blind primary user. Accessibility (VoiceOver,
@@ -20,10 +21,13 @@ Auth HTTP is proxied through `/auth/*` so iOS talks only to this backend.
 `AUTH_MODE=dev` (default) resolves to a fixed dev UUID; `AUTH_MODE=real`
 verifies the Supabase JWT.
 
-**Modes — fitness / diet / author.** The old `author` / `health` / `jarvis`
-trio as the active product set is retired. `health` is superseded by
-`fitness` + `diet`. `jarvis` code stays untouched and registered but is not
-actively developed this pass.
+**Modes — fitness / diet / author / brainstorm / mail_calendar.** `health` is
+superseded by `fitness` + `diet`. User-facing Jarvis is replaced by
+`mail_calendar` (Google-first, new packages only). `jarvis` source stays
+untouched and isolated. Brainstorm is voice-first discussion + optional cited
+web research (`research` on `/chat`, Anthropic web search first via
+`ResearchProvider`). Full wire rules:
+`docs/V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md`.
 
 **Author — Postgres-native.** Manuscripts → chapters → scenes live in
 Postgres. Google Docs is **not** the source of truth on `v2-rebuild`. The
@@ -31,17 +35,19 @@ Docs/OAuth implementation remains recoverable on `main` @ `f3d97158`.
 
 **Confirm Gate — irreversible/destructive only.** Shared `pending_actions`
 table remains. It guards food entry saves, destructive manuscript actions
-(e.g. delete scene), and similar. Ordinary workout set logs and reversible
-scene edits do **not** create pending actions.
+(e.g. delete scene), Mail & Calendar send/delete/archive/event
+mutate/invite/RSVP, and similar. Ordinary workout set logs, reversible scene
+edits, Brainstorm research, and mail/calendar read-draft do **not** create
+pending actions.
 
 **Wearables — Terra API (default).** Aggregator for Apple Watch, Oura, etc.
 via one integration. Spike may be reconsidered before building alternatives;
 flag before switching.
 
-**API contract — additive `visual_panel`.** `/chat` (and some domain
-endpoints) may return `visual_panel: {type, data} | null` for inline
-quarter-screen UI. Existing `{reply, mode, conversation_id, pending_action}`
-consumers remain valid when the field is absent/null.
+**API contract — additive `visual_panel` and `research`.** `/chat` (and some
+domain endpoints) may return `visual_panel: {type, data} | null` and
+`research: {…} | null`. They are separate fields. Older consumers remain valid
+when either is absent/null.
 
 **Sync — LWW by default for log-style rows.** `food_entries`, `set_logs`,
 `health_metrics` are independent rows. Author content is structured Postgres
@@ -53,8 +59,14 @@ schema history; new code must not write to them.
 - [x] Auth proxy routes `/auth/signup|login|magic-link|apple`.
 - [x] Fitness `/workouts/*`, Diet `/food/*`, Author manuscripts + brainstorm,
       Wearables Terra connect + webhook.
-- [x] `MODE_REGISTRY` → fitness / diet / author (+ inert jarvis).
+- [x] `MODE_REGISTRY` → fitness / diet / author (+ legacy jarvis hidden from `/modes`).
 - [x] `visual_panel` on `ChatResponse`.
+- [x] Contract docs for Brainstorm + Mail & Calendar (slice 0) — runtime five-mode
+      registration and research/OAuth **not** landed yet.
+- [ ] Slice 1: ordered five-mode `/modes` + empty prompts + Author
+      `/author/brainstorm-session` rename + `research: null` on model.
+- [ ] Slice 3+: Brainstorm `ResearchProvider` / Anthropic web search.
+- [ ] Slice 5+: Mail & Calendar Google OAuth + read/write tools.
 - [ ] Live `AUTH_MODE=real` verification against a production Supabase project.
 - [ ] End-to-end Terra + real wearable device supervised test.
 
