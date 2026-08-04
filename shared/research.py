@@ -79,23 +79,24 @@ class ResearchProvider(Protocol):
         ...
 
 
-_provider_override: ResearchProvider | None | object = object()
+_UNSET: object = object()
+_provider_override: ResearchProvider | None | object = _UNSET
 
 
 def set_research_provider_for_tests(provider: ResearchProvider | None) -> None:
-    """Test seam. Pass None to force unavailable; omit reset via clear_…"""
+    """Test seam. Pass None to force unavailable; reset with clear_…"""
     global _provider_override
     _provider_override = provider
 
 
 def clear_research_provider_override() -> None:
     global _provider_override
-    _provider_override = object()
+    _provider_override = _UNSET
 
 
 def get_research_provider() -> ResearchProvider | None:
     """Resolve the active provider. None ⇒ treat as unavailable at call site."""
-    if _provider_override is not object():
+    if _provider_override is not _UNSET:
         return _provider_override  # type: ignore[return-value]
 
     name = (os.environ.get("RESEARCH_PROVIDER") or "anthropic").strip().lower()
