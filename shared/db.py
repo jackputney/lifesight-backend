@@ -338,6 +338,20 @@ async def get_oauth_credentials(user_id: str, provider: str = "google") -> Optio
     return dict(row) if row else None
 
 
+async def delete_oauth_credentials(user_id: str, provider: str) -> bool:
+    """Delete this user's OAuth row for a provider. Returns True if a row was removed."""
+    result = await pool().execute(
+        """
+        DELETE FROM oauth_credentials
+        WHERE user_id = $1::uuid AND provider = $2
+        """,
+        user_id,
+        provider,
+    )
+    # asyncpg returns e.g. "DELETE 1"
+    return result.endswith("1")
+
+
 # ---------------------------------------------------------------------------
 # Writing documents (002: writing_documents) — Google Docs is source of truth
 # ---------------------------------------------------------------------------
