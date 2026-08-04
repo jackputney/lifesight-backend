@@ -19,8 +19,9 @@ Request:
   "conversation_id": "abc123"
 }
 ```
-`mode` is one of `"fitness" | "diet" | "author" | "jarvis"`. (`jarvis` remains
-registered but is not actively developed this pass. `health` is retired.)
+`mode` for active clients is one of `"fitness" | "diet" | "author"`. (`jarvis`
+remains registered server-side for legacy routing but is hidden from `GET /modes`
+and the iOS UI. `health` is retired.)
 `conversation_id` is `null` on the first message of a session.
 
 Response:
@@ -49,7 +50,8 @@ Response: `{ "result": "Saved: …" }`
 `approved: false` discards the pending action entirely and must not execute anything.
 
 ## GET /modes
-Response: `{ "modes": ["author", "diet", "fitness", "jarvis"] }`
+Response: `{ "modes": ["author", "diet", "fitness"] }`
+(`jarvis` is not advertised; `health` is retired.)
 
 ## GET /health
 Response: `{ "status": "ok" }`

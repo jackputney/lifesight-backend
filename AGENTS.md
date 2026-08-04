@@ -23,7 +23,7 @@ Full detail lives in `.cursor/rules/10-api-contract.mdc` in this repo. Summary:
 - `POST /confirm {action_id, approved}` → `{result}`
 - `GET /me` → `{user_id}`
 - `POST /devices`, `GET /devices`, `DELETE /devices/{device_id}` — push-token registration
-- `GET /modes` → `{modes: [...]}` — includes `fitness`, `diet`, `author`, and inert `jarvis`
+- `GET /modes` → `{modes: ["author", "diet", "fitness"]}` — jarvis stays in source/`MODE_REGISTRY` but is hidden from this public list; `health` is retired
 - `GET /health` → `{status: "ok"}`
 - Auth (proxied so iOS never holds Supabase keys):
   - `POST /auth/signup` `{email, password}` → session tokens + `user_id`

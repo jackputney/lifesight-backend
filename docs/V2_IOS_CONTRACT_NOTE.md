@@ -10,40 +10,28 @@
 iOS should pin decoding and UX assumptions to **app commit `613e6e3`** until a later app commit + matching contract note supersede it.
 
 **Status:** foundation smoke-tested against `613e6e3`. Not production-ready.  
-**Not frozen:** public mode list, weight units, and several schema proposals below still need product/engineering approval.
+**Resolved:** public mode list is `fitness` / `diet` / `author` (see §1).  
+**Not frozen:** weight units and several schema proposals below still need product/engineering approval.
 
 ---
 
-## 1. Public mode list — UNRESOLVED (runtime ≠ recommendation)
+## 1. Public mode list — RESOLVED
 
-### Runtime today (`613e6e3`)
-
-`GET /modes` returns:
+`GET /modes` returns exactly:
 
 ```json
-{"modes":["author","diet","fitness","jarvis"]}
+{"modes":["author","diet","fitness"]}
 ```
 
-`health` is **not** in `MODE_REGISTRY` (retired from routing).  
-`jarvis` **is still advertised** because it remains in `MODE_REGISTRY`.
+| Mode | Client visibility | Notes |
+|------|-------------------|--------|
+| `fitness` | Active | Visible in `/modes` and iOS UI |
+| `diet` | Active | Visible in `/modes` and iOS UI |
+| `author` | Active | Visible in `/modes` and iOS UI |
+| `health` | Retired | Not in `MODE_REGISTRY` or `/modes` |
+| `jarvis` | Hidden legacy | Stays in `MODE_REGISTRY` / `modes/jarvis/`; omitted from `/modes` |
 
-### Recommendation (not implemented — needs product approval)
-
-| Mode | Proposed client visibility | Notes |
-|------|----------------------------|--------|
-| `fitness` | Active | New |
-| `diet` | Active | New |
-| `author` | Active | Postgres chapters/scenes |
-| `health` | Hidden / retired | Removed from backend registry |
-| `jarvis` | Hidden legacy | Keep `modes/jarvis/` on disk; omit from `/modes` |
-
-Proposed code shape after approval:
-
-```text
-PUBLIC_MODE_IDS = ["fitness", "diet", "author"]
-```
-
-Until product explicitly approves this, **do not finish iOS navigation/mode cards** as if the recommendation were already live. Treat the mode list as **unresolved**.
+Implemented as `PUBLIC_MODE_IDS = ("author", "diet", "fitness")` in `main.py`.
 
 ---
 

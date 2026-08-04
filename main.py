@@ -65,15 +65,21 @@ client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-# v2 chat modes. jarvis stays registered (inert — no active work this pass)
-# so existing clients/history don't break; health is retired (superseded by
-# fitness + diet). settings is an iOS screen, not a chat mode.
+# v2 chat modes. health is retired (superseded by fitness + diet).
+# jarvis source stays in MODE_REGISTRY / modes/jarvis/ so code is not deleted,
+# but it is hidden from the public /modes list (see PUBLIC_MODE_IDS).
+# settings is an iOS screen, not a chat mode.
 MODE_REGISTRY = {
     "fitness": FITNESS_PROMPT,
     "diet": DIET_PROMPT,
     "author": AUTHOR_PROMPT,
     "jarvis": JARVIS_PROMPT,
 }
+
+# Authoritative public v2 mode list — what GET /modes returns and what the
+# iOS Home/Sidebar may show. Intentionally excludes jarvis (legacy, hidden)
+# and health (retired).
+PUBLIC_MODE_IDS: tuple[str, ...] = ("author", "diet", "fitness")
 
 # Per-mode Anthropic tool schemas. Modes with no tools simply aren't a key
 # here — _run_model_turn treats a missing/empty list as "no tools offered".
@@ -258,7 +264,10 @@ def health():
 
 @app.get("/modes")
 def modes():
-    return {"modes": sorted(MODE_REGISTRY)}
+    """Public mode catalog for clients. Sorted for a stable wire order.
+    Does not list every key in MODE_REGISTRY — jarvis remains routable if
+    somehow requested, but is not advertised."""
+    return {"modes": sorted(PUBLIC_MODE_IDS)}
 
 
 @app.get("/me")
@@ -278,7 +287,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     if mode not in MODE_REGISTRY:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported mode '{mode}'. Valid modes: {sorted(MODE_REGISTRY)}",
+            detail=f"Unsupported mode '{mode}'. Valid modes: {sorted(PUBLIC_MODE_IDS)}",
         )
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
