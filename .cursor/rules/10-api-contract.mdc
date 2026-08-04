@@ -1,48 +1,55 @@
 ---
 alwaysApply: true
 ---
-# Frozen API Contract — build to these shapes exactly
+# API Contract (v2) — build to these shapes
 
 This contract is shared with the iOS client (`lifesight-ios`, `LifesightAPI.swift`).
 Changing a shape here is a cross-repo breaking change — flag it (see the escalation
 protocol in `00-core.mdc`) instead of changing it unilaterally.
 
+v2 knowingly extends the prior frozen contract with an additive optional
+`visual_panel` field and new mode strings. See `CONTEXT.md` / `AGENTS.md`.
+
 ## POST /chat
 Request:
 ```json
 {
-  "transcript": "schedule a call with Sam tomorrow at 2pm",
-  "mode": "jarvis",
+  "transcript": "how many sets left?",
+  "mode": "fitness",
   "conversation_id": "abc123"
 }
 ```
-`mode` is one of `"author" | "health" | "jarvis"`. `conversation_id` is `null` on the
-first message of a session.
+`mode` is one of `"fitness" | "diet" | "author" | "jarvis"`. (`jarvis` remains
+registered but is not actively developed this pass. `health` is retired.)
+`conversation_id` is `null` on the first message of a session.
 
 Response:
 ```json
 {
-  "reply": "I've drafted that invite. Want me to send it?",
-  "mode": "jarvis",
+  "reply": "You're on set 3 of bench press.",
+  "mode": "fitness",
   "conversation_id": "abc123",
-  "pending_action": {
-    "action_id": "act_789",
-    "description": "Create calendar invite: Call with Sam, tomorrow 2:00 PM"
+  "pending_action": null,
+  "visual_panel": {
+    "type": "workout_sets",
+    "data": {}
   }
 }
 ```
-`conversation_id` is server-generated if the request's was `null`. `pending_action` is
-`null` unless something needs confirmation. `pending_action.description` is READ ALOUD
-to the user — write it as a natural spoken sentence, not a debug string or raw data dump.
+`conversation_id` is server-generated if the request's was `null`.
+`pending_action` is `null` unless something irreversible needs confirmation.
+`pending_action.description` is READ ALOUD — a natural spoken sentence.
+`visual_panel` is optional/nullable (`{type, data} | null`). Older clients that
+ignore unknown fields remain compatible when it is absent or null.
 
 ## POST /confirm
 Request: `{ "action_id": "act_789", "approved": true }`
-Response: `{ "result": "Invite sent to Sam." }`
+Response: `{ "result": "Saved: …" }`
 
 `approved: false` discards the pending action entirely and must not execute anything.
 
 ## GET /modes
-Response: `{ "modes": ["author", "health", "jarvis"] }`
+Response: `{ "modes": ["author", "diet", "fitness", "jarvis"] }`
 
 ## GET /health
 Response: `{ "status": "ok" }`
@@ -50,42 +57,41 @@ Response: `{ "status": "ok" }`
 ## GET /me
 Response: `{ "user_id": "<uuid>" }` — resolved identity for the current auth token.
 
-## POST /devices, GET /devices, DELETE /devices/{device_id}
-Push-notification target registration, one row per device per user.
-- `POST /devices` request: `{ "device_id": str, "push_token": str|null, "platform": "ios"|"android"|"web" }`
-  → returns the stored `DeviceOut` row (`device_id, user_id, push_token, platform, last_seen`).
-- `GET /devices` → `list[DeviceOut]` for the current user.
-- `DELETE /devices/{device_id}` → `204` on success, `404` if not found for this user.
+## Auth (v2)
+Login options: email/password, magic link, Sign in with Apple — all via backend
+proxies so iOS does not embed Supabase secrets:
+- `POST /auth/signup` `{email, password}`
+- `POST /auth/login` `{email, password}`
+- `POST /auth/magic-link` `{email}`
+- `POST /auth/apple` `{id_token, nonce?}`
 
-## Auth — implemented, dev mode by default
-Every request (`/chat`, `/confirm`, `/me`, `/devices/*`) resolves identity via
+Every authenticated request resolves identity via
 `Authorization: Bearer <token>` through `Depends(get_current_user_id)` in
-`shared/auth.py`. Decision is frozen (see `CONTEXT.md`): **Supabase Auth + Sign in
-with Apple** — no typed password, no CAPTCHA (the accessible path for a near-blind
-user). Supabase issues an HS256 JWT whose `sub` claim is the `auth.users(id)` UUID.
+`shared/auth.py`.
 - `AUTH_MODE=dev` (default): any Bearer token, or none at all, resolves to a fixed
-  dev UUID. This is what local/CI testing runs against.
+  dev UUID.
 - `AUTH_MODE=real`: verifies the Supabase JWT signature, audience, and expiry.
-  Requires `SUPABASE_JWT_SECRET` in the environment. Not yet tested against a live
-  Supabase project.
-- Never decode or inspect tokens outside `shared/auth.py` — every route depends on
-  `get_current_user_id` and nothing else touches the header. The dev/real swap must
-  stay confined to that one file.
-- The iOS client must never assert its own `user_id` in a request body — identity is
-  always derived from the token server-side.
+  Requires `SUPABASE_JWT_SECRET`.
+- Never decode tokens outside `shared/auth.py`.
+- The iOS client must never assert its own `user_id` in a request body.
 
-## The one hard rule for Jarvis Mode (and any future irreversible action)
-Anything irreversible — sending an email, creating/modifying a calendar event, writing
-health logs, writing the manuscript — must NEVER happen on the first `/chat` pass:
-1. `/chat` drafts the action but does NOT execute it.
-2. Response includes `pending_action` with a human-readable, speakable description.
-3. The app shows/speaks a confirm screen.
-4. Only when `/confirm` arrives with `approved: true` does the action execute.
-5. If a connection drops mid-action, the next reply must say explicitly whether
-   anything was actually sent or created — never leave it ambiguous.
+## POST /devices, GET /devices, DELETE /devices/{device_id}
+Unchanged from v1 device registration shapes.
+
+## Confirm Gate scope (v2)
+Irreversible/destructive only: e.g. `save_food_entry`, `delete_scene`. Ordinary
+workout set logs and reversible scene edits do **not** create `pending_action`.
+
+## Domain endpoints (summary)
+- Fitness: `POST /workouts/session/start`, `POST /workouts/voice-log`,
+  `GET /workouts/session/{id}/state`
+- Diet: `POST /food/photo|barcode|voice` (drafts), `POST /food/entries` (stages
+  Confirm Gate pending action)
+- Author: manuscript/chapter/scene CRUD under `/manuscripts/...`,
+  `POST /author/brainstorm`
+- Wearables: `POST /wearables/connect`, `POST /wearables/terra/webhook`
 
 ## Conversation memory
-`conversation_id` ties multi-turn exchanges together. The backend stores history keyed
-by this id (in-memory for now — see `main.py` `CONVERSATIONS`, not yet persisted across
-restarts). The app sends `null` to start fresh (e.g. switching modes) and echoes back
+`conversation_id` ties multi-turn exchanges together. History is Postgres-backed.
+The app sends `null` to start fresh (e.g. switching modes) and echoes back
 whatever id the server returns on every subsequent message.

@@ -18,8 +18,9 @@ alwaysApply: true
   email, write manuscript, save health log). It returns a pending state that needs a
   second explicit `/confirm` call. Never fold it into the tool executor or skip it for
   "obviously safe" actions.
-- Modes are preset only: `{ name, system_prompt }` via `MODE_REGISTRY` in `main.py`. Tool
-  sets are pre-built per mode, never assigned dynamically from user voice input.
+- Modes are preset only: `{ name, system_prompt }` via `MODE_REGISTRY` in `main.py`
+  (v2: `fitness` / `diet` / `author`; `jarvis` inert). Tool sets are pre-built per
+  mode, never assigned dynamically from user voice input.
 - See `.cursor/rules/10-api-contract.mdc` for the exact request/response shapes — they
   are frozen and shared with the iOS client. Any shape change is a cross-repo breaking
   change, not a local refactor.

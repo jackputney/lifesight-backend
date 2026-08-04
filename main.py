@@ -1,63 +1,41 @@
-"""Voice Companion backend — mode router + identity/devices + Confirm Gate.
+"""LifeSight backend v2 — mode router + auth + Confirm Gate + domain APIs.
 
-POST /chat routes {transcript, mode, conversation_id} to the matching mode
-system prompt via MODE_REGISTRY and calls Claude, keeping multi-turn history
-per conversation_id. Identity comes from the auth layer
-(Depends(get_current_user_id)) — the client never asserts its own user_id.
-Auth is stubbed in shared/auth.py (AUTH_MODE=dev by default); swapping to
-real Supabase JWT verification touches only that file.
+POST /chat routes {transcript, mode, conversation_id} to MODE_REGISTRY
+(fitness / diet / author; jarvis kept inert). Identity from
+Depends(get_current_user_id). Auth supports email/password, magic link, and
+Sign in with Apple via /auth/* (Supabase Auth proxied so iOS talks only here).
 
-/me and /devices provide identity plus push-target registration.
+Confirm Gate guards irreversible/destructive actions only (e.g. save_food_entry,
+delete_scene) — not ordinary set logs or draft scene edits.
 
-POST /confirm resolves a pending action by id (the Confirm Gate's second
-half). Author Mode is wired with three real tools: create_pending_action
-(generic fallback), read_doc (read-only, no confirm needed), and write_doc
-(the real manuscript-write path — creates a pending action carrying the
-actual text, executed for real by /confirm on approval). health/jarvis have
-no tools yet and always return pending_action=null.
+Domain APIs live in routers/v2.py (workouts, food, manuscripts, wearables).
+Google Docs Author path is abandoned on this branch (history preserved on main).
 
-Storage is Postgres via shared/db.py (asyncpg), backed by migrations
-001_users_devices.sql and 002_core_schema.sql run against a Supabase
-project. DATABASE_URL must be set; startup fails fast with a readable
-error otherwise. Routes never touch SQL — they call shared.db functions,
-same pattern shared/auth.py uses for identity. Every tool handler follows
-the same rule: it calls shared.db functions rather than keeping its own
-state, so /chat (writer) and /confirm (reader) always agree on what's
-pending.
-
-GET /oauth/google/start + /oauth/google/callback run the one-time Google
-OAuth handshake so Author Mode can read/write a real Google Doc. Tokens are
-stored encrypted at rest (shared/crypto.py) — shared/db.py and Postgres
-never see plaintext. The OAuth `state` param is HMAC-signed
-(OAUTH_STATE_SECRET) rather than a bare user_id, so the callback can't be
-tricked into linking a Google account to the wrong LIFESIGHT user.
-
-CORS is wide open (allow_origins=["*"]) for local dev so the iOS Simulator
-can reach localhost:8000 — tighten this before deploying anywhere public.
+CORS is wide open for local dev — tighten before any public deploy.
 """
 import asyncio
-import hashlib
-import hmac
 import os
-import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 import anthropic
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from modes.author.prompt import SYSTEM_PROMPT as AUTHOR_PROMPT
 from modes.author.prompt import TOOLS as AUTHOR_TOOLS
-from modes.health.prompt import SYSTEM_PROMPT as HEALTH_PROMPT
+from modes.diet.prompt import SYSTEM_PROMPT as DIET_PROMPT
+from modes.diet.prompt import TOOLS as DIET_TOOLS
+from modes.fitness.prompt import SYSTEM_PROMPT as FITNESS_PROMPT
+from modes.fitness.prompt import TOOLS as FITNESS_TOOLS
 from modes.jarvis.prompt import SYSTEM_PROMPT as JARVIS_PROMPT
-from shared import crypto, db, google_docs
+from routers.v2 import router as v2_router
+from shared import db
 from shared.auth import get_current_user_id
 
 load_dotenv()
@@ -81,13 +59,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(v2_router)
+
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
+# v2 chat modes. jarvis stays registered (inert — no active work this pass)
+# so existing clients/history don't break; health is retired (superseded by
+# fitness + diet). settings is an iOS screen, not a chat mode.
 MODE_REGISTRY = {
+    "fitness": FITNESS_PROMPT,
+    "diet": DIET_PROMPT,
     "author": AUTHOR_PROMPT,
-    "health": HEALTH_PROMPT,
     "jarvis": JARVIS_PROMPT,
 }
 
@@ -95,6 +79,8 @@ MODE_REGISTRY = {
 # here — _run_model_turn treats a missing/empty list as "no tools offered".
 MODE_TOOLS: dict[str, list[dict]] = {
     "author": AUTHOR_TOOLS,
+    "fitness": FITNESS_TOOLS,
+    "diet": DIET_TOOLS,
 }
 
 # A voice confirm that never arrives shouldn't stay "pending" forever. Passed
@@ -102,22 +88,10 @@ MODE_TOOLS: dict[str, list[dict]] = {
 # is the only state — nothing is cached in this process.
 PENDING_ACTION_TTL = timedelta(minutes=10)
 
-# How long a Google OAuth `state` token is valid for — the gap between
-# hitting /oauth/google/start and Google redirecting back to the callback.
-OAUTH_STATE_TTL_SECONDS = 600
-
-
-class GoogleNotConnectedError(Exception):
-    """Raised when a Google-dependent tool or /confirm execution can't get
-    valid credentials — no OAuth connection yet, or an expired access token
-    with no refresh token to fall back on. Callers turn this into a natural
-    spoken message rather than a raw framework error, since everything in
-    this app is read aloud."""
-
 
 class ChatRequest(BaseModel):
     transcript: str = Field(..., min_length=1)
-    mode: str = "author"
+    mode: str = "fitness"
     conversation_id: str | None = None
     # NOTE: user_id is NOT a request field — identity comes from the auth
     # token via Depends(get_current_user_id), so a client can never claim to
@@ -129,11 +103,19 @@ class PendingAction(BaseModel):
     description: str
 
 
+class VisualPanel(BaseModel):
+    """Optional inline visual for the chat-style UI (quarter-screen panels).
+    Additive — absent/null must not break older clients."""
+    type: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class ChatResponse(BaseModel):
     reply: str
     mode: str
     conversation_id: str
     pending_action: PendingAction | None = None
+    visual_panel: VisualPanel | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -174,156 +156,36 @@ async def _call_model(create_kwargs: dict):
     return await asyncio.to_thread(client.messages.create, **create_kwargs)
 
 
-def _sign_oauth_state(user_id: str) -> str:
-    """Build a `state` value for the Google OAuth redirect that carries
-    user_id but can't be forged. Without this, anyone could call
-    /oauth/google/callback directly with state=<victim's user_id> and link
-    their own Google account to someone else's LIFESIGHT account — state is
-    the only thing tying the callback back to who started the flow, since
-    Google's redirect carries no Authorization header."""
-    secret = os.environ["OAUTH_STATE_SECRET"].encode()
-    issued_at = str(int(time.time()))
-    signature = hmac.new(secret, f"{user_id}:{issued_at}".encode(), hashlib.sha256).hexdigest()
-    return f"{user_id}:{issued_at}:{signature}"
-
-
-def _verify_oauth_state(state: str) -> str:
-    """Returns the user_id embedded in a state token, or raises ValueError if
-    it's missing, malformed, forged, or too old to trust."""
-    try:
-        user_id, issued_at, signature = state.split(":", 2)
-    except ValueError:
-        raise ValueError("Malformed state") from None
-    secret = os.environ["OAUTH_STATE_SECRET"].encode()
-    expected = hmac.new(secret, f"{user_id}:{issued_at}".encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature, expected):
-        raise ValueError("state signature does not match — possible forgery attempt")
-    if time.time() - int(issued_at) > OAUTH_STATE_TTL_SECONDS:
-        raise ValueError("state expired — restart the connect flow")
-    return user_id
-
-
-def _to_aware_utc(dt: datetime | None) -> datetime | None:
-    """google-auth returns naive UTC datetimes for token expiry; Postgres
-    (via asyncpg) needs timezone-aware ones to compare/store consistently."""
-    if dt is None:
-        return None
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-
-
-async def _get_valid_google_credentials(user_id: str) -> tuple[str, str | None, list[str]]:
-    """Return (access_token, refresh_token, scopes) good to use right now,
-    transparently refreshing via Google and persisting the new token first if
-    the stored one has expired. Raises GoogleNotConnectedError if there's
-    nothing usable — callers decide how to phrase that for the user."""
-    row = await db.get_oauth_credentials(user_id, provider="google")
-    if row is None:
-        raise GoogleNotConnectedError("No Google account connected for this user")
-
-    access_token = crypto.decrypt(row["access_token_enc"])
-    refresh_token = crypto.decrypt(row["refresh_token_enc"]) if row["refresh_token_enc"] else None
-    scopes = row["scopes"]
-    expires_at = row["expires_at"]
-
-    if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
-        if not refresh_token:
-            raise GoogleNotConnectedError("Google access expired and there is no refresh token")
-        refreshed = await asyncio.to_thread(google_docs.refresh_access_token, refresh_token, scopes)
-        access_token = refreshed["access_token"]
-        refresh_token = refreshed["refresh_token"] or refresh_token
-        await db.save_oauth_credentials(
-            user_id=user_id,
-            provider="google",
-            access_token_enc=crypto.encrypt(access_token),
-            refresh_token_enc=crypto.encrypt(refresh_token),
-            scopes=scopes,
-            expires_at=_to_aware_utc(refreshed["expiry"]),
-        )
-
-    return access_token, refresh_token, scopes
-
-
 async def _run_tool(
     name: str, tool_input: dict, *, user_id: str, conversation_id: str, mode: str
 ) -> tuple[str, PendingAction | None]:
     """Execute one Claude tool call. Returns (tool_result text for Claude,
     pending_action to surface to the client, or None if this tool didn't
-    create one). The write goes straight to Postgres via shared/db.py so
-    /confirm's read (also shared/db.py) always sees it — no in-memory state."""
+    create one). Writes go to Postgres via shared/db.py so /confirm always
+    sees them — no in-memory pending state."""
     if name == "create_pending_action":
-        # Generic fallback for an action type that doesn't have its own tool
-        # yet (e.g. a future send_email/create_event). Author Mode's real
-        # manuscript writes go through write_doc below instead, which
-        # carries actual text — this one only ever carries a description, so
-        # /confirm has nothing real to execute for it (see the TODO there).
+        # Confirm Gate for destructive / irreversible actions only
+        # (delete_scene, overwrite_chapter, generic). Ordinary scene edits
+        # and set logs do NOT use this path.
         description = str(tool_input.get("description", "")).strip()
         if not description:
             return "Error: description must be a non-empty sentence.", None
+        action_type = str(tool_input.get("action_type") or "generic").strip() or "generic"
+        payload = tool_input.get("payload")
+        if not isinstance(payload, dict):
+            payload = {k: v for k, v in tool_input.items() if k not in ("description", "action_type")}
         action_id = await db.create_pending_action(
             user_id=user_id,
             conversation_id=conversation_id,
             source_mode=mode,
-            action_type="generic",
-            payload={"description": description},
+            action_type=action_type,
+            payload=payload or {"description": description},
             description=description,
             expires_at=datetime.now(timezone.utc) + PENDING_ACTION_TTL,
         )
         return (
-            "Pending action created and shown to the user for confirmation.",
-            PendingAction(action_id=action_id, description=description),
-        )
-
-    if name == "read_doc":
-        doc = await db.get_writing_document(user_id, doc_type="manuscript")
-        if doc is None:
-            return (
-                "Error: no manuscript document is connected yet. Tell the "
-                "user they need to connect their Google account first.",
-                None,
-            )
-        try:
-            access_token, refresh_token, scopes = await _get_valid_google_credentials(user_id)
-        except GoogleNotConnectedError:
-            return (
-                "Error: Google account not connected or needs reconnecting. "
-                "Tell the user they need to (re)connect their Google account.",
-                None,
-            )
-        text = await asyncio.to_thread(
-            google_docs.get_document_text, access_token, refresh_token, scopes, doc["google_doc_id"]
-        )
-        return (text.strip() or "The manuscript is currently empty."), None
-
-    if name == "write_doc":
-        text = str(tool_input.get("text", "")).strip()
-        description = str(tool_input.get("description", "")).strip()
-        if not text or not description:
-            return "Error: text and description must both be non-empty.", None
-        doc = await db.get_writing_document(user_id, doc_type="manuscript")
-        if doc is None:
-            return (
-                "Error: no manuscript document is connected yet. Tell the "
-                "user they need to connect their Google account first.",
-                None,
-            )
-        # The pending action carries the real text/target now, unlike
-        # create_pending_action's description-only payload — /confirm reads
-        # this back and performs the actual Docs write on approval.
-        action_id = await db.create_pending_action(
-            user_id=user_id,
-            conversation_id=conversation_id,
-            source_mode=mode,
-            action_type="insert_manuscript",
-            payload={
-                "document_id": str(doc["id"]),
-                "google_doc_id": doc["google_doc_id"],
-                "text": text,
-            },
-            description=description,
-            expires_at=datetime.now(timezone.utc) + PENDING_ACTION_TTL,
-        )
-        return (
-            "Pending action created and shown to the user for confirmation.",
+            "Pending action created and shown to the user for confirmation. "
+            "Do not say the action is done yet.",
             PendingAction(action_id=action_id, description=description),
         )
 
@@ -455,24 +317,35 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     )
 
 
-async def _execute_insert_manuscript(action: dict) -> None:
-    """The real Google Docs write for an approved insert_manuscript pending
-    action. Raises GoogleNotConnectedError if credentials aren't usable;
-    the caller (POST /confirm) turns that into a spoken message."""
+async def _execute_save_food_entry(action: dict) -> None:
     payload = action["payload"] or {}
-    google_doc_id = payload.get("google_doc_id")
-    text = payload.get("text")
-    document_id = payload.get("document_id")
-    if not google_doc_id or text is None or not document_id:
-        # A pending action created before write_doc existed (e.g. via the
-        # generic create_pending_action fallback) has no real write target —
-        # nothing to execute, resolve as confirmed with no side effect.
-        return
-    access_token, refresh_token, scopes = await _get_valid_google_credentials(str(action["user_id"]))
-    revision_id = await asyncio.to_thread(
-        google_docs.append_text, access_token, refresh_token, scopes, google_doc_id, text
+    await db.insert_food_entry(
+        str(action["user_id"]),
+        method=str(payload.get("method") or "manual"),
+        matched_food_name=payload.get("matched_food_name"),
+        calories=payload.get("calories"),
+        protein_g=payload.get("protein_g"),
+        carbs_g=payload.get("carbs_g"),
+        fat_g=payload.get("fat_g"),
+        confidence=payload.get("confidence"),
+        raw_input_ref=payload.get("raw_input_ref"),
     )
-    await db.update_writing_document_revision(document_id, revision_id)
+
+
+async def _execute_delete_scene(action: dict) -> str:
+    payload = action["payload"] or {}
+    scene_id = payload.get("scene_id")
+    if not scene_id:
+        return "No scene was specified to delete."
+    scene = await db.get_scene(str(scene_id))
+    if scene is None:
+        return "That scene was already gone."
+    # Ownership: scene → chapter → manuscript.user_id
+    ms = await db.get_manuscript(str(scene["manuscript_id"]), str(action["user_id"]))
+    if ms is None:
+        raise HTTPException(status_code=403, detail="Scene does not belong to this user")
+    await db.delete_scene(str(scene_id))
+    return f"Deleted the scene from {scene.get('chapter_title') or 'the manuscript'}."
 
 
 @app.post("/confirm", response_model=ConfirmResponse)
@@ -504,18 +377,15 @@ async def confirm(req: ConfirmRequest, user_id: str = Depends(get_current_user_i
     if not req.approved:
         return ConfirmResponse(result=f"Cancelled: {action['description']}")
 
-    if action["action_type"] == "insert_manuscript":
-        try:
-            await _execute_insert_manuscript(action)
-        except GoogleNotConnectedError:
-            return ConfirmResponse(
-                result="I couldn't make that change — your Google account needs to be reconnected."
-            )
-    # TODO: other action_types (send_email, create_event, log_meal, ...) have
-    # no real executor yet. create_pending_action's "generic" fallback still
-    # only resolves the pending state without performing anything real —
-    # extend this dispatch as more modes get their own real tools.
+    if action["action_type"] == "save_food_entry":
+        await _execute_save_food_entry(action)
+        return ConfirmResponse(result=f"Saved: {action['description']}")
 
+    if action["action_type"] == "delete_scene":
+        result = await _execute_delete_scene(action)
+        return ConfirmResponse(result=result)
+
+    # generic / unknown action_types resolve the pending state only.
     return ConfirmResponse(result=f"Confirmed: {action['description']}")
 
 
@@ -549,57 +419,21 @@ async def remove_device(
 
 
 # ---------------------------------------------------------------------------
-# Google OAuth (Author Mode's Google Docs connection)
+# Google Docs OAuth — abandoned on v2-rebuild (Postgres-native author).
+# History + working implementation remain on main @ f3d97158.
 # ---------------------------------------------------------------------------
-# Not part of the frozen /chat|/confirm|/me|/devices contract — this is a
-# browser-facing handshake, not something the iOS client calls as JSON. The
-# app should open /oauth/google/start in a system browser/SFSafariViewController
-# and let Google's redirect land on /oauth/google/callback; there is nothing
-# for the app to parse out of either response today.
 
 @app.get("/oauth/google/start")
-async def google_oauth_start(user_id: str = Depends(get_current_user_id)):
-    """Redirect to Google's consent screen. state is this user's id, signed
-    so the callback can trust it (see _sign_oauth_state)."""
-    state = _sign_oauth_state(user_id)
-    auth_url = await asyncio.to_thread(google_docs.build_auth_url, state)
-    return RedirectResponse(auth_url)
-
-
-@app.get("/oauth/google/callback", response_class=HTMLResponse)
-async def google_oauth_callback(code: str, state: str):
-    """Google redirects here after consent. No Depends(get_current_user_id)
-    — this request comes from Google's server via the user's browser, not
-    from the iOS app, so there's no Bearer token to check. Identity comes
-    entirely from the signed state param instead."""
-    try:
-        user_id = _verify_oauth_state(state)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid OAuth state: {exc}")
-
-    tokens = await asyncio.to_thread(google_docs.exchange_code, code, state)
-    await db.save_oauth_credentials(
-        user_id=user_id,
-        provider="google",
-        access_token_enc=crypto.encrypt(tokens["access_token"]),
-        refresh_token_enc=crypto.encrypt(tokens["refresh_token"]) if tokens["refresh_token"] else None,
-        scopes=tokens["scopes"],
-        expires_at=_to_aware_utc(tokens["expiry"]),
+async def google_oauth_start_gone():
+    raise HTTPException(
+        status_code=410,
+        detail="Google Docs Author integration was removed in v2. Writing is Postgres-native.",
     )
 
-    # "We will use a fresh doc" — create the manuscript on first connection
-    # rather than asking the user to pick an existing file (this user
-    # navigates by voice; a file picker isn't a usable flow). Only do this
-    # once — a re-connect (expired/revoked token) shouldn't spawn a second doc.
-    existing = await db.get_writing_document(user_id, doc_type="manuscript")
-    if existing is None:
-        google_doc_id = await asyncio.to_thread(
-            google_docs.create_document,
-            tokens["access_token"],
-            tokens["refresh_token"],
-            tokens["scopes"],
-            "LIFESIGHT Manuscript",
-        )
-        await db.create_writing_document(user_id, google_doc_id, "LIFESIGHT Manuscript")
 
-    return "<html><body><h1>Google account connected.</h1><p>You can close this window.</p></body></html>"
+@app.get("/oauth/google/callback")
+async def google_oauth_callback_gone():
+    raise HTTPException(
+        status_code=410,
+        detail="Google Docs Author integration was removed in v2. Writing is Postgres-native.",
+    )

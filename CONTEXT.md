@@ -1,65 +1,63 @@
-# LifeSight — Architecture & Decisions
+# LifeSight — Architecture & Decisions (v2)
 
 **Naming (settled):** the product is **LifeSight**; the AI agent/voice persona is
-**Olivia**. "author" / "health" / "jarvis" are internal mode keys — `jarvis`
-stays the key for the executive-assistant area (Jack's existing identifier).
+**Olivia**. Chat mode keys (v2): `fitness`, `diet`, `author`. `jarvis` remains
+in the repo as an inert registry entry (not actively developed this pass).
+`settings` is an iOS screen, not a chat mode.
 
-Voice-first assistant for a near-blind primary user. Three modes share one
-FastAPI backend and one **Olivia** voice identity: **author** (manuscript in
-Google Docs), **health** (log against a plan), **jarvis** (calendar/email).
-Accessibility (VoiceOver, spoken confirmation) is the dominating constraint
-everywhere, not just in Jarvis.
+Voice-first assistant for a near-blind primary user. Accessibility (VoiceOver,
+spoken confirmation) remains a dominating constraint — Confirm Gate still
+exists, but its scope is narrowed (see below).
 
-## Confirmed decisions
+## Confirmed decisions (v2 — authoritative)
 
-**Auth — Supabase + Sign in with Apple.** Supabase Auth owns identity;
-`auth.users(id)` (UUID) is the FK for every table. Login is Sign in with Apple
-(Face ID / Apple ID — no typed password, no CAPTCHA; the accessible path).
-Supabase issues an HS256 JWT whose `sub` is the user UUID; Supabase handles
-refresh. Endpoints get identity **only** via `Depends(get_current_user_id)` and
-never decode tokens themselves — the dev/real swap touches only
-`shared/auth.py`. `AUTH_MODE=dev` (default) resolves to a fixed dev UUID.
-Verify logout/token-revocation through an actual VoiceOver pass, not just
-functionally.
+**Auth — Supabase, multiple login options.** Supabase Auth owns identity;
+`auth.users(id)` (UUID) is the FK for every table. Login supports
+**email/password (or magic link) and Sign in with Apple**, both presented at
+the login screen. This knowingly reverses the earlier Apple-only / no-password
+decision. Endpoints get identity **only** via `Depends(get_current_user_id)`.
+Auth HTTP is proxied through `/auth/*` so iOS talks only to this backend.
+`AUTH_MODE=dev` (default) resolves to a fixed dev UUID; `AUTH_MODE=real`
+verifies the Supabase JWT.
 
-**Confirm-gate — one shared table for all modes.** `pending_actions`
-(`source_mode`, `action_type`, `payload` jsonb, `status`
-pending/confirmed/rejected/expired, `expires_at`). Irreversible actions
-(send_email, create_event, reschedule_event; health log writes; manuscript
-inserts) never execute directly — they create a pending row, get read back
-aloud, and commit only on a matched spoken "yes" or explicit confirm. The
-fails-closed spoken-yes/no matcher (`confirm_match.py` in the reference) is the
-sole authority and ports verbatim into `shared/`. `expires_at` exists because a
-missed-STT "yes" that lingers forever is a real bug.
+**Modes — fitness / diet / author.** The old `author` / `health` / `jarvis`
+trio as the active product set is retired. `health` is superseded by
+`fitness` + `diet`. `jarvis` code stays untouched and registered but is not
+actively developed this pass.
 
-**Sync — LWW by default, with one carve-out.** `health_entries` and general
-log rows use last-write-wins + soft delete (`deleted_at`) — fine for
-independent rows across one person's devices; no CRDT. **Writing is NOT LWW.**
-Google Docs is the source of truth. Offline dictation is stored append-only per
-session (`writing_sessions` + `writing_drafts`: device + session + seq +
-text_delta) and merged into Docs by `batchUpdate` insertText at a saved anchor
-— never a full-document overwrite (which would silently delete paragraphs
-edited on the web meanwhile). `writing_documents.updated_at` is metadata only,
-never a content-sync signal.
+**Author — Postgres-native.** Manuscripts → chapters → scenes live in
+Postgres. Google Docs is **not** the source of truth on `v2-rebuild`. The
+Docs/OAuth implementation remains recoverable on `main` @ `f3d97158`.
 
-## Port source
-The working reference is `Oliver_Jarvis_V2` (branch `master`) — a Python/FastAPI
-app. Its agent loop, 14-tool set, confirm-gate, spoken read-back, and Google
-client decompose into a shared execution layer (used by all modes) plus
-per-mode toolsets. Do not rewrite `confirm_match.py` / `spoken_readback.py`.
+**Confirm Gate — irreversible/destructive only.** Shared `pending_actions`
+table remains. It guards food entry saves, destructive manuscript actions
+(e.g. delete scene), and similar. Ordinary workout set logs and reversible
+scene edits do **not** create pending actions.
 
-## Build status
-- [x] Auth injection (`shared/auth.py`), `/me`, `/devices` wired into the mode
-      router; `user_id` removed from `/chat` body (identity from token).
-- [x] Migrations `001_users_devices.sql` (Supabase), `002_core_schema.sql`
-      (full schema above), applied by `scripts/run_migrations.py`.
-- [x] Postgres wired (asyncpg, `shared/db.py`): conversations/messages,
-      pending-action resolution, and devices are DB-backed; in-memory dicts
-      removed. `DATABASE_URL` is now required to start the server.
-- [ ] Real Supabase JWT verification (flip `AUTH_MODE=real`) + iOS Apple flow.
-- [ ] Port the shared confirm-gate + agent loop + Jarvis tools.
+**Wearables — Terra API (default).** Aggregator for Apple Watch, Oura, etc.
+via one integration. Spike may be reconsidered before building alternatives;
+flag before switching.
 
-## Build order
-The shared confirm-gate (`confirm_match.py` + `spoken_readback.py` +
-`pending_actions`) is sequenced **ahead of** per-mode tools, since all three
-modes depend on it — rather than building it per-mode later.
+**API contract — additive `visual_panel`.** `/chat` (and some domain
+endpoints) may return `visual_panel: {type, data} | null` for inline
+quarter-screen UI. Existing `{reply, mode, conversation_id, pending_action}`
+consumers remain valid when the field is absent/null.
+
+**Sync — LWW by default for log-style rows.** `food_entries`, `set_logs`,
+`health_metrics` are independent rows. Author content is structured Postgres
+CRUD (not Docs merge). Legacy `writing_*` tables from the Docs era remain in
+schema history; new code must not write to them.
+
+## Build status (v2-rebuild branch)
+- [x] Migration `003_v2_rebuild.sql` (fitness, diet, author, wearables).
+- [x] Auth proxy routes `/auth/signup|login|magic-link|apple`.
+- [x] Fitness `/workouts/*`, Diet `/food/*`, Author manuscripts + brainstorm,
+      Wearables Terra connect + webhook.
+- [x] `MODE_REGISTRY` → fitness / diet / author (+ inert jarvis).
+- [x] `visual_panel` on `ChatResponse`.
+- [ ] Live `AUTH_MODE=real` verification against a production Supabase project.
+- [ ] End-to-end Terra + real wearable device supervised test.
+
+## Branching
+All v2 work lives on `v2-rebuild`. Do not force-push or rewrite `main`.
+`main` @ `f3d97158` preserves the Author Google Docs WIP.
