@@ -1,8 +1,9 @@
 # v2 Brainstorm + Mail & Calendar — approved contract
 
-**Status:** contract approved; **runtime not yet updated** (still three-mode
-`PUBLIC_MODE_IDS` at `d5d150e`). Do not implement Anthropic web search or
-Mail & Calendar OAuth until this document’s review commit is accepted.
+**Status:** contract approved in docs commit `ff730a8`; **runtime not yet
+updated** (still three-mode `PUBLIC_MODE_IDS` at `d5d150e`). Do not implement
+Anthropic web search or Mail & Calendar OAuth until this contract is accepted
+and slice 1 is explicitly greenlit.
 
 **Related:** `.cursor/rules/10-api-contract.mdc`, `AGENTS.md`,
 `docs/V2_IOS_CONTRACT_NOTE.md`.

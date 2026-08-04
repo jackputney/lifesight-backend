@@ -5,7 +5,7 @@
 | Role | Commit | Notes |
 |------|--------|--------|
 | **Backend application runtime** | `d5d150e627351d9759d1ca82e8a50511cadd6f93` | Public `/modes` = fitness/diet/author only; jarvis hidden |
-| **This documentation track** | *(docs commit after review)* | Brainstorm + Mail & Calendar contract approved; **not in runtime yet** |
+| **This documentation track** | `ff730a8c73f5a6478ed15c187d90224e36fd24ed` | Brainstorm + Mail & Calendar contract approved; **not in runtime yet** |
 
 iOS Home today may still show three modes until slice 2. Pin new five-mode /
 `research` decoding to the backend commit that lands slice 1+, not to
