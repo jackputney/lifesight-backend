@@ -1,4 +1,4 @@
-# AGENTS.md — LIFESIGHT shared brain
+# AGENTS.md — LIFESIGHT shared brain (v2)
 
 Read by both coding agents on this project: Cursor here in `lifesight-backend`, and
 Claude Code in `lifesight-ios`. This file is the source of truth for the contract
@@ -9,46 +9,93 @@ because changing it means changing both repos.
 ## What this project is
 LIFESIGHT: life-management software for a visually impaired user. A voice-first iOS
 app talks to exactly one backend, which routes by mode to Claude with a mode-specific
-system prompt. Three modes today: **author** (manuscript, Google Docs), **health**
-(diet/workout logging against an uploaded plan), **jarvis** (calendar + email).
+system prompt. **v2 chat modes (approved order):** **fitness**, **diet**, **author**,
+**brainstorm**, **mail_calendar**. **health** is retired. **jarvis** source remains
+isolated as legacy (not in `/modes`, not reused for Mail & Calendar). **settings**
+is an iOS screen, not a chat mode.
 
-## The frozen API contract
-Full detail lives in `.cursor/rules/10-api-contract.mdc` in this repo. Summary:
+## The API contract (v2)
+Full detail lives in `.cursor/rules/10-api-contract.mdc` and
+`docs/V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md`. Summary:
 
-- `POST /chat {transcript, mode, conversation_id}` → `{reply, mode, conversation_id, pending_action}`
+- `POST /chat {transcript, mode, conversation_id}` →
+  `{reply, mode, conversation_id, pending_action, visual_panel, research}`
+  - `visual_panel` and `research` are **optional / nullable** and separate.
+    Older clients that ignore unknown fields keep working when either is null/absent.
+  - `research` is for Brainstorm cited findings; see the brainstorm contract doc.
 - `POST /confirm {action_id, approved}` → `{result}`
 - `GET /me` → `{user_id}`
 - `POST /devices`, `GET /devices`, `DELETE /devices/{device_id}` — push-token registration
-- `GET /modes` → `{modes: [...]}`
+- `GET /modes` →
+  `{modes: ["fitness", "diet", "author", "brainstorm", "mail_calendar"]}`
+  — **exact order**, not alphabetically sorted. `jarvis` hidden; `health` retired.
 - `GET /health` → `{status: "ok"}`
-- Auth: `Authorization: Bearer <token>` on every request, resolved via
-  `Depends(get_current_user_id)` (`shared/auth.py`). `AUTH_MODE=dev` (default) always
-  resolves to a fixed dev UUID; `AUTH_MODE=real` verifies a Supabase JWT. Frozen decision:
-  Supabase Auth + Sign in with Apple, no password — see `CONTEXT.md`.
+- Auth (proxied so iOS never holds Supabase keys):
+  - `POST /auth/signup` `{email, password}` → session tokens + `user_id`
+  - `POST /auth/login` `{email, password}` → session tokens + `user_id`
+  - `POST /auth/magic-link` `{email}` → ack (email sent)
+  - `POST /auth/apple` `{id_token, nonce?}` → session tokens + `user_id`
+  - All other routes: `Authorization: Bearer <token>` via
+    `Depends(get_current_user_id)` (`shared/auth.py`). `AUTH_MODE=dev` (default)
+    resolves to a fixed dev UUID; `AUTH_MODE=real` verifies a Supabase JWT.
+- Domain endpoints (see `routers/v2.py`):
+  - Fitness: `POST /workouts/session/start`, `POST /workouts/voice-log`,
+    `GET /workouts/session/{id}/state`
+  - Diet: `POST /food/photo|barcode|voice` (drafts), `POST /food/entries` (Confirm Gate)
+  - Author: `POST /manuscripts`, chapter/scene CRUD,
+    `POST /author/brainstorm-session` (rename from `/author/brainstorm`)
+  - Wearables: `POST /wearables/connect`, `POST /wearables/terra/webhook`
+  - Mail & Calendar: Google-first under `mail_calendar` (later slices)
 
-## The Confirm Gate — non-negotiable
-The user cannot glance at a screen to catch a mistake. Every irreversible action (send
-email, create/modify calendar event, write manuscript, save health log) must go through:
-draft on `/chat` → `pending_action` returned → spoken confirm in the app → `/confirm`
-with `approved: true` → only then does it execute. No exceptions for "obviously safe"
-actions. `pending_action.description` is read aloud, so write it as a spoken sentence.
+## Resolved product decisions (v2 — do not re-litigate mid-build)
+1. Auth: email/password (or magic link) **and** Sign in with Apple.
+2. Modes: ordered `fitness` / `diet` / `author` / `brainstorm` / `mail_calendar`;
+   `health` retired; `jarvis` legacy-isolated.
+3. Author: Postgres manuscripts/chapters/scenes — Google Docs abandoned on this branch.
+4. Wearables aggregator: Terra API (default).
+5. Contract: additive optional `visual_panel` and `research` on chat-shaped responses.
+6. Confirm Gate: irreversible/destructive only (not every conversational turn).
+7. Brainstorm research: Anthropic web search first via `ResearchProvider`;
+   fact-check only after a real completed search.
+8. Mail & Calendar: Google first; progressive OAuth (read then write); new code under
+   `mail_calendar` only.
+
+## The Confirm Gate — narrowed, still non-negotiable for its scope
+The user cannot glance at a screen to catch a mistake. Irreversible/destructive
+actions (save food entry, delete scene, send/delete/archive mail, mutate calendar,
+invite/RSVP) must go through: draft → `pending_action` → spoken confirm →
+`/confirm` with `approved: true` → only then execute.
+`pending_action.description` is read aloud — write it as a spoken sentence.
+
+Ordinary workout set logs, reversible scene edits, Brainstorm research, and
+mail/calendar read-search-draft do **not** use the Confirm Gate.
 
 ## No real personal data in either repo
 Both repos are public. Never commit real names, health numbers, doc IDs, emails, or
-tokens — env vars and the database only. Jarvis development uses a separate TEST Google
-account, never the real user's calendar/email, until a supervised integration test.
+tokens — env vars and the database only.
 
 ## Mode routing
 `main.py`'s `MODE_REGISTRY` maps a `mode` string to a system prompt from
 `modes/<mode>/prompt.py`, layered on `shared/identity.py`. Tool sets are pre-built per
-mode, never assigned dynamically from user input.
+mode, never assigned dynamically from user input. Public catalog is
+`PUBLIC_MODE_IDS` (ordered), not a sorted dump of the full registry.
 
 ## Where each agent's ownership starts and stops
-- Cursor / this repo: everything under `lifesight-backend` except Jarvis's own tool
-  implementations once that work starts (owned by whoever is building Jarvis Mode).
+- Cursor / this repo: everything under `lifesight-backend`; leave Jarvis modules
+  untouched except to keep them out of `/modes`.
 - Claude Code / `lifesight-ios`: the SwiftUI app, `LifesightAPI.swift`, Keychain-based
-  session storage. The app talks to the backend only — never to Claude or Google
-  directly, and never holds an API key on-device.
+  session storage. The app talks to the backend only — never to Claude, Terra,
+  Google, or Supabase Auth directly with embedded secrets. Voice aliases and
+  icons stay native; `/modes` drives enabled order.
+
+## Branching
+v2 work is on `v2-rebuild`. `main` @ `f3d97158` preserves Author Google Docs WIP.
+Do not rewrite `main` history.
+
+## Implementation slices
+Brainstorm + Mail & Calendar land in small ordered commits — see
+`docs/V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md` §6. Do not start search or OAuth
+until the contract docs slice is reviewed.
 
 ## Zero placeholders
 Every function is fully implemented, or the gap is explicitly documented (e.g. in a

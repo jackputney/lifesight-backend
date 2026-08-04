@@ -1,33 +1,24 @@
-"""Voice Companion backend — mode router + identity/devices + Confirm Gate.
+"""LifeSight backend v2 — mode router + auth + Confirm Gate + domain APIs.
 
-POST /chat routes {transcript, mode, conversation_id} to the matching mode
-system prompt via MODE_REGISTRY and calls Claude, keeping multi-turn history
-per conversation_id. Identity comes from the auth layer
-(Depends(get_current_user_id)) — the client never asserts its own user_id.
-Auth is stubbed in shared/auth.py (AUTH_MODE=dev by default); swapping to
-real Supabase JWT verification touches only that file.
+POST /chat routes {transcript, mode, conversation_id} to MODE_REGISTRY
+(fitness / diet / author; jarvis kept inert). Identity from
+Depends(get_current_user_id). Auth supports email/password, magic link, and
+Sign in with Apple via /auth/* (Supabase Auth proxied so iOS talks only here).
 
-/me and /devices provide identity plus push-target registration.
+Confirm Gate guards irreversible/destructive actions only (e.g. save_food_entry,
+delete_scene) — not ordinary set logs or draft scene edits.
 
-POST /confirm resolves a pending action by id (the Confirm Gate's second
-half). No mode populates pending_action yet (no tool-calling is wired up),
-so it's always null in /chat responses today.
+Domain APIs live in routers/v2.py (workouts, food, manuscripts, wearables).
+Google Docs Author path is abandoned on this branch (history preserved on main).
 
-Storage is Postgres via shared/db.py (asyncpg), backed by migrations
-001_users_devices.sql and 002_core_schema.sql run against a Supabase
-project. DATABASE_URL must be set; startup fails fast with a readable
-error otherwise. Routes never touch SQL — they call shared.db functions,
-same pattern shared/auth.py uses for identity.
-
-CORS is wide open (allow_origins=["*"]) for local dev so the iOS Simulator
-can reach localhost:8000 — tighten this before deploying anywhere public.
+CORS is wide open for local dev — tighten before any public deploy.
 """
 import asyncio
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
-from typing import Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Optional
 from uuid import UUID
 
 import anthropic
@@ -37,8 +28,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from modes.author.prompt import SYSTEM_PROMPT as AUTHOR_PROMPT
-from modes.health.prompt import SYSTEM_PROMPT as HEALTH_PROMPT
+from modes.author.prompt import TOOLS as AUTHOR_TOOLS
+from modes.brainstorm.prompt import SYSTEM_PROMPT as BRAINSTORM_PROMPT
+from modes.brainstorm.prompt import TOOLS as BRAINSTORM_TOOLS
+from modes.diet.prompt import SYSTEM_PROMPT as DIET_PROMPT
+from modes.diet.prompt import TOOLS as DIET_TOOLS
+from modes.fitness.prompt import SYSTEM_PROMPT as FITNESS_PROMPT
+from modes.fitness.prompt import TOOLS as FITNESS_TOOLS
 from modes.jarvis.prompt import SYSTEM_PROMPT as JARVIS_PROMPT
+from modes.mail_calendar.prompt import SYSTEM_PROMPT as MAIL_CALENDAR_PROMPT
+from modes.mail_calendar.prompt import TOOLS as MAIL_CALENDAR_TOOLS
+from routers.v2 import router as v2_router
 from shared import db
 from shared.auth import get_current_user_id
 
@@ -63,19 +63,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(v2_router)
+
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
+# v2 chat modes. health is retired (superseded by fitness + diet).
+# jarvis source stays in MODE_REGISTRY / modes/jarvis/ so code is not deleted,
+# but it is hidden from the public /modes list (see PUBLIC_MODE_IDS) and must
+# not be reused for mail_calendar.
+# settings is an iOS screen, not a chat mode.
 MODE_REGISTRY = {
+    "fitness": FITNESS_PROMPT,
+    "diet": DIET_PROMPT,
     "author": AUTHOR_PROMPT,
-    "health": HEALTH_PROMPT,
+    "brainstorm": BRAINSTORM_PROMPT,
+    "mail_calendar": MAIL_CALENDAR_PROMPT,
     "jarvis": JARVIS_PROMPT,
 }
 
+# Authoritative public v2 mode list — exact Home/Sidebar order. Do not sort.
+# Excludes jarvis (legacy, hidden) and health (retired).
+PUBLIC_MODE_IDS: tuple[str, ...] = (
+    "fitness",
+    "diet",
+    "author",
+    "brainstorm",
+    "mail_calendar",
+)
+
+# Per-mode Anthropic tool schemas. Modes with no tools simply aren't a key
+# here — _run_model_turn treats a missing/empty list as "no tools offered".
+# brainstorm / mail_calendar register empty tool lists until later slices.
+MODE_TOOLS: dict[str, list[dict]] = {
+    "author": AUTHOR_TOOLS,
+    "fitness": FITNESS_TOOLS,
+    "diet": DIET_TOOLS,
+    "brainstorm": BRAINSTORM_TOOLS,
+    "mail_calendar": MAIL_CALENDAR_TOOLS,
+}
+
+# A voice confirm that never arrives shouldn't stay "pending" forever. Passed
+# to db.create_pending_action as expires_at; the pending_actions row itself
+# is the only state — nothing is cached in this process.
+PENDING_ACTION_TTL = timedelta(minutes=10)
+
+
 class ChatRequest(BaseModel):
     transcript: str = Field(..., min_length=1)
-    mode: str = "author"
+    mode: str = "fitness"
     conversation_id: str | None = None
     # NOTE: user_id is NOT a request field — identity comes from the auth
     # token via Depends(get_current_user_id), so a client can never claim to
@@ -87,11 +124,51 @@ class PendingAction(BaseModel):
     description: str
 
 
+class VisualPanel(BaseModel):
+    """Optional inline visual for the chat-style UI (quarter-screen panels).
+    Additive — absent/null must not break older clients."""
+    type: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchSource(BaseModel):
+    """Public Brainstorm citation fields (no snippet in the initial iOS contract)."""
+    title: str
+    url: str
+    publisher: str | None = None
+    retrieved_at: str
+
+
+class ResearchFactCheck(BaseModel):
+    claim: str
+    verdict: str  # supported | partially_supported | not_supported | inconclusive
+    confidence: float
+
+
+class ResearchResult(BaseModel):
+    """Additive Brainstorm research payload. Separate from visual_panel.
+
+    Ordinary non-research turns use research=null on ChatResponse.
+    fact_check is only valid when status == \"completed\" and a real web
+    search ran; completed research must include at least one source
+    (enforced when providers populate this object in a later slice).
+    """
+    status: str  # not_requested | completed | failed | unavailable
+    query: str | None = None
+    summary: str | None = None
+    uncertainty: str | None = None
+    sources: list[ResearchSource] = Field(default_factory=list)
+    fact_check: ResearchFactCheck | None = None
+
+
 class ChatResponse(BaseModel):
     reply: str
     mode: str
     conversation_id: str
     pending_action: PendingAction | None = None
+    visual_panel: VisualPanel | None = None
+    # Default null for all modes until Brainstorm research ships.
+    research: ResearchResult | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -126,6 +203,103 @@ def _build_system_prompt(mode: str) -> str:
     )
 
 
+async def _call_model(create_kwargs: dict):
+    """The Anthropic SDK call is blocking; run it off the event loop so one
+    long generation doesn't stall every other request."""
+    return await asyncio.to_thread(client.messages.create, **create_kwargs)
+
+
+async def _run_tool(
+    name: str, tool_input: dict, *, user_id: str, conversation_id: str, mode: str
+) -> tuple[str, PendingAction | None]:
+    """Execute one Claude tool call. Returns (tool_result text for Claude,
+    pending_action to surface to the client, or None if this tool didn't
+    create one). Writes go to Postgres via shared/db.py so /confirm always
+    sees them — no in-memory pending state."""
+    if name == "create_pending_action":
+        # Confirm Gate for destructive / irreversible actions only
+        # (delete_scene, overwrite_chapter, generic). Ordinary scene edits
+        # and set logs do NOT use this path.
+        description = str(tool_input.get("description", "")).strip()
+        if not description:
+            return "Error: description must be a non-empty sentence.", None
+        action_type = str(tool_input.get("action_type") or "generic").strip() or "generic"
+        payload = tool_input.get("payload")
+        if not isinstance(payload, dict):
+            payload = {k: v for k, v in tool_input.items() if k not in ("description", "action_type")}
+        action_id = await db.create_pending_action(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            source_mode=mode,
+            action_type=action_type,
+            payload=payload or {"description": description},
+            description=description,
+            expires_at=datetime.now(timezone.utc) + PENDING_ACTION_TTL,
+        )
+        return (
+            "Pending action created and shown to the user for confirmation. "
+            "Do not say the action is done yet.",
+            PendingAction(action_id=action_id, description=description),
+        )
+
+    return f"Error: unknown tool '{name}'.", None
+
+
+async def _run_model_turn(
+    *, mode: str, conversation_id: str, history: list[dict], user_id: str
+) -> tuple[str, PendingAction | None]:
+    """Call Claude, executing any tool calls it makes and persisting every
+    turn to Postgres, until it produces a final text reply. Returns
+    (reply_text, pending_action or None)."""
+    create_kwargs: dict = dict(
+        model=MODEL,
+        max_tokens=1024,
+        system=_build_system_prompt(mode),
+        messages=history,
+    )
+    tools = MODE_TOOLS.get(mode)
+    if tools:
+        create_kwargs["tools"] = tools
+
+    message = await _call_model(create_kwargs)
+
+    pending_action: PendingAction | None = None
+    # Defensive loop, not just an if: today create_pending_action never needs
+    # a second round trip, but a future multi-tool mode (or Claude calling
+    # more than one tool before it's done talking) needs the same shape.
+    while message.stop_reason == "tool_use":
+        # message.content is a list of Anthropic SDK block objects — dump to
+        # plain dicts so both the in-memory history and the DB's jsonb column
+        # get the same JSON-serializable shape.
+        assistant_blocks = [block.model_dump() for block in message.content]
+        history.append({"role": "assistant", "content": assistant_blocks})
+        await db.append_message(conversation_id, "assistant", assistant_blocks)
+
+        tool_results = []
+        for block in message.content:
+            if block.type != "tool_use":
+                continue
+            result_text, created = await _run_tool(
+                block.name, block.input, user_id=user_id, conversation_id=conversation_id, mode=mode
+            )
+            if created is not None:
+                pending_action = created
+            tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result_text})
+
+        history.append({"role": "user", "content": tool_results})
+        await db.append_message(conversation_id, "user", tool_results)
+
+        message = await _call_model(create_kwargs)
+
+    text_blocks = [block.text for block in message.content if block.type == "text"]
+    if not text_blocks:
+        raise HTTPException(status_code=502, detail="Model returned no text")
+
+    reply = text_blocks[0].strip()
+    await db.append_message(conversation_id, "assistant", reply)
+    return reply, pending_action
+
+
 # ---------------------------------------------------------------------------
 # Health / identity
 # ---------------------------------------------------------------------------
@@ -137,7 +311,13 @@ def health():
 
 @app.get("/modes")
 def modes():
-    return {"modes": sorted(MODE_REGISTRY)}
+    """Public mode catalog for clients.
+
+    Order is product-significant (Home card order). Do not alphabetically
+    sort. jarvis remains in MODE_REGISTRY for legacy/debug but is not
+    advertised here.
+    """
+    return {"modes": list(PUBLIC_MODE_IDS)}
 
 
 @app.get("/me")
@@ -157,7 +337,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     if mode not in MODE_REGISTRY:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported mode '{mode}'. Valid modes: {sorted(MODE_REGISTRY)}",
+            detail=f"Unsupported mode '{mode}'. Valid modes: {sorted(PUBLIC_MODE_IDS)}",
         )
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -184,49 +364,70 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     history.append({"role": "user", "content": req.transcript})
     await db.append_message(conversation_id, "user", req.transcript)
 
-    # The Anthropic SDK call is blocking; run it off the event loop so one
-    # long generation doesn't stall every other request.
-    message = await asyncio.to_thread(
-        client.messages.create,
-        model=MODEL,
-        max_tokens=1024,
-        system=_build_system_prompt(mode),
-        messages=history,
+    reply, pending_action = await _run_model_turn(
+        mode=mode, conversation_id=conversation_id, history=history, user_id=user_id
     )
 
-    text_blocks = [block.text for block in message.content if block.type == "text"]
-    if not text_blocks:
-        raise HTTPException(status_code=502, detail="Model returned no text")
-
-    reply = text_blocks[0].strip()
-    await db.append_message(conversation_id, "assistant", reply)
-
-    # No tool-calling is wired up yet (see README), so no code path constructs a
-    # pending_action today. The field is real, not a placeholder — it stays null
-    # until a mode actually proposes an irreversible action.
     return ChatResponse(
         reply=reply,
         mode=mode,
         conversation_id=conversation_id,
-        pending_action=None,
+        pending_action=pending_action,
+        visual_panel=None,
+        research=None,
     )
+
+
+async def _execute_save_food_entry(action: dict) -> None:
+    payload = action["payload"] or {}
+    await db.insert_food_entry(
+        str(action["user_id"]),
+        method=str(payload.get("method") or "manual"),
+        matched_food_name=payload.get("matched_food_name"),
+        calories=payload.get("calories"),
+        protein_g=payload.get("protein_g"),
+        carbs_g=payload.get("carbs_g"),
+        fat_g=payload.get("fat_g"),
+        confidence=payload.get("confidence"),
+        raw_input_ref=payload.get("raw_input_ref"),
+    )
+
+
+async def _execute_delete_scene(action: dict) -> str:
+    payload = action["payload"] or {}
+    scene_id = payload.get("scene_id")
+    if not scene_id:
+        return "No scene was specified to delete."
+    scene = await db.get_scene(str(scene_id))
+    if scene is None:
+        return "That scene was already gone."
+    # Ownership: scene → chapter → manuscript.user_id
+    ms = await db.get_manuscript(str(scene["manuscript_id"]), str(action["user_id"]))
+    if ms is None:
+        raise HTTPException(status_code=403, detail="Scene does not belong to this user")
+    await db.delete_scene(str(scene_id))
+    return f"Deleted the scene from {scene.get('chapter_title') or 'the manuscript'}."
 
 
 @app.post("/confirm", response_model=ConfirmResponse)
 async def confirm(req: ConfirmRequest, user_id: str = Depends(get_current_user_id)):
     action = await db.get_pending_action(req.action_id)
-    if action is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No pending action with id '{req.action_id}'",
-        )
-    if str(action["user_id"]) != user_id:
+
+    # Ownership is a hard security boundary (cross-user access), not a normal
+    # Confirm Gate lifecycle state, so it stays a real error unlike the cases
+    # below.
+    if action is not None and str(action["user_id"]) != user_id:
         raise HTTPException(status_code=403, detail="Pending action does not belong to this user")
-    if action["status"] != "pending":
-        raise HTTPException(status_code=409, detail=f"Pending action already {action['status']}")
-    if datetime.now(timezone.utc) > action["expires_at"]:
+
+    if action is not None and action["status"] == "pending" and datetime.now(timezone.utc) > action["expires_at"]:
         await db.resolve_pending_action(req.action_id, "expired")
-        raise HTTPException(status_code=410, detail="Pending action expired before it was confirmed")
+        action["status"] = "expired"
+
+    if action is None or action["status"] != "pending":
+        # Unknown, already resolved, or just-expired — all read the same to a
+        # voice client: there's nothing left to confirm. One friendly spoken
+        # line beats a raw 404/409 the app would have to translate.
+        return ConfirmResponse(result="That action is no longer pending.")
 
     await db.resolve_pending_action(
         req.action_id,
@@ -235,15 +436,18 @@ async def confirm(req: ConfirmRequest, user_id: str = Depends(get_current_user_i
     )
 
     if not req.approved:
-        return ConfirmResponse(result="Cancelled. Nothing was sent or created.")
+        return ConfirmResponse(result=f"Cancelled: {action['description']}")
 
-    # No tool executor is wired up yet — there is currently no code path that
-    # creates pending_actions rows, so this branch has nothing real to confirm
-    # in practice. It will execute the actual action once a mode's tool-calling
-    # starts creating rows here.
-    return ConfirmResponse(
-        result="Confirmed, but no tool executor is wired up yet — nothing was actually sent."
-    )
+    if action["action_type"] == "save_food_entry":
+        await _execute_save_food_entry(action)
+        return ConfirmResponse(result=f"Saved: {action['description']}")
+
+    if action["action_type"] == "delete_scene":
+        result = await _execute_delete_scene(action)
+        return ConfirmResponse(result=result)
+
+    # generic / unknown action_types resolve the pending state only.
+    return ConfirmResponse(result=f"Confirmed: {action['description']}")
 
 
 # ---------------------------------------------------------------------------
@@ -273,3 +477,24 @@ async def remove_device(
 ):
     if not await db.delete_device(user_id, device_id):
         raise HTTPException(status_code=404, detail="Device not found")
+
+
+# ---------------------------------------------------------------------------
+# Google Docs OAuth — abandoned on v2-rebuild (Postgres-native author).
+# History + working implementation remain on main @ f3d97158.
+# ---------------------------------------------------------------------------
+
+@app.get("/oauth/google/start")
+async def google_oauth_start_gone():
+    raise HTTPException(
+        status_code=410,
+        detail="Google Docs Author integration was removed in v2. Writing is Postgres-native.",
+    )
+
+
+@app.get("/oauth/google/callback")
+async def google_oauth_callback_gone():
+    raise HTTPException(
+        status_code=410,
+        detail="Google Docs Author integration was removed in v2. Writing is Postgres-native.",
+    )

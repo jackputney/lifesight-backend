@@ -2,9 +2,11 @@
 # Auth injection point. Endpoints depend on get_current_user_id and never
 # decode tokens themselves — so the dev/real swap touches ONLY this file.
 #
-# Decision (frozen): Supabase Auth owns identity, login is Sign in with Apple
-# (accessibility — no typed password). Supabase issues an HS256 JWT whose `sub`
-# claim IS the auth.users(id) UUID we FK against. There is no password anywhere.
+# Decision (v2): Supabase Auth owns identity. Login supports email/password,
+# magic link, AND Sign in with Apple — all presented at the login screen.
+# Auth HTTP is proxied through /auth/* (shared/supabase_auth.py) so the iOS
+# client talks only to this backend. Supabase issues an HS256 JWT whose `sub`
+# claim IS the auth.users(id) UUID we FK against.
 #
 #   AUTH_MODE=dev  (default) -> every request resolves to the fixed dev UUID.
 #   AUTH_MODE=real           -> verify the Supabase JWT from the Bearer header.
