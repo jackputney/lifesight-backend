@@ -1,7 +1,9 @@
-"""v2 API routes: auth, workouts, food, manuscripts, wearables.
+"""v2 API routes: workouts, food, manuscripts, wearables.
 
 Mounted from main.py. Identity always via Depends(get_current_user_id) except
 the unauthenticated Terra webhook (signature-verified when secret is set).
+
+Self-hosted auth lives in routers/auth.py (`/auth/register`, `/auth/login`, …).
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from shared import db, supabase_auth, terra
+from shared import db, terra
 from shared.auth import get_current_user_id
 
 router = APIRouter()
@@ -31,58 +33,6 @@ def _anthropic() -> anthropic.Anthropic:
     if not key:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
     return anthropic.Anthropic(api_key=key)
-
-
-# ---------------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------------
-
-class SignUpRequest(BaseModel):
-    email: str = Field(..., min_length=3)
-    password: str = Field(..., min_length=6)
-
-
-class SignInRequest(BaseModel):
-    email: str = Field(..., min_length=3)
-    password: str = Field(..., min_length=6)
-
-
-class MagicLinkRequest(BaseModel):
-    email: str = Field(..., min_length=3)
-
-
-class AppleSignInRequest(BaseModel):
-    id_token: str = Field(..., min_length=10)
-    nonce: Optional[str] = None
-
-
-class AuthSessionOut(BaseModel):
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    expires_in: Optional[int] = None
-    token_type: str = "bearer"
-    user_id: Optional[str] = None
-    email: Optional[str] = None
-
-
-@router.post("/auth/signup", response_model=AuthSessionOut)
-async def auth_signup(body: SignUpRequest):
-    return AuthSessionOut(**await supabase_auth.sign_up(body.email, body.password))
-
-
-@router.post("/auth/login", response_model=AuthSessionOut)
-async def auth_login(body: SignInRequest):
-    return AuthSessionOut(**await supabase_auth.sign_in_password(body.email, body.password))
-
-
-@router.post("/auth/magic-link")
-async def auth_magic_link(body: MagicLinkRequest):
-    return await supabase_auth.request_magic_link(body.email)
-
-
-@router.post("/auth/apple", response_model=AuthSessionOut)
-async def auth_apple(body: AppleSignInRequest):
-    return AuthSessionOut(**await supabase_auth.sign_in_apple(body.id_token, body.nonce))
 
 
 # ---------------------------------------------------------------------------

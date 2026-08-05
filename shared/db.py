@@ -716,3 +716,201 @@ async def insert_health_metric(
         source_device, recorded_at,
     )
     return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Self-hosted auth (006: users, auth_sessions)
+# ---------------------------------------------------------------------------
+
+_USER_COLS = (
+    "id, username, email, password_hash, display_name, is_active, created_at, updated_at"
+)
+_SESSION_COLS = (
+    "id, user_id, refresh_token_hash, expires_at, revoked_at, "
+    "created_at, last_used_at, device_name"
+)
+
+
+async def create_local_user(
+    *,
+    username: str,
+    email: Optional[str],
+    password_hash: str,
+    display_name: Optional[str],
+) -> dict:
+    row = await pool().fetchrow(
+        f"""
+        INSERT INTO users (username, email, password_hash, display_name)
+        VALUES ($1, $2, $3, $4)
+        RETURNING {_USER_COLS}
+        """,
+        username,
+        email,
+        password_hash,
+        display_name,
+    )
+    return dict(row)
+
+
+async def get_local_user_by_id(user_id: str) -> Optional[dict]:
+    row = await pool().fetchrow(
+        f"SELECT {_USER_COLS} FROM users WHERE id = $1::uuid",
+        user_id,
+    )
+    return dict(row) if row else None
+
+
+async def get_local_user_by_username(username: str) -> Optional[dict]:
+    row = await pool().fetchrow(
+        f"SELECT {_USER_COLS} FROM users WHERE username = $1",
+        username,
+    )
+    return dict(row) if row else None
+
+
+async def get_local_user_by_email(email: str) -> Optional[dict]:
+    row = await pool().fetchrow(
+        f"SELECT {_USER_COLS} FROM users WHERE email = $1",
+        email,
+    )
+    return dict(row) if row else None
+
+
+async def update_local_user(
+    user_id: str,
+    *,
+    display_name: Optional[str] = None,
+    email: Optional[str] = None,
+    clear_email: bool = False,
+    password_hash: Optional[str] = None,
+) -> Optional[dict]:
+    # Build a dynamic UPDATE that only touches provided fields.
+    sets: list[str] = ["updated_at = now()"]
+    args: list[Any] = []
+    idx = 1
+    if display_name is not None:
+        sets.append(f"display_name = ${idx}")
+        args.append(display_name)
+        idx += 1
+    if clear_email:
+        sets.append("email = NULL")
+    elif email is not None:
+        sets.append(f"email = ${idx}")
+        args.append(email)
+        idx += 1
+    if password_hash is not None:
+        sets.append(f"password_hash = ${idx}")
+        args.append(password_hash)
+        idx += 1
+    args.append(user_id)
+    row = await pool().fetchrow(
+        f"""
+        UPDATE users SET {", ".join(sets)}
+        WHERE id = ${idx}::uuid
+        RETURNING {_USER_COLS}
+        """,
+        *args,
+    )
+    return dict(row) if row else None
+
+
+async def create_auth_session(
+    *,
+    user_id: str,
+    refresh_token_hash: str,
+    expires_at: datetime,
+    device_name: Optional[str],
+) -> dict:
+    row = await pool().fetchrow(
+        f"""
+        INSERT INTO auth_sessions (user_id, refresh_token_hash, expires_at, device_name)
+        VALUES ($1::uuid, $2, $3, $4)
+        RETURNING {_SESSION_COLS}
+        """,
+        user_id,
+        refresh_token_hash,
+        expires_at,
+        device_name,
+    )
+    return dict(row)
+
+
+async def get_auth_session(session_id: str) -> Optional[dict]:
+    row = await pool().fetchrow(
+        f"SELECT {_SESSION_COLS} FROM auth_sessions WHERE id = $1::uuid",
+        session_id,
+    )
+    return dict(row) if row else None
+
+
+async def get_auth_session_by_refresh_hash(refresh_token_hash: str) -> Optional[dict]:
+    row = await pool().fetchrow(
+        f"SELECT {_SESSION_COLS} FROM auth_sessions WHERE refresh_token_hash = $1",
+        refresh_token_hash,
+    )
+    return dict(row) if row else None
+
+
+async def rotate_auth_session_refresh(
+    session_id: str,
+    *,
+    new_refresh_token_hash: str,
+    expires_at: datetime,
+    now: datetime,
+) -> Optional[dict]:
+    row = await pool().fetchrow(
+        f"""
+        UPDATE auth_sessions
+        SET refresh_token_hash = $2,
+            expires_at = $3,
+            last_used_at = $4
+        WHERE id = $1::uuid
+          AND revoked_at IS NULL
+          AND expires_at > $4
+        RETURNING {_SESSION_COLS}
+        """,
+        session_id,
+        new_refresh_token_hash,
+        expires_at,
+        now,
+    )
+    return dict(row) if row else None
+
+
+async def touch_auth_session(session_id: str, *, now: datetime) -> None:
+    await pool().execute(
+        """
+        UPDATE auth_sessions SET last_used_at = $2
+        WHERE id = $1::uuid AND revoked_at IS NULL
+        """,
+        session_id,
+        now,
+    )
+
+
+async def revoke_auth_session(session_id: str, *, now: datetime) -> bool:
+    status = await pool().execute(
+        """
+        UPDATE auth_sessions SET revoked_at = $2
+        WHERE id = $1::uuid AND revoked_at IS NULL
+        """,
+        session_id,
+        now,
+    )
+    return status.endswith("1")
+
+
+async def revoke_all_auth_sessions(user_id: str, *, now: datetime) -> int:
+    status = await pool().execute(
+        """
+        UPDATE auth_sessions SET revoked_at = $2
+        WHERE user_id = $1::uuid AND revoked_at IS NULL
+        """,
+        user_id,
+        now,
+    )
+    # asyncpg returns e.g. "UPDATE 3"
+    try:
+        return int(status.split()[-1])
+    except (IndexError, ValueError):
+        return 0

@@ -4,7 +4,8 @@ anthropic==0.42.0
 python-dotenv==1.0.1
 httpx==0.28.1
 pydantic==2.10.4
-pyjwt==2.10.1              # real-mode Supabase JWT verification (shared/auth.py)
+pyjwt==2.10.1              # self-hosted access JWT mint/verify (shared/local_auth)
+argon2-cffi==25.1.0        # Argon2id password hashing (shared/local_auth/passwords.py)
 asyncpg==0.30.0            # Postgres storage layer (shared/db.py)
 cryptography==49.0.0       # encrypt oauth_credentials tokens at rest (shared/crypto.py)
 google-auth==2.56.2                # Google OAuth token/credential objects
