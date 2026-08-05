@@ -1,7 +1,8 @@
 """Google OAuth for Mail & Calendar (read scopes) — hardened.
 
 - Backend callback: localhost only in development; HTTPS in production.
-- After token exchange, redirect to an allowlisted app return URI (no tokens).
+- After token exchange, redirect to an allowlisted app return URI with only
+  `result=success|error|reauth_required` (no tokens, codes, or error details).
 - HMAC state with user binding + nonce + short TTL; single-use via transactions.
 - PKCE S256 with verifier stored encrypted in oauth_transactions (not credentials).
 """
@@ -154,15 +155,28 @@ def validate_app_return_uri(uri: str, *, allowlist_csv: str | None = None) -> st
     return candidate
 
 
-def build_app_redirect(app_return_uri: str, *, status: str, detail: str | None = None) -> str:
-    """Append only non-secret status query params — never tokens or codes."""
+# Public app-return contract (iOS ASWebAuthenticationSession). Backend emits
+# only `result`; cancelled is iOS-local and must not be generated here.
+APP_RETURN_RESULTS = frozenset({"success", "error", "reauth_required"})
+
+
+def build_app_redirect(app_return_uri: str, *, result: str) -> str:
+    """Append only `result=` — never tokens, codes, user ids, or error details."""
+    if result not in APP_RETURN_RESULTS:
+        raise ValueError(
+            "app return result must be one of: " + ", ".join(sorted(APP_RETURN_RESULTS))
+        )
     parsed = urlparse(app_return_uri)
-    q = {"mail_calendar": status}
-    if detail:
-        q["detail"] = detail[:200]
-    # Preserve path; replace query entirely with our safe params.
+    # Preserve path; replace query entirely with the single public result param.
     return urlunparse(
-        (parsed.scheme, parsed.netloc, parsed.path, "", urlencode(q), "")
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            "",
+            urlencode({"result": result}),
+            "",
+        )
     )
 
 

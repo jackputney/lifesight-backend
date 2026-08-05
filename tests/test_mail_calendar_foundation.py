@@ -32,7 +32,7 @@ from shared.mail_calendar.types import (
     MailMessageSummary,
 )
 
-APP_RETURN = "lifesight://mail-calendar/oauth"
+APP_RETURN = "lifesight://mail-calendar/oauth-complete"
 USER_A = "00000000-0000-4000-8000-0000000000aa"
 USER_B = "00000000-0000-4000-8000-0000000000bb"
 DEV_USER = "00000000-0000-4000-8000-000000000001"
@@ -245,8 +245,8 @@ class OAuthCallbackTests(_TxnCase):
                     )
         self.assertEqual(resp.status_code, 302)
         loc = resp.headers["location"]
-        self.assertTrue(loc.startswith(APP_RETURN))
-        self.assertIn("mail_calendar=connected", loc)
+        self.assertEqual(loc, f"{APP_RETURN}?result=success")
+        self.assertNotIn("mail_calendar=", loc)
         self.assertNotIn("access-secret-token", loc)
         self.assertNotIn("refresh-secret-token", loc)
         self.assertNotIn("auth-code", loc)
@@ -708,6 +708,50 @@ class HardeningApiTests(unittest.TestCase):
 
     def test_encryption_key_rotation_documented_incomplete(self):
         self.assertEqual(oauth.ENCRYPTION_KEY_ROTATION_STATUS, "incomplete")
+
+    def test_app_return_result_success(self):
+        self.assertEqual(
+            oauth.build_app_redirect(APP_RETURN, result="success"),
+            "lifesight://mail-calendar/oauth-complete?result=success",
+        )
+
+    def test_app_return_result_error(self):
+        self.assertEqual(
+            oauth.build_app_redirect(APP_RETURN, result="error"),
+            "lifesight://mail-calendar/oauth-complete?result=error",
+        )
+
+    def test_app_return_result_reauth_required(self):
+        self.assertEqual(
+            oauth.build_app_redirect(APP_RETURN, result="reauth_required"),
+            "lifesight://mail-calendar/oauth-complete?result=reauth_required",
+        )
+
+    def test_app_return_omits_sensitive_query_parameters(self):
+        for result in ("success", "error", "reauth_required"):
+            loc = oauth.build_app_redirect(APP_RETURN, result=result)
+            parsed = urlparse(loc)
+            q = parse_qs(parsed.query, keep_blank_values=True)
+            self.assertEqual(list(q.keys()), ["result"])
+            self.assertEqual(q["result"], [result])
+            self.assertNotIn("mail_calendar", q)
+            self.assertNotIn("detail", q)
+            self.assertNotIn("code", q)
+            self.assertNotIn("access_token", q)
+            self.assertNotIn("refresh_token", q)
+            self.assertNotIn("state", q)
+            self.assertNotIn("user_id", q)
+            self.assertNotIn("error", q)
+            self.assertNotIn("error_description", q)
+            blob = loc.lower()
+            self.assertNotIn("access_token", blob)
+            self.assertNotIn("refresh_token", blob)
+            self.assertNotIn("bearer ", blob)
+
+        with self.assertRaises(ValueError):
+            oauth.build_app_redirect(APP_RETURN, result="connected")
+        with self.assertRaises(ValueError):
+            oauth.build_app_redirect(APP_RETURN, result="cancelled")
 
 
 if __name__ == "__main__":

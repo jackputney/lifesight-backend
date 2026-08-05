@@ -6,6 +6,8 @@ Never returns OAuth tokens or authorization codes to the client.
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 
@@ -23,6 +25,8 @@ from shared.mail_calendar.types import (
     MailListOut,
     MailMessage,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/mail-calendar", tags=["mail-calendar"])
 
@@ -71,7 +75,7 @@ async def mail_calendar_oauth_callback(
 ):
     """Browser callback — identity from signed state; redirect to app (no tokens)."""
     if error:
-        return await _redirect_or_error(state, status="error", detail=error)
+        return await _redirect_or_error(state, result="error", detail=error)
 
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing code or state")
@@ -82,30 +86,26 @@ async def mail_calendar_oauth_callback(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except oauth.OAuthFlowError as exc:
         if exc.app_return_uri:
+            logger.warning("Mail & Calendar OAuth flow error: %s", exc)
             return RedirectResponse(
-                oauth.build_app_redirect(
-                    exc.app_return_uri, status="error", detail=str(exc)
-                ),
+                oauth.build_app_redirect(exc.app_return_uri, result="error"),
                 status_code=302,
             )
-        return await _redirect_or_error(state, status="error", detail=str(exc))
+        return await _redirect_or_error(state, result="error", detail=str(exc))
     except ValueError as exc:
-        return await _redirect_or_error(state, status="error", detail=str(exc))
+        return await _redirect_or_error(state, result="error", detail=str(exc))
     except Exception as exc:
         return await _redirect_or_error(
             state,
-            status="error",
-            detail=f"Token exchange failed: {type(exc).__name__}",
+            result="error",
+            detail=f"Token exchange failed: {type(exc).__name__}: {exc}",
         )
 
     access = tokens.get("access_token")
     if not access:
+        logger.warning("Mail & Calendar OAuth: Google returned no access token")
         return RedirectResponse(
-            oauth.build_app_redirect(
-                tokens["app_return_uri"],
-                status="error",
-                detail="Google returned no access token",
-            ),
+            oauth.build_app_redirect(tokens["app_return_uri"], result="error"),
             status_code=302,
         )
 
@@ -118,14 +118,16 @@ async def mail_calendar_oauth_callback(
     )
     # Redirect must never include access/refresh tokens or the auth code.
     return RedirectResponse(
-        oauth.build_app_redirect(tokens["app_return_uri"], status="connected"),
+        oauth.build_app_redirect(tokens["app_return_uri"], result="success"),
         status_code=302,
     )
 
 
 async def _redirect_or_error(
-    state: str | None, *, status: str, detail: str
+    state: str | None, *, result: str, detail: str
 ) -> RedirectResponse:
+    """Redirect with public `result` only; keep `detail` in server logs."""
+    logger.warning("Mail & Calendar OAuth callback failure: %s", detail)
     return_uri = None
     if state:
         row = await transactions.get(state)
@@ -135,10 +137,10 @@ async def _redirect_or_error(
             await transactions.delete(state)
     if return_uri:
         return RedirectResponse(
-            oauth.build_app_redirect(return_uri, status=status, detail=detail),
+            oauth.build_app_redirect(return_uri, result=result),
             status_code=302,
         )
-    raise HTTPException(status_code=400, detail=detail)
+    raise HTTPException(status_code=400, detail="OAuth callback failed")
 
 
 @router.post("/disconnect", response_model=DisconnectOut)
