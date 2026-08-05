@@ -1,6 +1,6 @@
 -- 006: self-hosted username/password users + refresh sessions
 -- public.users is the identity store for AUTH_MODE=self (not Supabase auth.users).
--- Domain tables still FK auth.users until a later migration rewires them.
+-- Domain FK rewire to public.users is migration 007.
 
 CREATE TABLE IF NOT EXISTS users (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),

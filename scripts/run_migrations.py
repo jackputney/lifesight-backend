@@ -5,13 +5,12 @@ Usage (from the repo root, venv active, DATABASE_URL set in .env):
     python scripts/run_migrations.py                  # run migrations/*.sql
     python scripts/run_migrations.py --seed-dev-user  # also insert the AUTH_MODE=dev user
 
-Migrations are idempotent (CREATE TABLE IF NOT EXISTS throughout), so
-re-running after adding a new file is safe.
+Migrations are mostly idempotent (IF NOT EXISTS / IF EXISTS), but 007's
+ALTER TABLE ADD CONSTRAINT is not — re-run only on a DB that has not applied
+007 yet, or skip already-applied files manually.
 
---seed-dev-user inserts the fixed dev UUID from shared/auth.py into
-auth.users so FK inserts work under AUTH_MODE=dev. It is opt-in and
-ON CONFLICT DO NOTHING, per the note in 001_users_devices.sql — never
-run it against a production project you care about keeping pristine.
+--seed-dev-user inserts the fixed AUTH_MODE=dev UUID into public.users so
+domain FKs work under the local bypass. Opt-in; ON CONFLICT DO NOTHING.
 """
 import asyncio
 import sys
@@ -25,9 +24,15 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from shared.auth import DEV_FAKE_USER_ID  # noqa: E402
 
+# Unusable Argon2id hash — matches migration 007 stub constant.
+_DEV_PASSWORD_HASH = (
+    "$argon2id$v=19$m=65536,t=3,p=4$PvirOBKxPzgqJveZrS8AFA$"  # pragma: allowlist secret
+    "L1MWnHZ/QAMJI4eOjfP0e/L07+Y5qeYs2k9Mep0rjA0"  # pragma: allowlist secret
+)
+
 DEV_SEED_SQL = """
-INSERT INTO auth.users (id, aud, role, email)
-VALUES ($1::uuid, 'authenticated', 'authenticated', 'dev@local.test')
+INSERT INTO users (id, username, email, password_hash, display_name, is_active)
+VALUES ($1::uuid, 'dev_local', NULL, $2, 'Dev bypass user', TRUE)
 ON CONFLICT (id) DO NOTHING;
 """
 
@@ -47,8 +52,8 @@ async def main() -> None:
             print(f"  ok")
 
         if "--seed-dev-user" in sys.argv:
-            print(f"Seeding dev user {DEV_FAKE_USER_ID} into auth.users ...")
-            await conn.execute(DEV_SEED_SQL.replace("$1::uuid", f"'{DEV_FAKE_USER_ID}'::uuid"))
+            print(f"Seeding dev user {DEV_FAKE_USER_ID} into public.users ...")
+            await conn.execute(DEV_SEED_SQL, DEV_FAKE_USER_ID, _DEV_PASSWORD_HASH)
             print("  ok")
 
         tables = await conn.fetch(

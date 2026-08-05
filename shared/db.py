@@ -4,10 +4,10 @@ One module owns the connection pool and every query, mirroring the pattern
 shared/auth.py uses for identity: routes call these functions and never touch
 SQL or the pool directly, so storage changes never touch route signatures.
 
-Backed by migrations/001_users_devices.sql and 002_core_schema.sql, run
-against a Supabase project (the schema FKs auth.users, which only exists
-there). DATABASE_URL comes from the environment; startup fails fast with a
-readable error if it's missing rather than limping along in-memory.
+Backed by migrations under migrations/*.sql. As of 007, domain user_id
+columns FK public.users (self-hosted identity), not Supabase auth.users.
+DATABASE_URL comes from the environment; startup fails fast with a readable
+error if it's missing rather than limping along in-memory.
 
 statement_cache_size=0 because Supabase's IPv4 connection string goes through
 PgBouncer in transaction mode, which breaks asyncpg's prepared-statement
