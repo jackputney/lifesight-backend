@@ -331,8 +331,24 @@ class AnthropicProviderBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BrainstormChatResearchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Chat tests use the AUTH_MODE=dev bypass + "Bearer test". Force that
+        # even when the developer .env has AUTH_MODE=self.
+        self._prev_auth_mode = os.environ.get("AUTH_MODE")
+        os.environ["AUTH_MODE"] = "dev"
+        self._prev_app_env = os.environ.get("APP_ENV")
+        os.environ["APP_ENV"] = "test"
+
     def tearDown(self) -> None:
         clear_research_provider_override()
+        if self._prev_auth_mode is None:
+            os.environ.pop("AUTH_MODE", None)
+        else:
+            os.environ["AUTH_MODE"] = self._prev_auth_mode
+        if self._prev_app_env is None:
+            os.environ.pop("APP_ENV", None)
+        else:
+            os.environ["APP_ENV"] = self._prev_app_env
 
     @patch("shared.db.init_pool", new_callable=AsyncMock)
     @patch("shared.db.close_pool", new_callable=AsyncMock)
