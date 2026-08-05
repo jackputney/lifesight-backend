@@ -8,7 +8,8 @@ Depends(get_current_user_id). Self-hosted username/password auth via
 Confirm Gate guards irreversible/destructive actions only (e.g. save_food_entry,
 delete_scene) — not ordinary set logs or draft scene edits.
 
-Domain APIs live in routers/v2.py (workouts, food, manuscripts, wearables).
+Domain APIs live in routers/v2.py (workouts, food, manuscripts, wearables)
+and routers/author_persistence.py (projects / documents / versions).
 Google Docs Author path is abandoned on this branch (history preserved on main).
 
 CORS is wide open for local dev — tighten before any public deploy.
@@ -39,6 +40,7 @@ from modes.jarvis.prompt import SYSTEM_PROMPT as JARVIS_PROMPT
 from modes.mail_calendar.prompt import SYSTEM_PROMPT as MAIL_CALENDAR_PROMPT
 from modes.mail_calendar.prompt import TOOLS as MAIL_CALENDAR_TOOLS
 from routers.auth import router as auth_router
+from routers.author_persistence import router as author_persistence_router
 from routers.v2 import router as v2_router
 from shared import db
 from shared.auth import assert_auth_mode_allowed, get_current_user_id
@@ -78,6 +80,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(v2_router)
+app.include_router(author_persistence_router)
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
