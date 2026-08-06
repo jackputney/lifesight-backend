@@ -24,8 +24,9 @@ from uuid import UUID
 
 import anthropic
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from modes.author.prompt import SYSTEM_PROMPT as AUTHOR_PROMPT
@@ -77,6 +78,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    """Propagate/generate X-Request-ID for DB failure diagnostics."""
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    token = db.request_id_var.set(request_id)
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        db.request_id_var.reset(token)
+
+
+@app.exception_handler(db.DatabaseUnavailableError)
+async def database_unavailable_handler(request: Request, exc: db.DatabaseUnavailableError):
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database temporarily unavailable"},
+        headers={"X-Request-ID": db.request_id_var.get()},
+    )
+
 
 app.include_router(auth_router)
 app.include_router(v2_router)
@@ -294,6 +318,23 @@ async def _run_model_turn(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/health/db")
+async def health_db():
+    """Liveness of the global asyncpg pool (SELECT 1)."""
+    try:
+        result = await db.check_db()
+    except db.DatabaseUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Database temporarily unavailable",
+        ) from exc
+    return {
+        "status": result["status"],
+        "pool_size": result["pool_size"],
+        "idle_size": result["idle_size"],
+    }
 
 
 @app.get("/modes")
