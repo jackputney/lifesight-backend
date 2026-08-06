@@ -1,11 +1,15 @@
 """Schema reproducibility — MODE_REGISTRY ↔ migration CHECKs.
 
-Always-on: static parse of migration 009 vs MODE_REGISTRY in main.py.
-Optional live: set RUN_MIGRATION_REPRO_TEST=1 and DATABASE_URL to an empty
-throwaway Postgres. Applies a minimal auth.users stub so historical FKs
-from 001–003 can run on vanilla Postgres (not used in production).
+Always-on: migration filename hygiene + static 009↔MODE_REGISTRY exact match.
+When RUN_MIGRATION_REPRO_TEST=1: apply committed migrations on empty disposable
+Postgres (CI job) with an auth.users stub for historical FKs, then verify
+schema/FKs, exact MODE_REGISTRY CHECKs, registry-mode acceptance, and
+rejection of health + unknown modes.
 
-Run:  python -m unittest tests.test_migration_repro -v
+Run:
+    python -m unittest tests.test_migration_repro -v
+    RUN_MIGRATION_REPRO_TEST=1 DATABASE_URL=... python -m unittest \\
+        tests.test_migration_repro -v
 """
 
 from __future__ import annotations
@@ -20,11 +24,6 @@ REPO = Path(__file__).resolve().parents[1]
 MIGRATIONS = REPO / "migrations"
 MIGRATION_009 = MIGRATIONS / "009_fix_mode_check.sql"
 
-AUTH_STUB_SQL = """
-CREATE SCHEMA IF NOT EXISTS auth;
-CREATE TABLE IF NOT EXISTS auth.users (id UUID PRIMARY KEY);
-"""
-
 EXPECTED_TABLES = (
     "users",
     "auth_sessions",
@@ -36,14 +35,27 @@ EXPECTED_TABLES = (
     "action_log",
 )
 
+# Looked up by (table, column, ref_table, ref_column); name is diagnostic only.
 EXPECTED_FOREIGN_KEYS = (
-    ("auth_sessions", "user_id", "users", "id"),
-    ("author_projects", "user_id", "users", "id"),
-    ("author_documents", "project_id", "author_projects", "id"),
-    ("author_documents", "user_id", "users", "id"),
-    ("author_document_versions", "document_id", "author_documents", "id"),
-    ("author_document_versions", "user_id", "users", "id"),
-    ("conversations", "user_id", "users", "id"),
+    ("auth_sessions_user_id_fkey", "auth_sessions", "user_id", "users", "id"),
+    ("author_projects_user_id_fkey", "author_projects", "user_id", "users", "id"),
+    ("author_documents_project_id_fkey", "author_documents", "project_id", "author_projects", "id"),
+    ("author_documents_user_id_fkey", "author_documents", "user_id", "users", "id"),
+    (
+        "author_document_versions_document_id_fkey",
+        "author_document_versions",
+        "document_id",
+        "author_documents",
+        "id",
+    ),
+    (
+        "author_document_versions_user_id_fkey",
+        "author_document_versions",
+        "user_id",
+        "users",
+        "id",
+    ),
+    ("conversations_user_id_fkey", "conversations", "user_id", "users", "id"),
 )
 
 MODE_CONSTRAINTS = (
@@ -51,6 +63,15 @@ MODE_CONSTRAINTS = (
     ("action_log", "mode", "action_log_mode_check"),
     ("pending_actions", "source_mode", "pending_actions_source_mode_check"),
 )
+
+EXPECTED_REGISTRY = {
+    "fitness",
+    "diet",
+    "author",
+    "brainstorm",
+    "mail_calendar",
+    "jarvis",
+}
 
 
 def mode_registry_keys() -> set[str]:
@@ -86,21 +107,62 @@ def modes_from_check_sql(sql: str, constraint_name: str) -> set[str]:
     return set(re.findall(r"'([^']+)'", match.group(1)))
 
 
-class ModeRegistryMigrationStaticTests(unittest.TestCase):
-    def test_009_matches_mode_registry(self):
-        registry = mode_registry_keys()
-        self.assertEqual(
-            registry,
-            {
-                "fitness",
-                "diet",
-                "author",
-                "brainstorm",
-                "mail_calendar",
-                "jarvis",
-            },
+def latest_modes_from_migrations(constraint_name: str) -> set[str]:
+    """Last committed migration that defines the named CHECK wins."""
+    found: set[str] | None = None
+    for path in sorted(MIGRATIONS.glob("*.sql")):
+        text = path.read_text(encoding="utf-8")
+        try:
+            found = modes_from_check_sql(text, constraint_name)
+        except AssertionError:
+            continue
+    if found is None:
+        raise AssertionError(f"No migration defines {constraint_name}")
+    return found
+
+
+def assert_modes_match_registry(allowed: set[str], registry: set[str], *, where: str) -> None:
+    """CHECK constraint modes must equal MODE_REGISTRY exactly."""
+    missing = registry - allowed
+    extra = allowed - registry
+    if missing or extra or allowed != registry:
+        raise AssertionError(
+            f"{where}: mode CHECK does not match MODE_REGISTRY.\n"
+            f"  db_allowed={sorted(allowed)}\n"
+            f"  registry={sorted(registry)}\n"
+            f"  missing_from_db={sorted(missing)}\n"
+            f"  extra_in_db={sorted(extra)}"
         )
+
+
+class MigrationHygieneStaticTests(unittest.TestCase):
+    def test_migration_filenames_have_no_duplicate_numbers(self):
+        numbers: dict[str, list[str]] = {}
+        for path in sorted(MIGRATIONS.glob("*.sql")):
+            num = path.name.split("_", 1)[0]
+            numbers.setdefault(num, []).append(path.name)
+        dupes = {k: v for k, v in numbers.items() if len(v) > 1}
+        self.assertEqual(dupes, {}, msg=f"duplicate migration numbers: {dupes}")
+
+
+class ModeRegistryMigrationStaticTests(unittest.TestCase):
+    def test_mode_registry_keys_are_exact(self):
+        self.assertEqual(mode_registry_keys(), EXPECTED_REGISTRY)
+        self.assertNotIn("health", EXPECTED_REGISTRY)
+
+    def test_committed_mode_checks_match_mode_registry(self):
+        registry = mode_registry_keys()
+        for name in (
+            "conversations_mode_check",
+            "action_log_mode_check",
+            "pending_actions_source_mode_check",
+        ):
+            allowed = latest_modes_from_migrations(name)
+            assert_modes_match_registry(allowed, registry, where=f"migration SQL {name}")
+
+    def test_009_matches_mode_registry(self):
         self.assertTrue(MIGRATION_009.is_file(), "009_fix_mode_check.sql missing")
+        registry = mode_registry_keys()
         sql = MIGRATION_009.read_text(encoding="utf-8")
         for name in (
             "conversations_mode_check",
@@ -108,12 +170,7 @@ class ModeRegistryMigrationStaticTests(unittest.TestCase):
             "pending_actions_source_mode_check",
         ):
             allowed = modes_from_check_sql(sql, name)
-            self.assertEqual(
-                allowed,
-                registry,
-                msg=f"{name}: db={sorted(allowed)} registry={sorted(registry)}",
-            )
-        self.assertNotIn("health", registry)
+            assert_modes_match_registry(allowed, registry, where=f"009 SQL {name}")
         self.assertIn(
             "UPDATE conversations SET mode = 'fitness' WHERE mode = 'health'",
             sql,
@@ -127,21 +184,13 @@ class ModeRegistryMigrationStaticTests(unittest.TestCase):
             sql,
         )
 
-    def test_migration_filenames_have_no_duplicate_numbers(self):
-        numbers: dict[str, list[str]] = {}
-        for path in sorted(MIGRATIONS.glob("*.sql")):
-            num = path.name.split("_", 1)[0]
-            numbers.setdefault(num, []).append(path.name)
-        dupes = {k: v for k, v in numbers.items() if len(v) > 1}
-        self.assertEqual(dupes, {}, msg=f"duplicate migration numbers: {dupes}")
-
 
 @unittest.skipUnless(
     os.environ.get("RUN_MIGRATION_REPRO_TEST") == "1",
-    "Set RUN_MIGRATION_REPRO_TEST=1 and DATABASE_URL to run live migration repro",
+    "Set RUN_MIGRATION_REPRO_TEST=1 and DATABASE_URL for live migration repro",
 )
 class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
-    async def test_clean_apply_and_mode_constraint(self):
+    async def test_clean_apply_schema_fks_and_mode_constraint(self):
         import asyncpg
 
         dsn = os.environ.get("DATABASE_URL")
@@ -149,6 +198,8 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
             self.skipTest("DATABASE_URL not set")
 
         registry = mode_registry_keys()
+        self.assertEqual(registry, EXPECTED_REGISTRY)
+
         conn = await asyncpg.connect(dsn, statement_cache_size=0, timeout=60)
         try:
             existing = await conn.fetchval(
@@ -160,22 +211,21 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
             if int(existing) > 0:
                 self.fail(
                     "Live migration repro refuses a non-empty public schema. "
-                    "Point DATABASE_URL at an empty throwaway database."
+                    "Use a disposable empty database."
                 )
 
-            await conn.execute(AUTH_STUB_SQL)
+            stub = (REPO / "scripts" / "ci_prepare_auth_schema.sql").read_text(
+                encoding="utf-8"
+            )
+            await conn.execute(stub)
 
-            # Apply 001–008, seed a retired health row, then apply 009.
+            # Apply 001–008, seed a retired health row, then apply 009+.
             for sql_file in sorted(MIGRATIONS.glob("*.sql")):
                 if sql_file.name.startswith("009_"):
                     break
                 print(f"APPLY {sql_file.name}", flush=True)
                 await conn.execute(sql_file.read_text(encoding="utf-8"))
 
-            auth_user = await conn.fetchval(
-                "INSERT INTO auth.users (id) VALUES (gen_random_uuid()) RETURNING id"
-            )
-            # After 007, conversations.user_id references public.users — create one.
             user_id = await conn.fetchval(
                 """
                 INSERT INTO users (username, password_hash)
@@ -186,7 +236,6 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
                 RETURNING id
                 """  # pragma: allowlist secret
             )
-            # Prove remap path: insert health while 004 CHECK still allows it.
             health_convo = await conn.fetchval(
                 """
                 INSERT INTO conversations (id, user_id, mode)
@@ -195,8 +244,6 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
                 """,
                 user_id,
             )
-            # auth_user kept only so the stub insert is not unused if schema differs.
-            self.assertIsNotNone(auth_user)
 
             for sql_file in sorted(MIGRATIONS.glob("009_*.sql")):
                 print(f"APPLY {sql_file.name}", flush=True)
@@ -218,9 +265,9 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
                     """,
                     table,
                 )
-                self.assertTrue(exists, msg=table)
+                self.assertTrue(exists, msg=f"missing table: {table}")
 
-            for table, column, ref_table, ref_column in EXPECTED_FOREIGN_KEYS:
+            for cname, table, column, ref_table, ref_column in EXPECTED_FOREIGN_KEYS:
                 row = await conn.fetchrow(
                     """
                     SELECT c.conname
@@ -249,7 +296,10 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIsNotNone(
                     row,
-                    msg=f"missing FK {table}.{column} -> {ref_table}.{ref_column}",
+                    msg=(
+                        f"missing FK {table}.{column} -> {ref_table}.{ref_column} "
+                        f"(expected name ~{cname})"
+                    ),
                 )
 
             for _table, _column, cname in MODE_CONSTRAINTS:
@@ -262,20 +312,11 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
                     cname,
                 )
                 self.assertIsNotNone(definition, msg=cname)
+                print(f"CONSTRAINT {cname}: {definition}", flush=True)
                 allowed = set(re.findall(r"'([^']+)'", definition))
-                missing = registry - allowed
-                extra = allowed - registry
-                self.assertEqual(
-                    missing,
-                    set(),
-                    msg=f"{cname} missing_from_db={sorted(missing)}",
+                assert_modes_match_registry(
+                    allowed, registry, where=f"live DB {cname}"
                 )
-                self.assertEqual(
-                    extra,
-                    set(),
-                    msg=f"{cname} extra_in_db={sorted(extra)}",
-                )
-                self.assertEqual(allowed, registry, msg=cname)
 
             for mode in sorted(registry):
                 await conn.execute(
