@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LifeSight Admin</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+    --text:#e6e9ef; --dim:#98a1b3; --accent:#6ea8fe; --good:#3fb950;
+    --warn:#d29922; --bad:#f85149; --mono:ui-monospace,"Cascadia Code",Consolas,monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7f9; --panel:#fff; --panel2:#f0f2f5; --line:#d8dce3;
+            --text:#1a1d23; --dim:#5c6572; --accent:#1f6feb; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line);
+           display:flex; gap:14px; align-items:center; flex-wrap:wrap; background:var(--panel); }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.2px; }
+  h1 span { color:var(--dim); font-weight:400; }
+  input, select, textarea, button { font:inherit; color:var(--text);
+    background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:6px 9px; }
+  input:focus, select:focus, textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  button { cursor:pointer; background:var(--accent); color:#fff; border-color:transparent; font-weight:500; }
+  button.ghost { background:var(--panel2); color:var(--text); border-color:var(--line); font-weight:400; }
+  button:disabled { opacity:.5; cursor:default; }
+  .wrap { display:grid; grid-template-columns:minmax(320px,3fr) minmax(340px,4fr); gap:16px; padding:16px; align-items:start; }
+  @media (max-width:900px) { .wrap { grid-template-columns:1fr; } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.6px; color:var(--dim);
+             margin:0; padding:11px 14px; border-bottom:1px solid var(--line); font-weight:600; }
+  .pad { padding:14px; }
+  .tablewrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  tbody tr { cursor:pointer; }
+  tbody tr:hover { background:var(--panel2); }
+  tbody tr.sel { background:color-mix(in srgb, var(--accent) 16%, transparent); }
+  .pill { display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px;
+          border:1px solid var(--line); background:var(--panel2); color:var(--dim); }
+  .pill.good { color:var(--good); border-color:color-mix(in srgb,var(--good) 40%,transparent); }
+  .pill.warn { color:var(--warn); border-color:color-mix(in srgb,var(--warn) 40%,transparent); }
+  .pill.bad  { color:var(--bad);  border-color:color-mix(in srgb,var(--bad) 40%,transparent); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:8px; }
+  .stat { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:9px 11px; }
+  .stat b { display:block; font-size:19px; font-weight:600; }
+  .stat span { color:var(--dim); font-size:11px; }
+  .form { display:grid; grid-template-columns:130px 1fr; gap:8px 10px; align-items:center; }
+  .form label { color:var(--dim); font-size:12px; }
+  .form input, .form select, .form textarea { width:100%; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .mono { font-family:var(--mono); font-size:11px; color:var(--dim); }
+  .msg { padding:8px 11px; border-radius:6px; font-size:13px; display:none; }
+  .msg.show { display:block; }
+  .msg.ok  { background:color-mix(in srgb,var(--good) 15%,transparent); color:var(--good); }
+  .msg.err { background:color-mix(in srgb,var(--bad) 15%,transparent);  color:var(--bad); }
+  .empty { color:var(--dim); padding:22px 14px; text-align:center; }
+  .sub { margin:12px 0 5px; letter-spacing:.7px; }
+  details.mode { border:1px solid var(--line); border-radius:8px; margin-bottom:7px; background:var(--panel2); }
+  details.mode > summary { cursor:pointer; padding:9px 12px; display:flex; gap:9px;
+    align-items:center; flex-wrap:wrap; list-style:none; }
+  details.mode > summary::-webkit-details-marker { display:none; }
+  details.mode > summary::before { content:'▸'; color:var(--dim); font-size:11px; }
+  details.mode[open] > summary::before { content:'▾'; }
+  details.mode[open] > summary { border-bottom:1px solid var(--line); }
+  .mtitle { font-weight:600; }
+  .mcount { margin-left:auto; color:var(--dim); font-size:12px; }
+  .mbody { padding:11px 12px; }
+  .mbody table { font-size:12.5px; }
+  .mbody td { white-space:normal; }
+  .mbody .sub:first-child { margin-top:0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LifeSight <span>admin</span></h1>
+  <div class="row" style="margin-left:auto">
+    <input id="key" type="password" placeholder="X-Admin-Key" style="width:250px" autocomplete="off">
+    <button id="connect">Connect</button>
+  </div>
+</header>
+
+<div id="banner" class="msg err" style="margin:16px 16px 0"></div>
+
+<div class="wrap">
+  <div style="display:grid; gap:16px">
+    <div class="card">
+      <h2>Overview</h2>
+      <div class="pad"><div id="stats" class="grid"><div class="empty">Not connected.</div></div></div>
+    </div>
+    <div class="card">
+      <h2>Users</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>User</th><th>Age</th><th>Status</th><th>Convos</th><th>Last active</th></tr></thead>
+          <tbody id="users"><tr><td colspan="5" class="empty">Enter your key and connect.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Detail</h2>
+    <div class="pad" id="detail"><div class="empty">Select a user.</div></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let KEY = sessionStorage.getItem('adminKey') || '';
+let selected = null;
+
+$('#key').value = KEY;
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { 'X-Admin-Key': KEY, 'Content-Type': 'application/json', ...(opts.headers || {}) }
+  });
+  if (!res.ok) {
+    let d; try { d = (await res.json()).detail; } catch { d = res.statusText; }
+    // FastAPI validation errors arrive as an array of objects; turn them into
+    // something an operator can act on instead of raw JSON.
+    if (Array.isArray(d)) {
+      d = d.map(e => `${(e.loc || []).slice(1).join('.') || 'value'}: ${e.msg}`).join('; ');
+    } else if (typeof d !== 'string') {
+      d = JSON.stringify(d);
+    }
+    // Postgres CHECK text is accurate but unreadable — name the field instead.
+    const m = d.match(/violates check constraint "profiles_(\w+?)_check"/);
+    if (m) d = `${m[1].replace(/_/g, ' ')}: value not allowed`;
+    throw new Error(d);
+  }
+  return res.json();
+}
+
+function banner(text, ok = false) {
+  const b = $('#banner');
+  b.textContent = text;
+  b.className = 'msg show ' + (ok ? 'ok' : 'err');
+  if (ok) setTimeout(() => b.classList.remove('show'), 2500);
+}
+
+const fmt = d => d ? new Date(d).toLocaleString(undefined, { dateStyle:'medium', timeStyle:'short' }) : '—';
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function load() {
+  if (!KEY) return banner('Enter the X-Admin-Key printed by the server.');
+  try {
+    const [s, users] = await Promise.all([api('/api/stats'), api('/api/users')]);
+    sessionStorage.setItem('adminKey', KEY);
+    $('#banner').classList.remove('show');
+    renderStats(s);
+    renderUsers(users);
+  } catch (e) { banner(e.message); }
+}
+
+function renderStats(s) {
+  const t = s.tables || {};
+  const cells = [
+    ['Users', s.users], ['Active', s.active_users], ['Profiles', s.profiles],
+    ['No profile', s.missing_profiles],
+    ['Conversations', t.conversations], ['Messages', t.messages], ['Pending actions', t.pending_actions],
+    ['Workouts', t.workout_sessions], ['Food entries', t.food_entries], ['Manuscripts', t.manuscripts],
+  ];
+  const modes = (s.conversations_by_mode || [])
+    .map(m => `<span class="pill">${esc(m.mode)} ${m.count}</span>`).join(' ');
+  $('#stats').innerHTML =
+    cells.map(([l, v]) => `<div class="stat"><b>${v ?? '—'}</b><span>${l}</span></div>`).join('') +
+    (modes ? `<div class="stat" style="grid-column:1/-1"><span>Conversations by mode</span>
+              <div class="row" style="margin-top:6px">${modes}</div></div>` : '');
+}
+
+function renderUsers(users) {
+  if (!users.length) return $('#users').innerHTML = '<tr><td colspan="5" class="empty">No users.</td></tr>';
+  $('#users').innerHTML = users.map(u => {
+    const name = u.display_name || u.username || u.email || u.id.slice(0, 8);
+    const tags = [
+      u.is_primary ? '<span class="pill good">primary</span>' : '',
+      !u.has_profile ? '<span class="pill warn">no profile</span>' : '',
+      !u.is_active ? '<span class="pill bad">inactive</span>' : '',
+    ].join(' ');
+    return `<tr data-id="${u.id}" ${selected === u.id ? 'class="sel"' : ''}>
+      <td><div>${esc(name)} ${tags}</div><div class="mono">${esc(u.username || u.email || u.id)}</div></td>
+      <td>${u.age_years ?? '—'}</td>
+      <td>${u.status ? `<span class="pill">${esc(u.status)}</span>` : '—'}</td>
+      <td>${u.conversations}</td>
+      <td class="mono">${fmt(u.last_active_at)}</td>
+    </tr>`;
+  }).join('');
+  $('#users').querySelectorAll('tr').forEach(tr =>
+    tr.onclick = () => { selected = tr.dataset.id; renderUsers(users); showDetail(selected); });
+}
+
+const FIELDS = [
+  ['display_name','Display name','text'], ['full_name','Full name','text'],
+  ['pronouns','Pronouns','text'], ['date_of_birth','Date of birth','date'],
+  ['sex_at_birth','Sex at birth','select:,female,male,intersex,undisclosed'],
+  ['height_cm','Height (cm)','number'], ['weight_kg','Weight (kg)','number'],
+  ['speech_rate','Speech rate','number'], ['voice_id','ElevenLabs voice','text'],
+  ['timezone','Timezone','text'], ['locale','Locale','text'],
+  ['status','Status','select:active,suspended,test'],
+  ['is_primary','Primary user','checkbox'], ['notes','Notes','textarea'],
+];
+
+const STATUS_CLASS = { confirmed:'good', executed:'good', rejected:'bad',
+                       expired:'warn', pending:'warn', proposed:'warn' };
+
+function renderModes(a) {
+  const entries = Object.entries(a.modes || {});
+  if (!entries.length) return '';
+  // Modes with something to show sort first; empty ones stay collapsed.
+  entries.sort((x, y) => (y[1].any ? 1 : 0) - (x[1].any ? 1 : 0));
+  return entries.map(([key, m]) => {
+    const counts = Object.entries(m.counts || {}).filter(([, v]) => v)
+      .map(([k, v]) => `<span class="pill">${esc(k)} ${v}</span>`).join(' ');
+    const done = (m.recent || []).map(r =>
+      `<tr><td class="mono">${fmt(r.ts)}</td><td>${esc(r.what)}</td></tr>`).join('');
+    const acts = (m.actions || []).map(x =>
+      `<tr><td><span class="pill ${STATUS_CLASS[x.status] || ''}">${esc(x.status)}</span></td>
+           <td>${esc(x.description || x.action_type)}</td>
+           <td class="mono">${fmt(x.resolved_at || x.created_at)}</td></tr>`).join('');
+    const stateCls = m.state.startsWith('active') ? '' :
+                     (m.state.startsWith('retired') ? 'bad' : 'warn');
+    return `<details class="mode" ${m.any ? 'open' : ''}>
+      <summary>
+        <span class="mtitle">${esc(m.label)}</span>
+        <span class="pill ${stateCls}">${esc(m.state)}</span>
+        <span class="mcount">${m.conversations} chats · ${(m.actions||[]).length} actions</span>
+      </summary>
+      <div class="mbody">
+        ${counts ? `<div class="row" style="margin-bottom:9px">${counts}</div>` : ''}
+        ${acts ? `<div class="mono sub">CONFIRM GATE</div>
+                  <div class="tablewrap"><table><tbody>${acts}</tbody></table></div>` : ''}
+        ${done ? `<div class="mono sub">CREATED</div>
+                  <div class="tablewrap"><table><tbody>${done}</tbody></table></div>` : ''}
+        ${!counts && !acts && !done ? '<div class="empty">Nothing yet.</div>' : ''}
+      </div>
+    </details>`;
+  }).join('');
+}
+
+async function showDetail(id) {
+  $('#detail').innerHTML = '<div class="empty">Loading…</div>';
+  let d, a;
+  try { [d, a] = await Promise.all([api('/api/users/' + id), api(`/api/users/${id}/activity`)]); }
+  catch (e) { return $('#detail').innerHTML = `<div class="msg show err">${esc(e.message)}</div>`; }
+  const p = d.profile || {};
+  const act = Object.entries(d.activity || {}).filter(([, v]) => v)
+    .map(([k, v]) => `<span class="pill">${esc(k)} ${v}</span>`).join(' ') || '<span class="dim">no activity</span>';
+  const gate = (a.actions_by_status || [])
+    .map(s => `<span class="pill ${STATUS_CLASS[s.status] || ''}">${esc(s.status)} ${s.count}</span>`).join(' ');
+
+  const inputs = FIELDS.map(([k, label, type]) => {
+    const v = p[k] ?? '';
+    let ctrl;
+    if (type === 'textarea') ctrl = `<textarea id="f_${k}" rows="3">${esc(v)}</textarea>`;
+    else if (type === 'checkbox') ctrl = `<input id="f_${k}" type="checkbox" ${p[k] ? 'checked' : ''} style="width:auto">`;
+    else if (type.startsWith('select:')) {
+      ctrl = `<select id="f_${k}">` + type.slice(7).split(',')
+        .map(o => `<option value="${o}" ${String(v) === o ? 'selected' : ''}>${o || '—'}</option>`).join('') + '</select>';
+    } else {
+      const val = type === 'date' && v ? String(v).slice(0, 10) : v;
+      ctrl = `<input id="f_${k}" type="${type}" ${type === 'number' ? 'step="0.1"' : ''} value="${esc(val)}">`;
+    }
+    return `<label for="f_${k}">${label}</label>${ctrl}`;
+  }).join('');
+
+  $('#detail').innerHTML = `
+    <div class="row" style="justify-content:space-between; margin-bottom:10px">
+      <div><div style="font-weight:600">${esc(d.user.username || d.user.email || 'no username')}</div>
+           <div class="mono">${esc(d.user.id)}</div></div>
+      <div style="text-align:right">
+        <div class="mono">created ${fmt(d.user.created_at)}</div>
+        <div class="mono">${d.sessions.active_sessions} active session(s), last ${fmt(d.sessions.last_active_at)}</div>
+      </div>
+    </div>
+    <div class="row" style="margin-bottom:12px">
+      ${!d.user.is_active ? '<span class="pill bad">inactive account</span>' : '<span class="pill good">active</span>'}
+      ${d.google_connected ? '<span class="pill good">Google connected</span>' : '<span class="pill">no Google</span>'}
+      ${!d.profile ? '<span class="pill warn">no profile row yet</span>' : ''}
+    </div>
+    <div style="margin-bottom:12px"><div class="mono sub">TOTALS</div><div class="row">${act}</div></div>
+    ${gate ? `<div style="margin-bottom:12px"><div class="mono sub">CONFIRM GATE (all modes)</div>
+              <div class="row">${gate}</div></div>` : ''}
+
+    <div class="mono sub">BY MODE</div>
+    <div style="margin-bottom:14px">${renderModes(a)}</div>
+
+    ${d.recent_conversations.length ? `<details style="margin-bottom:12px">
+      <summary class="mono sub" style="cursor:pointer">CHAT HISTORY (${d.recent_conversations.length})</summary>
+      <div class="tablewrap"><table><tbody>${d.recent_conversations.map(c =>
+        `<tr><td><span class="pill">${esc(c.mode)}</span></td>
+             <td>${esc(c.title || '')}</td>
+             <td class="mono">${esc(String(c.conversation_id).slice(0,8))}</td>
+             <td class="mono">${fmt(c.last_message_at || c.started_at)}</td></tr>`).join('')}</tbody></table></div></details>` : ''}
+    <div class="mono sub">PROFILE</div>
+    <div class="form">${inputs}</div>
+    <div class="row" style="margin-top:12px">
+      <button id="save">Save profile</button>
+      <button class="ghost" id="reload">Reload</button>
+      <span id="saved" class="msg"></span>
+    </div>`;
+
+  $('#reload').onclick = () => showDetail(id);
+  $('#save').onclick = async () => {
+    const body = {};
+    for (const [k, , type] of FIELDS) {
+      const el = $('#f_' + k);
+      if (!el) continue;
+      if (type === 'checkbox') { body[k] = el.checked; continue; }
+      const raw = el.value.trim();
+      if (raw === '') { body[k] = null; continue; }
+      body[k] = type === 'number' ? Number(raw) : raw;
+    }
+    const note = $('#saved');
+    try {
+      await api(`/api/users/${id}/profile`, { method: 'PATCH', body: JSON.stringify(body) });
+      note.className = 'msg show ok'; note.textContent = 'Saved.';
+      load();
+    } catch (e) { note.className = 'msg show err'; note.textContent = e.message; }
+  };
+}
+
+$('#connect').onclick = () => { KEY = $('#key').value.trim(); load(); };
+$('#key').onkeydown = e => { if (e.key === 'Enter') $('#connect').click(); };
+if (KEY) load();
+</script>
+</body>
+</html>
