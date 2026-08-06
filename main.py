@@ -8,7 +8,8 @@ Depends(get_current_user_id). Self-hosted username/password auth via
 Confirm Gate guards irreversible/destructive actions only (e.g. save_food_entry,
 delete_scene) — not ordinary set logs or draft scene edits.
 
-Domain APIs live in routers/v2.py (workouts, food, manuscripts, wearables).
+Domain APIs live in routers/v2.py (workouts, food, manuscripts, wearables)
+and routers/author_persistence.py (projects / documents / versions).
 Google Docs Author path is abandoned on this branch (history preserved on main).
 
 CORS is wide open for local dev — tighten before any public deploy.
@@ -23,8 +24,9 @@ from uuid import UUID
 
 import anthropic
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from modes.author.prompt import SYSTEM_PROMPT as AUTHOR_PROMPT
@@ -39,6 +41,7 @@ from modes.jarvis.prompt import SYSTEM_PROMPT as JARVIS_PROMPT
 from modes.mail_calendar.prompt import SYSTEM_PROMPT as MAIL_CALENDAR_PROMPT
 from modes.mail_calendar.prompt import TOOLS as MAIL_CALENDAR_TOOLS
 from routers.auth import router as auth_router
+from routers.author_persistence import router as author_persistence_router
 from routers.v2 import router as v2_router
 from shared import db
 from shared.auth import assert_auth_mode_allowed, get_current_user_id
@@ -76,8 +79,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    """Propagate/generate X-Request-ID for DB failure diagnostics."""
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    token = db.request_id_var.set(request_id)
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        db.request_id_var.reset(token)
+
+
+@app.exception_handler(db.DatabaseUnavailableError)
+async def database_unavailable_handler(request: Request, exc: db.DatabaseUnavailableError):
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database temporarily unavailable"},
+        headers={"X-Request-ID": db.request_id_var.get()},
+    )
+
+
 app.include_router(auth_router)
 app.include_router(v2_router)
+app.include_router(author_persistence_router)
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
@@ -291,6 +318,23 @@ async def _run_model_turn(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/health/db")
+async def health_db():
+    """Liveness of the global asyncpg pool (SELECT 1)."""
+    try:
+        result = await db.check_db()
+    except db.DatabaseUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Database temporarily unavailable",
+        ) from exc
+    return {
+        "status": result["status"],
+        "pool_size": result["pool_size"],
+        "idle_size": result["idle_size"],
+    }
 
 
 @app.get("/modes")

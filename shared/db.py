@@ -12,21 +12,66 @@ error if it's missing rather than limping along in-memory.
 statement_cache_size=0 because Supabase's IPv4 connection string goes through
 PgBouncer in transaction mode, which breaks asyncpg's prepared-statement
 cache. Harmless on a direct connection.
+
+Pool resilience: connection-level failures log structured diagnostics, expire
+and recreate the pool once, retry idempotent reads once, and surface writes as
+DatabaseUnavailableError (HTTP 503) without duplicate execution.
 """
+from __future__ import annotations
+
+import asyncio
 import json
+import logging
 import os
 import re
 import uuid
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 import asyncpg
 
-_pool: Optional[asyncpg.Pool] = None
+logger = logging.getLogger("lifesight.db")
+
+_pool: Optional["ResilientPool"] = None
+_pool_lock = asyncio.Lock()
+_dsn: Optional[str] = None
+
+# Set by request middleware; safe empty default outside HTTP.
+request_id_var: ContextVar[str] = ContextVar("db_request_id", default="-")
+
+# min_size=0 so process startup succeeds when the pooler is briefly unreachable;
+# connections are opened on demand and reaped by max_inactive_connection_lifetime.
+POOL_MIN_SIZE = 0
+POOL_MAX_SIZE = 5
+POOL_TIMEOUT = 10.0
+POOL_COMMAND_TIMEOUT = 30.0
+POOL_MAX_INACTIVE_CONNECTION_LIFETIME = 60.0
+
+_CONNECTION_MESSAGE_MARKERS = (
+    "enotfound",
+    "tenant/user",
+    "connection reset",
+    "connection refused",
+    "server closed the connection",
+    "connection was closed",
+    "could not connect",
+    "too many connections",
+    "network is unreachable",
+    "name or service not known",
+)
 
 
-async def init_pool() -> None:
-    global _pool
+class DatabaseUnavailableError(Exception):
+    """Connection-level DB failure suitable for a sanitized HTTP 503."""
+
+    def __init__(self, message: str = "Database temporarily unavailable"):
+        self.message = message
+        super().__init__(message)
+
+
+def _require_dsn() -> str:
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
         raise RuntimeError(
@@ -34,22 +79,282 @@ async def init_pool() -> None:
             "(Connect > Connection string) into .env, then run "
             "python scripts/run_migrations.py once. See README."
         )
-    _pool = await asyncpg.create_pool(
-        dsn, min_size=1, max_size=5, statement_cache_size=0
+    return dsn
+
+
+def is_connection_failure(exc: BaseException) -> bool:
+    """True for dead/unreachable pooler connections, not ordinary SQL errors."""
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            asyncio.TimeoutError,
+            OSError,
+            ConnectionError,
+            asyncpg.InterfaceError,
+            asyncpg.PostgresConnectionError,
+            asyncpg.CannotConnectNowError,
+        ),
+    ):
+        return True
+    if isinstance(exc, asyncpg.InternalServerError):
+        msg = str(exc).lower()
+        return any(marker in msg for marker in _CONNECTION_MESSAGE_MARKERS)
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate and str(sqlstate).startswith("08"):
+        return True
+    return False
+
+
+def is_idempotent_sql(query: object) -> bool:
+    """Only pure SELECT statements are safe to retry after pool recovery."""
+    if not isinstance(query, str):
+        return False
+    head = query.lstrip().split(None, 1)
+    return bool(head) and head[0].upper() == "SELECT"
+
+
+def pool_stats(p: Any = None) -> dict[str, Optional[int]]:
+    target = p if p is not None else _pool
+    raw = getattr(target, "_raw", target) if target is not None else None
+    if raw is None:
+        return {"pool_size": None, "idle_size": None, "max_size": None}
+    try:
+        return {
+            "pool_size": int(raw.get_size()),
+            "idle_size": int(raw.get_idle_size()),
+            "max_size": int(raw.get_max_size()),
+        }
+    except Exception:
+        return {"pool_size": None, "idle_size": None, "max_size": None}
+
+
+def log_db_failure(exc: BaseException, *, request_id: Optional[str] = None) -> None:
+    stats = pool_stats()
+    rid = request_id if request_id is not None else request_id_var.get()
+    logger.error(
+        "database_failure exception_type=%s request_id=%s pool_size=%s idle_size=%s max_size=%s detail=%s",
+        type(exc).__name__,
+        rid,
+        stats["pool_size"],
+        stats["idle_size"],
+        stats["max_size"],
+        str(exc),
     )
+
+
+async def _create_raw_pool(dsn: str) -> asyncpg.Pool:
+    return await asyncpg.create_pool(
+        dsn,
+        min_size=POOL_MIN_SIZE,
+        max_size=POOL_MAX_SIZE,
+        max_inactive_connection_lifetime=POOL_MAX_INACTIVE_CONNECTION_LIFETIME,
+        timeout=POOL_TIMEOUT,
+        command_timeout=POOL_COMMAND_TIMEOUT,
+        statement_cache_size=0,
+    )
+
+
+class ResilientPool:
+    """Thin proxy: retry SELECT once after pool recreate; never retry writes."""
+
+    def __init__(self, raw: asyncpg.Pool):
+        self._raw = raw
+
+    def get_size(self) -> int:
+        return self._raw.get_size()
+
+    def get_idle_size(self) -> int:
+        return self._raw.get_idle_size()
+
+    def get_max_size(self) -> int:
+        return self._raw.get_max_size()
+
+    def get_min_size(self) -> int:
+        return self._raw.get_min_size()
+
+    async def close(self) -> None:
+        await self._raw.close()
+
+    def acquire(self, *, timeout: Optional[float] = None):
+        return self._acquire(timeout=timeout)
+
+    @asynccontextmanager
+    async def _acquire(self, *, timeout: Optional[float] = None):
+        # Acquires are not auto-retried: callers may be mid-write transaction.
+        try:
+            async with self._raw.acquire(timeout=timeout) as conn:
+                yield conn
+        except Exception as exc:
+            if not is_connection_failure(exc):
+                raise
+            log_db_failure(exc)
+            try:
+                await recreate_pool()
+            except Exception as recreate_exc:
+                log_db_failure(recreate_exc)
+                raise DatabaseUnavailableError() from recreate_exc
+            raise DatabaseUnavailableError() from exc
+
+    async def _call(self, method_name: str, query: object, *args: Any, **kwargs: Any):
+        idempotent = is_idempotent_sql(query)
+        try:
+            method = getattr(self._raw, method_name)
+            return await method(query, *args, **kwargs)
+        except Exception as exc:
+            if not is_connection_failure(exc):
+                raise
+            log_db_failure(exc)
+            try:
+                await recreate_pool()
+            except Exception as recreate_exc:
+                log_db_failure(recreate_exc)
+                raise DatabaseUnavailableError() from recreate_exc
+            if not idempotent:
+                # Writes: pool refreshed for later requests; do not re-execute.
+                raise DatabaseUnavailableError() from exc
+            try:
+                fresh = pool()
+                method = getattr(fresh._raw, method_name)
+                return await method(query, *args, **kwargs)
+            except Exception as retry_exc:
+                if is_connection_failure(retry_exc):
+                    log_db_failure(retry_exc)
+                    raise DatabaseUnavailableError() from retry_exc
+                raise
+
+    async def fetch(self, query: object, *args: Any, **kwargs: Any):
+        return await self._call("fetch", query, *args, **kwargs)
+
+    async def fetchrow(self, query: object, *args: Any, **kwargs: Any):
+        return await self._call("fetchrow", query, *args, **kwargs)
+
+    async def fetchval(self, query: object, *args: Any, **kwargs: Any):
+        return await self._call("fetchval", query, *args, **kwargs)
+
+    async def execute(self, query: object, *args: Any, **kwargs: Any):
+        return await self._call("execute", query, *args, **kwargs)
+
+    async def executemany(self, query: object, *args: Any, **kwargs: Any):
+        return await self._call("executemany", query, *args, **kwargs)
+
+
+async def init_pool() -> None:
+    """Create the global pool; probe once without failing app startup.
+
+    On probe failure the API stays up in degraded mode:
+    /health → 200, /health/db and DB routes → sanitized 503 until a later
+    request successfully recreates/uses the pool.
+    """
+    global _pool, _dsn
+    dsn = _require_dsn()
+    _dsn = dsn
+    try:
+        raw = await _create_raw_pool(dsn)
+    except Exception as exc:
+        log_db_failure(exc)
+        logger.error(
+            "database_pool_init_failed request_id=%s — app starting degraded",
+            request_id_var.get(),
+        )
+        _pool = None
+        return
+
+    _pool = ResilientPool(raw)
+    try:
+        # Probe the raw pool so startup does not trigger recovery/retry churn.
+        await raw.fetchval("SELECT 1")
+        logger.info(
+            "database_pool_ready pool_size=%s idle_size=%s",
+            _pool.get_size(),
+            _pool.get_idle_size(),
+        )
+    except Exception as exc:
+        if is_connection_failure(exc) or isinstance(exc, DatabaseUnavailableError):
+            log_db_failure(exc)
+            logger.warning(
+                "database_pool_degraded request_id=%s — startup probe failed; "
+                "serving /health without DB",
+                request_id_var.get(),
+            )
+            return
+        raise
+
+
+async def ensure_pool() -> ResilientPool:
+    """Return the pool, creating it on demand after a degraded startup."""
+    global _pool
+    if _pool is not None:
+        return _pool
+    async with _pool_lock:
+        if _pool is not None:
+            return _pool
+        dsn = _dsn or _require_dsn()
+        try:
+            raw = await _create_raw_pool(dsn)
+        except Exception as exc:
+            log_db_failure(exc)
+            raise DatabaseUnavailableError() from exc
+        _pool = ResilientPool(raw)
+        logger.warning(
+            "database_pool_created_on_demand request_id=%s",
+            request_id_var.get(),
+        )
+        return _pool
 
 
 async def close_pool() -> None:
     global _pool
-    if _pool is not None:
-        await _pool.close()
+    async with _pool_lock:
+        if _pool is not None:
+            try:
+                await _pool.close()
+            finally:
+                _pool = None
+
+
+async def recreate_pool() -> None:
+    """Expire the global pool and open a fresh one (one recovery path)."""
+    global _pool, _dsn
+    async with _pool_lock:
+        dsn = _dsn or _require_dsn()
+        _dsn = dsn
+        old = _pool
         _pool = None
+        if old is not None:
+            try:
+                await old.close()
+            except Exception as exc:
+                logger.warning(
+                    "database_pool_close_failed exception_type=%s detail=%s",
+                    type(exc).__name__,
+                    str(exc),
+                )
+        raw = await _create_raw_pool(dsn)
+        _pool = ResilientPool(raw)
+        logger.warning(
+            "database_pool_recreated request_id=%s pool_size=%s idle_size=%s",
+            request_id_var.get(),
+            _pool.get_size(),
+            _pool.get_idle_size(),
+        )
 
 
-def pool() -> asyncpg.Pool:
+def pool() -> ResilientPool:
     if _pool is None:
-        raise RuntimeError("DB pool not initialized — did app startup run?")
+        raise DatabaseUnavailableError()
     return _pool
+
+
+async def check_db() -> dict[str, Any]:
+    """SELECT 1 through the application pool (with read recovery)."""
+    try:
+        p = await ensure_pool()
+    except DatabaseUnavailableError:
+        raise
+    value = await p.fetchval("SELECT 1")
+    stats = pool_stats()
+    return {"status": "ok", "result": value, **stats}
 
 
 # ---------------------------------------------------------------------------
