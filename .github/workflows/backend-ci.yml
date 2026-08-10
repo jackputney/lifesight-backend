@@ -55,7 +55,6 @@ jobs:
           AUTH_JWT_SECRET: ci-test-jwt-secret-not-for-production  # pragma: allowlist secret
           ANTHROPIC_API_KEY: ""
           DATABASE_URL: postgresql://ci:ci@127.0.0.1:1/ci  # pragma: allowlist secret
-          # Live migration repro is a separate job; keep it skipped here.
           RUN_MIGRATION_REPRO_TEST: "0"
 
   migration-repro:
@@ -106,7 +105,7 @@ jobs:
             exit 1
           fi
 
-      - name: Apply migrations (smoke apply)
+      - name: Apply migrations on empty database
         run: python scripts/ci_apply_migrations.py --prepare-auth-stub
 
       - name: Recreate empty database for end-to-end repro test
@@ -115,13 +114,43 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql-client
-          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL'
-          SELECT pg_terminate_backend(pid)
-          FROM pg_stat_activity
-          WHERE datname = 'lifesight_ci' AND pid <> pg_backend_pid();
-          DROP DATABASE lifesight_ci;
-          CREATE DATABASE lifesight_ci;
-          SQL
+          # Separate -c calls: DROP DATABASE cannot run inside a multi-statement transaction.
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -c \
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'lifesight_ci' AND pid <> pg_backend_pid();"
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE lifesight_ci;"
+          psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE lifesight_ci;"
 
-      - name: Verify schema, MODE_REGISTRY modes, and unknown-mode rejection
-        run: python -m unittest tests.test_migration_repro.LiveMigrationReproTests -v
+      - name: Verify schema, FKs, MODE_REGISTRY modes, unknown-mode rejection
+        run: python -m unittest tests.test_migration_repro -v
+
+      - name: Dump schema diagnostics on failure
+        if: failure()
+        env:
+          PGPASSWORD: postgres  # pragma: allowlist secret
+        run: |
+          echo "::group::public tables"
+          psql -h localhost -U postgres -d lifesight_ci -c "\dt public.*" || true
+          echo "::endgroup::"
+          echo "::group::mode CHECK constraints"
+          psql -h localhost -U postgres -d lifesight_ci -c "
+            SELECT conname, pg_get_constraintdef(oid)
+            FROM pg_constraint
+            WHERE conname LIKE '%mode%check%'
+            ORDER BY conname;
+          " || true
+          echo "::endgroup::"
+          echo "::group::auth/author foreign keys"
+          psql -h localhost -U postgres -d lifesight_ci -c "
+            SELECT c.conname, cl.relname AS table_name, pg_get_constraintdef(c.oid)
+            FROM pg_constraint c
+            JOIN pg_class cl ON cl.oid = c.conrelid
+            JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+            WHERE c.contype = 'f'
+              AND ns.nspname = 'public'
+              AND cl.relname IN (
+                'users', 'auth_sessions', 'conversations',
+                'author_projects', 'author_documents', 'author_document_versions'
+              )
+            ORDER BY cl.relname, c.conname;
+          " || true
+          echo "::endgroup::"
