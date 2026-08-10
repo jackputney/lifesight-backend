@@ -325,6 +325,106 @@ class SelfHostedAuthTests(unittest.TestCase):
         with _env(AUTH_MODE="dev", APP_ENV="development"):
             assert_auth_mode_allowed()  # allowed
 
+    def test_16_timezone_null_by_default_and_me_returns_it(self):
+        with _env():
+            with self._client() as client:
+                reg = self._register(client).json()
+                self.assertIsNone(reg["user"]["timezone"])
+                me = client.get(
+                    "/auth/me",
+                    headers={"Authorization": f"Bearer {reg['access_token']}"},
+                )
+        self.assertEqual(me.status_code, 200)
+        self.assertIsNone(me.json()["timezone"])
+
+    def test_17_valid_timezone_accepted_and_persists(self):
+        with _env():
+            with self._client() as client:
+                reg = self._register(client).json()
+                headers = {"Authorization": f"Bearer {reg['access_token']}"}
+                patched = client.patch(
+                    "/auth/me",
+                    headers=headers,
+                    json={
+                        "display_name": "Alice Updated",
+                        "email": "alice+tz@example.com",
+                        "timezone": "America/Los_Angeles",
+                    },
+                )
+                self.assertEqual(patched.status_code, 200)
+                body = patched.json()
+                self.assertEqual(body["timezone"], "America/Los_Angeles")
+                self.assertEqual(body["display_name"], "Alice Updated")
+                self.assertEqual(body["email"], "alice+tz@example.com")
+                self.assertEqual(body["username"], "alice")
+                me = client.get("/auth/me", headers=headers)
+                self.assertEqual(me.status_code, 200)
+                self.assertEqual(me.json()["timezone"], "America/Los_Angeles")
+                stored = next(iter(self.store.users.values()))
+                self.assertEqual(stored["timezone"], "America/Los_Angeles")
+
+    def test_18_invalid_timezone_rejected(self):
+        with _env():
+            with self._client() as client:
+                reg = self._register(client).json()
+                headers = {"Authorization": f"Bearer {reg['access_token']}"}
+                for bad in ("-07:00", "PST", "Not/A_Zone", "", "America/Los Angeles"):
+                    resp = client.patch(
+                        "/auth/me",
+                        headers=headers,
+                        json={"timezone": bad},
+                    )
+                    self.assertEqual(resp.status_code, 400, msg=bad)
+                    self.assertIn("IANA", resp.json()["detail"])
+                me = client.get("/auth/me", headers=headers)
+                self.assertEqual(me.status_code, 200)
+                self.assertIsNone(me.json()["timezone"])
+
+    def test_19_user_cannot_modify_another_users_timezone(self):
+        with _env():
+            with self._client() as client:
+                a = self._register(client, username="alice", email="a@example.com").json()
+                b = self._register(client, username="bob", email="b@example.com").json()
+                a_headers = {"Authorization": f"Bearer {a['access_token']}"}
+                b_headers = {"Authorization": f"Bearer {b['access_token']}"}
+                self.assertEqual(
+                    client.patch(
+                        "/auth/me",
+                        headers=a_headers,
+                        json={"timezone": "America/New_York"},
+                    ).status_code,
+                    200,
+                )
+                self.assertEqual(
+                    client.patch(
+                        "/auth/me",
+                        headers=b_headers,
+                        json={"timezone": "Europe/London"},
+                    ).status_code,
+                    200,
+                )
+                a_me = client.get("/auth/me", headers=a_headers).json()
+                b_me = client.get("/auth/me", headers=b_headers).json()
+                self.assertEqual(a_me["id"], a["user"]["id"])
+                self.assertEqual(b_me["id"], b["user"]["id"])
+                self.assertEqual(a_me["timezone"], "America/New_York")
+                self.assertEqual(b_me["timezone"], "Europe/London")
+                self.assertNotEqual(a_me["timezone"], b_me["timezone"])
+
+    def test_20_username_immutable_via_patch_me(self):
+        with _env():
+            with self._client() as client:
+                reg = self._register(client).json()
+                headers = {"Authorization": f"Bearer {reg['access_token']}"}
+                resp = client.patch(
+                    "/auth/me",
+                    headers=headers,
+                    json={"username": "hacker", "timezone": "UTC"},
+                )
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.json()["username"], "alice")
+                self.assertEqual(resp.json()["timezone"], "UTC")
+
 
 if __name__ == "__main__":
     unittest.main()
