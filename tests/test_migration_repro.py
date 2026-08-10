@@ -30,6 +30,8 @@ EXPECTED_TABLES = (
     "author_projects",
     "author_documents",
     "author_document_versions",
+    "artifacts",
+    "artifact_versions",
     "conversations",
     "pending_actions",
     "action_log",
@@ -55,6 +57,15 @@ EXPECTED_FOREIGN_KEYS = (
         "users",
         "id",
     ),
+    ("artifacts_user_id_fkey", "artifacts", "user_id", "users", "id"),
+    (
+        "artifact_versions_artifact_id_fkey",
+        "artifact_versions",
+        "artifact_id",
+        "artifacts",
+        "id",
+    ),
+    ("artifact_versions_user_id_fkey", "artifact_versions", "user_id", "users", "id"),
     ("conversations_user_id_fkey", "conversations", "user_id", "users", "id"),
 )
 
@@ -245,7 +256,9 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
                 user_id,
             )
 
-            for sql_file in sorted(MIGRATIONS.glob("009_*.sql")):
+            for sql_file in sorted(MIGRATIONS.glob("*.sql")):
+                if sql_file.name < "009_":
+                    continue
                 print(f"APPLY {sql_file.name}", flush=True)
                 await conn.execute(sql_file.read_text(encoding="utf-8"))
 
