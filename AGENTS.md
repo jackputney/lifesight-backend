@@ -19,10 +19,14 @@ Full detail lives in `.cursor/rules/10-api-contract.mdc` and
 `docs/V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md`. Summary:
 
 - `POST /chat {transcript, mode, conversation_id}` →
-  `{reply, mode, conversation_id, pending_action, visual_panel, research}`
+  `{reply, mode, conversation_id, pending_action, visual_panel, research, client_actions}`
   - `visual_panel` and `research` are **optional / nullable** and separate.
     Older clients that ignore unknown fields keep working when either is null/absent.
   - `research` is for Brainstorm cited findings; see the brainstorm contract doc.
+  - `client_actions` is always an array (default `[]`). V1: `{type:"navigate",
+    target}` with closed targets `home|fitness|diet|author|brainstorm|
+    mail_calendar|settings`. Not Confirm Gate. Never `jarvis`/`health`.
+    Spoken text stays in `reply`.
 - `POST /confirm {action_id, approved}` → `{result}`
 - `GET /me` → `{user_id}`
 - `POST /devices`, `GET /devices`, `DELETE /devices/{device_id}` — push-token registration

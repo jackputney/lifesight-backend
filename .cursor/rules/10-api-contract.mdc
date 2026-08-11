@@ -42,16 +42,40 @@ Response:
     "type": "workout_sets",
     "data": {}
   },
-  "research": null
+  "research": null,
+  "client_actions": []
 }
 ```
 `conversation_id` is server-generated if the request's was `null`.
 `pending_action` is `null` unless something irreversible needs confirmation.
 `pending_action.description` is READ ALOUD — a natural spoken sentence.
 `visual_panel` is optional/nullable (`{type, data} | null`).
-`research` is optional/nullable and **separate from** `visual_panel`. Older
-clients that ignore unknown fields remain compatible when either field is
-absent or null.
+`research` is optional/nullable and **separate from** `visual_panel`.
+`client_actions` is always an array (never null). V1 items are
+`{ "type": "navigate", "target": "<allowlist>" }` only. Ordinary turns return
+`[]`. Navigation is client-local — **not** Confirm Gate. Spoken field remains
+`reply` (not `assistant_text`). Older clients that ignore unknown fields remain
+compatible.
+
+### `client_actions` (V1 — navigate only)
+Allowlisted `target` values (closed set):
+`home` | `fitness` | `diet` | `author` | `brainstorm` | `mail_calendar` | `settings`
+
+Never emit `jarvis` or `health`. Deterministic whole-utterance commands
+(`open` / `go to` / `take me to` / …) are handled before mode Claude.
+
+Example navigate turn:
+```json
+{
+  "reply": "Opening Fitness.",
+  "mode": "diet",
+  "conversation_id": "abc123",
+  "pending_action": null,
+  "visual_panel": null,
+  "research": null,
+  "client_actions": [{ "type": "navigate", "target": "fitness" }]
+}
+```
 
 ### `research` (Brainstorm; usually null elsewhere)
 ```json
