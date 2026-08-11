@@ -61,6 +61,7 @@ class ChatNewModesTests(unittest.TestCase):
                     self.assertIsNone(body["research"])
                     self.assertIsNone(body["pending_action"])
                     self.assertIsNone(body["visual_panel"])
+                    self.assertEqual(body["client_actions"], [])
         finally:
             if prev is None:
                 os.environ.pop("ANTHROPIC_API_KEY", None)

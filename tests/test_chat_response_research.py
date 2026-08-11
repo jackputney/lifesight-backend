@@ -26,6 +26,7 @@ class ChatResponseResearchTests(unittest.TestCase):
         self.assertIsNone(payload["research"])
         self.assertIn("visual_panel", payload)
         self.assertIsNone(payload["visual_panel"])
+        self.assertEqual(payload["client_actions"], [])
 
     def test_omitted_research_defaults_to_null(self) -> None:
         """Existing constructors that omit research stay compatible."""

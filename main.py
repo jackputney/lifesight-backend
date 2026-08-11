@@ -45,6 +45,14 @@ from routers.author_persistence import router as author_persistence_router
 from routers.v2 import router as v2_router
 from shared import db
 from shared.auth import assert_auth_mode_allowed, get_current_user_id
+from shared.client_actions import (
+    ClientAction,
+    blocked_navigate_reply,
+    empty_client_actions,
+    navigate_acknowledgement,
+    navigate_action,
+    parse_navigate_command,
+)
 from shared.research import (
     ResearchFactCheck,
     ResearchResult,
@@ -180,6 +188,9 @@ class ChatResponse(BaseModel):
     visual_panel: VisualPanel | None = None
     # Additive Brainstorm field — null for ordinary turns and all other modes.
     research: ResearchResult | None = None
+    # Always an array (never null). V1: navigate only; ordinary turns → [].
+    # Not Confirm Gate — client-local UI actions only.
+    client_actions: list[ClientAction] = Field(default_factory=list)
 
 
 class ConfirmRequest(BaseModel):
@@ -359,6 +370,30 @@ async def me(user_id: str = Depends(get_current_user_id)):
 # Chat (mode router) + Confirm Gate
 # ---------------------------------------------------------------------------
 
+async def _ensure_conversation(
+    conversation_id: str | None, *, user_id: str, mode: str
+) -> str:
+    """Resolve / create conversation_id with ownership checks."""
+    if conversation_id is None:
+        conversation_id = str(uuid.uuid4())
+        await db.create_conversation(conversation_id, user_id, mode)
+        return conversation_id
+    try:
+        uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="conversation_id must be a UUID")
+    convo = await db.get_conversation(conversation_id)
+    if convo is None:
+        # Client sent an id we've never seen (e.g. minted before the DB
+        # existed) — start fresh under that id rather than erroring out.
+        await db.create_conversation(conversation_id, user_id, mode)
+    elif str(convo["user_id"]) != user_id:
+        raise HTTPException(
+            status_code=403, detail="conversation_id does not belong to this user"
+        )
+    return conversation_id
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     mode = req.mode.lower().strip()
@@ -368,25 +403,37 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
             detail=f"Unsupported mode '{mode}'. Valid modes: {sorted(PUBLIC_MODE_IDS)}",
         )
 
+    # Global app commands (V1: navigate) — before mode Claude / API key.
+    # Never Confirm Gate; never jarvis/health targets.
+    navigate = parse_navigate_command(req.transcript)
+    if navigate is not None:
+        conversation_id = await _ensure_conversation(
+            req.conversation_id, user_id=user_id, mode=mode
+        )
+        await db.append_message(conversation_id, "user", req.transcript)
+        if navigate.target is not None:
+            reply = navigate_acknowledgement(navigate.target)
+            actions = [navigate_action(navigate.target)]
+        else:
+            reply = blocked_navigate_reply(navigate.blocked_alias or "")
+            actions = empty_client_actions()
+        await db.append_message(conversation_id, "assistant", reply)
+        return ChatResponse(
+            reply=reply,
+            mode=mode,
+            conversation_id=conversation_id,
+            pending_action=None,
+            visual_panel=None,
+            research=None,
+            client_actions=actions,
+        )
+
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
 
-    conversation_id = req.conversation_id
-    if conversation_id is None:
-        conversation_id = str(uuid.uuid4())
-        await db.create_conversation(conversation_id, user_id, mode)
-    else:
-        try:
-            uuid.UUID(conversation_id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="conversation_id must be a UUID")
-        convo = await db.get_conversation(conversation_id)
-        if convo is None:
-            # Client sent an id we've never seen (e.g. minted before the DB
-            # existed) — start fresh under that id rather than erroring out.
-            await db.create_conversation(conversation_id, user_id, mode)
-        elif str(convo["user_id"]) != user_id:
-            raise HTTPException(status_code=403, detail="conversation_id does not belong to this user")
+    conversation_id = await _ensure_conversation(
+        req.conversation_id, user_id=user_id, mode=mode
+    )
 
     history = await db.load_messages(conversation_id)
     history.append({"role": "user", "content": req.transcript})
@@ -394,6 +441,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
 
     research: ResearchResult | None = None
     pending_action: PendingAction | None = None
+    client_actions = empty_client_actions()
 
     # Brainstorm research is opt-in via explicit verify/research/check language.
     # No Confirm Gate — read-only. Other modes never attach a research object.
@@ -431,6 +479,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
         pending_action=pending_action,
         visual_panel=None,
         research=research,
+        client_actions=client_actions,
     )
 
 
