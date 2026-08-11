@@ -51,18 +51,30 @@ Response:
 `pending_action.description` is READ ALOUD — a natural spoken sentence.
 `visual_panel` is optional/nullable (`{type, data} | null`).
 `research` is optional/nullable and **separate from** `visual_panel`.
-`client_actions` is always an array (never null). V1 items are
-`{ "type": "navigate", "target": "<allowlist>" }` only. Ordinary turns return
-`[]`. Navigation is client-local — **not** Confirm Gate. Spoken field remains
-`reply` (not `assistant_text`). Older clients that ignore unknown fields remain
-compatible.
+`client_actions` is always an array (never null). Ordinary turns return `[]`.
+Spoken field remains `reply` (not `assistant_text`). Older clients that ignore
+unknown fields / unknown action `type`s remain compatible.
 
-### `client_actions` (V1 — navigate only)
-Allowlisted `target` values (closed set):
-`home` | `fitness` | `diet` | `author` | `brainstorm` | `mail_calendar` | `settings`
+### `client_actions` — navigate + Author create results
+**Navigate** (client-local UI; not Confirm Gate):
+`{ "type": "navigate", "target": "<allowlist>" }`
+Allowlisted `target`: `home` | `fitness` | `diet` | `author` | `brainstorm` |
+`mail_calendar` | `settings`. Never `jarvis` / `health`.
 
-Never emit `jarvis` or `health`. Deterministic whole-utterance commands
-(`open` / `go to` / `take me to` / …) are handled before mode Claude.
+**Author create results** (backend already mutated; iOS refreshes/navigates only):
+```json
+{ "type": "author_project_created", "project_id": "<uuid>", "title": "My Novel" }
+```
+```json
+{
+  "type": "author_document_created",
+  "project_id": "<uuid>",
+  "document_id": "<uuid>",
+  "title": "Chapter One"
+}
+```
+Creates are safe/reversible — **no** Confirm Gate. Document create without a
+unique project title asks for clarification and returns `client_actions: []`.
 
 Example navigate turn:
 ```json
@@ -74,6 +86,25 @@ Example navigate turn:
   "visual_panel": null,
   "research": null,
   "client_actions": [{ "type": "navigate", "target": "fitness" }]
+}
+```
+
+Example Author create turn:
+```json
+{
+  "reply": "I created My Novel.",
+  "mode": "fitness",
+  "conversation_id": "abc123",
+  "pending_action": null,
+  "visual_panel": null,
+  "research": null,
+  "client_actions": [
+    {
+      "type": "author_project_created",
+      "project_id": "…",
+      "title": "My Novel"
+    }
+  ]
 }
 ```
 

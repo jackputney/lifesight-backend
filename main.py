@@ -45,8 +45,11 @@ from routers.author_persistence import router as author_persistence_router
 from routers.v2 import router as v2_router
 from shared import db
 from shared.auth import assert_auth_mode_allowed, get_current_user_id
+from shared.author_actions import execute_author_command, parse_author_command
 from shared.client_actions import (
-    ClientAction,
+    AuthorDocumentCreatedAction,
+    AuthorProjectCreatedAction,
+    NavigateAction,
     blocked_navigate_reply,
     empty_client_actions,
     navigate_acknowledgement,
@@ -188,9 +191,12 @@ class ChatResponse(BaseModel):
     visual_panel: VisualPanel | None = None
     # Additive Brainstorm field — null for ordinary turns and all other modes.
     research: ResearchResult | None = None
-    # Always an array (never null). V1: navigate only; ordinary turns → [].
-    # Not Confirm Gate — client-local UI actions only.
-    client_actions: list[ClientAction] = Field(default_factory=list)
+    # Always an array (never null). Ordinary turns → [].
+    # navigate = client-local; author_*_created = result signals after server mutation.
+    # Not Confirm Gate for these types.
+    client_actions: list[
+        NavigateAction | AuthorProjectCreatedAction | AuthorDocumentCreatedAction
+    ] = Field(default_factory=list)
 
 
 class ConfirmRequest(BaseModel):
@@ -403,8 +409,9 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
             detail=f"Unsupported mode '{mode}'. Valid modes: {sorted(PUBLIC_MODE_IDS)}",
         )
 
-    # Global app commands (V1: navigate) — before mode Claude / API key.
-    # Never Confirm Gate; never jarvis/health targets.
+    # Global app commands — before mode Claude / API key.
+    # Navigate: client-local. Author creates: server-side mutation + result signal.
+    # Never Confirm Gate for these; never jarvis/health navigate targets.
     navigate = parse_navigate_command(req.transcript)
     if navigate is not None:
         conversation_id = await _ensure_conversation(
@@ -426,6 +433,24 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
             visual_panel=None,
             research=None,
             client_actions=actions,
+        )
+
+    author_cmd = parse_author_command(req.transcript)
+    if author_cmd is not None:
+        conversation_id = await _ensure_conversation(
+            req.conversation_id, user_id=user_id, mode=mode
+        )
+        await db.append_message(conversation_id, "user", req.transcript)
+        result = await execute_author_command(author_cmd, user_id=user_id)
+        await db.append_message(conversation_id, "assistant", result.reply)
+        return ChatResponse(
+            reply=result.reply,
+            mode=mode,
+            conversation_id=conversation_id,
+            pending_action=None,
+            visual_panel=None,
+            research=None,
+            client_actions=result.client_actions,
         )
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
