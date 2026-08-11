@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from main import ChatResponse, app
 from shared.client_actions import (
     ALLOWED_NAVIGATE_TARGETS,
-    ClientAction,
+    NavigateAction,
     parse_navigate_command,
 )
 
@@ -95,7 +95,7 @@ class ChatResponseClientActionsShapeTests(unittest.TestCase):
             reply="Opening Fitness.",
             mode="diet",
             conversation_id="00000000-0000-4000-8000-000000000099",
-            client_actions=[ClientAction(type="navigate", target="fitness")],
+            client_actions=[NavigateAction(type="navigate", target="fitness")],
         ).model_dump(mode="json")
         self.assertEqual(
             payload["client_actions"],

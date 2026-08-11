@@ -1,18 +1,18 @@
-"""Global app client_actions for /chat — V1 navigation only.
+"""Global app client_actions for /chat.
 
-Deterministic intent layer runs before mode Claude. Navigation never uses the
-Confirm Gate. jarvis and health are never emit targets.
+V1 navigate + Author create *result* signals. Deterministic intent layers run
+before mode Claude. Navigation and Author creates never use the Confirm Gate.
+jarvis and health are never emit navigate targets.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-ClientActionType = Literal["navigate"]
 NavigateTarget = Literal[
     "home",
     "fitness",
@@ -81,11 +81,32 @@ _NAVIGATE_CMD = re.compile(
 )
 
 
-class ClientAction(BaseModel):
-    """Wire shape for /chat client_actions items (V1: navigate only)."""
-
-    type: ClientActionType = "navigate"
+class NavigateAction(BaseModel):
+    type: Literal["navigate"] = "navigate"
     target: NavigateTarget
+
+
+class AuthorProjectCreatedAction(BaseModel):
+    """Result signal after backend created an Author project (not a mutation command)."""
+
+    type: Literal["author_project_created"] = "author_project_created"
+    project_id: str
+    title: str
+
+
+class AuthorDocumentCreatedAction(BaseModel):
+    """Result signal after backend created an Author document (not a mutation command)."""
+
+    type: Literal["author_document_created"] = "author_document_created"
+    project_id: str
+    document_id: str
+    title: str
+
+
+ClientAction = Annotated[
+    Union[NavigateAction, AuthorProjectCreatedAction, AuthorDocumentCreatedAction],
+    Field(discriminator="type"),
+]
 
 
 @dataclass(frozen=True)
@@ -107,7 +128,7 @@ def normalize_command_text(text: str) -> str:
 def parse_navigate_command(transcript: str) -> Optional[NavigateMatch]:
     """Return a navigate match for whole-utterance app commands, else None.
 
-    Allowlisted targets become ClientAction(navigate). Blocked aliases
+    Allowlisted targets become NavigateAction. Blocked aliases
     (health, jarvis) return NavigateMatch(target=None, blocked_alias=...).
     Ordinary chat returns None so mode Claude handles the turn.
     """
@@ -128,10 +149,29 @@ def parse_navigate_command(transcript: str) -> Optional[NavigateMatch]:
     return NavigateMatch(target=target)
 
 
-def navigate_action(target: NavigateTarget) -> ClientAction:
+def navigate_action(target: NavigateTarget) -> NavigateAction:
     if target not in ALLOWED_NAVIGATE_TARGETS:
         raise ValueError(f"navigate target not allowlisted: {target}")
-    return ClientAction(type="navigate", target=target)
+    return NavigateAction(type="navigate", target=target)
+
+
+def author_project_created_action(*, project_id: str, title: str) -> AuthorProjectCreatedAction:
+    return AuthorProjectCreatedAction(
+        type="author_project_created",
+        project_id=str(project_id),
+        title=title,
+    )
+
+
+def author_document_created_action(
+    *, project_id: str, document_id: str, title: str
+) -> AuthorDocumentCreatedAction:
+    return AuthorDocumentCreatedAction(
+        type="author_document_created",
+        project_id=str(project_id),
+        document_id=str(document_id),
+        title=title,
+    )
 
 
 def navigate_acknowledgement(target: NavigateTarget) -> str:
@@ -147,5 +187,5 @@ def blocked_navigate_reply(alias: str) -> str:
     return "That screen isn't available."
 
 
-def empty_client_actions() -> list[ClientAction]:
+def empty_client_actions() -> list[NavigateAction | AuthorProjectCreatedAction | AuthorDocumentCreatedAction]:
     return []
