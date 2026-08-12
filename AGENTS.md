@@ -34,6 +34,8 @@ Full detail lives in `.cursor/rules/10-api-contract.mdc` and
   `{modes: ["fitness", "diet", "author", "brainstorm", "mail_calendar"]}`
   — **exact order**, not alphabetically sorted. `jarvis` hidden; `health` retired.
 - `GET /health` → `{status: "ok"}`
+- `POST /voice/speech` `{text}` → streamed `audio/mpeg` (ElevenLabs server-side;
+  requires Bearer JWT + `ELEVENLABS_API_KEY` / `ELEVENLABS_VOICE_ID`)
 - Auth (proxied so iOS never holds Supabase keys):
   - `POST /auth/signup` `{email, password}` → session tokens + `user_id`
   - `POST /auth/login` `{email, password}` → session tokens + `user_id`

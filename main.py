@@ -12,7 +12,8 @@ Domain APIs live in routers/v2.py (workouts, food, manuscripts, wearables)
 and routers/author_persistence.py (projects / documents / versions).
 Google Docs Author path is abandoned on this branch (history preserved on main).
 
-CORS is wide open for local dev — tighten before any public deploy.
+CORS origins come from CORS_ALLOW_ORIGINS (local default *).
+Staging/production require AUTH_MODE=self + AUTH_JWT_SECRET + explicit CORS.
 """
 import asyncio
 import os
@@ -43,8 +44,9 @@ from modes.mail_calendar.prompt import TOOLS as MAIL_CALENDAR_TOOLS
 from routers.auth import router as auth_router
 from routers.author_persistence import router as author_persistence_router
 from routers.v2 import router as v2_router
+from routers.voice import router as voice_router
 from shared import db
-from shared.auth import assert_auth_mode_allowed, get_current_user_id
+from shared.auth import assert_auth_mode_allowed, cors_allow_origins, get_current_user_id
 from shared.client_actions import (
     ClientAction,
     blocked_navigate_reply,
@@ -78,11 +80,11 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Lifesight Backend", lifespan=lifespan)
 
-# Wide open for local dev only (Simulator/browser calls from any origin). Lock
-# this down to the real app's origin(s) before deploying anywhere public.
+# Origins from CORS_ALLOW_ORIGINS (comma-separated). Local unset → ["*"].
+# Staging/production refuse wildcard / missing allowlist at startup.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_allow_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -113,6 +115,7 @@ async def database_unavailable_handler(request: Request, exc: db.DatabaseUnavail
 app.include_router(auth_router)
 app.include_router(v2_router)
 app.include_router(author_persistence_router)
+app.include_router(voice_router)
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
