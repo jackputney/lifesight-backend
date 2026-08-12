@@ -93,6 +93,32 @@ You should see:
 Uvicorn running on http://127.0.0.1:8000
 ```
 
+## Staging / deploy checklist
+
+Migrations are **not** applied at process startup. Treat them as an explicit
+deploy step (once per environment, and again whenever a new file lands under
+`migrations/`):
+
+```bash
+# Against the staging/production DATABASE_URL (no --seed-dev-user there):
+python scripts/run_migrations.py
+```
+
+Required staging/production env:
+
+| Variable | Value |
+|----------|--------|
+| `APP_ENV` | `staging` or `production` |
+| `AUTH_MODE` | `self` (startup fails otherwise) |
+| `AUTH_JWT_SECRET` | non-empty |
+| `CORS_ALLOW_ORIGINS` | explicit comma-separated origins (not `*`) |
+| `DATABASE_URL` | session pooler URI |
+| `ANTHROPIC_API_KEY` | set for `/chat` |
+| `ELEVENLABS_API_KEY` / `ELEVENLABS_VOICE_ID` | set for `POST /voice/speech` |
+| `TERRA_WEBHOOK_SECRET` | set if wearables webhooks are enabled |
+
+Probe after deploy: `GET /health` (process) and `GET /health/db` (Postgres).
+
 ## Test it
 
 In a second terminal window, with the server still running:

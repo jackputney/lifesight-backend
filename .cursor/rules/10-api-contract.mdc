@@ -124,6 +124,13 @@ structured mode-config may come later.)
 ## GET /health
 Response: `{ "status": "ok" }`
 
+## POST /voice/speech
+Server-side TTS only (ElevenLabs). iOS must not embed ElevenLabs API keys.
+
+Request: `{ "text": "Opening Author." }` with `Authorization: Bearer <access JWT>`.
+Response: `audio/mpeg` (streamed). Env: `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`
+(optional `ELEVENLABS_MODEL_ID`, default `eleven_flash_v2_5`).
+
 ## GET /me
 Response: `{ "user_id": "<uuid>" }` — resolved identity for the current auth token.
 

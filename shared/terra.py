@@ -67,11 +67,17 @@ async def create_widget_session(
 
 
 def verify_webhook_signature(body: bytes, signature_header: str | None) -> bool:
-    """HMAC-SHA256 check when TERRA_WEBHOOK_SECRET is set. If unset, accept
-    (local/dev only) — production must set the secret."""
-    secret = os.environ.get("TERRA_WEBHOOK_SECRET", "")
+    """HMAC-SHA256 check when TERRA_WEBHOOK_SECRET is set.
+
+    Unsigned acceptance is allowed only for local AUTH_MODE=dev outside
+    staging/production. Staging/production and AUTH_MODE=self reject missing
+    secrets (and missing signatures) so traffic cannot silently skip HMAC.
+    """
+    secret = (os.environ.get("TERRA_WEBHOOK_SECRET") or "").strip()
     if not secret:
-        return True
+        from shared.auth import auth_mode, is_deploy_environment
+
+        return auth_mode() == "dev" and not is_deploy_environment()
     if not signature_header:
         return False
     digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()

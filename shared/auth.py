@@ -2,11 +2,12 @@
 # Auth injection point. Endpoints depend on get_current_user_id and never
 # decode tokens themselves — so mode swaps touch ONLY this file.
 #
-#   AUTH_MODE=dev   (default) -> fixed DEV_FAKE_USER_ID (local bypass only).
-#   AUTH_MODE=self            -> verify short-lived self-hosted access JWTs.
+#   AUTH_MODE=dev   (default for local) -> fixed DEV_FAKE_USER_ID (bypass only).
+#   AUTH_MODE=self  -> verify short-lived self-hosted access JWTs.
 #
-# AUTH_MODE=dev is refused when APP_ENV/ENVIRONMENT is production/prod.
-# Identity always comes from authentication — never from a request-body user_id.
+# Staging/production (APP_ENV/ENVIRONMENT in staging|stage|production|prod)
+# MUST use AUTH_MODE=self and a non-empty AUTH_JWT_SECRET. Identity always
+# comes from authentication — never from a request-body user_id.
 
 from __future__ import annotations
 
@@ -15,6 +16,9 @@ import os
 from fastapi import Header, HTTPException
 
 DEV_FAKE_USER_ID = "00000000-0000-4000-8000-000000000001"
+
+# Environments that must never use the local-dev auth bypass.
+DEPLOY_ENVIRONMENTS = frozenset({"production", "prod", "staging", "stage"})
 
 
 def auth_mode() -> str:
@@ -25,12 +29,62 @@ def app_environment() -> str:
     return (os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "").strip().lower()
 
 
-def assert_auth_mode_allowed() -> None:
-    """Fail closed if the local-dev bypass is enabled in production."""
-    if auth_mode() == "dev" and app_environment() in ("production", "prod"):
+def is_deploy_environment() -> bool:
+    return app_environment() in DEPLOY_ENVIRONMENTS
+
+
+def _jwt_secret_configured() -> bool:
+    return bool((os.environ.get("AUTH_JWT_SECRET") or "").strip())
+
+
+def cors_allow_origins() -> list[str]:
+    """Origins for CORSMiddleware.
+
+    Local/dev: CORS_ALLOW_ORIGINS unset → ["*"].
+    Staging/production: must be an explicit comma-separated allowlist (not *).
+    """
+    raw = (os.environ.get("CORS_ALLOW_ORIGINS") or "").strip()
+    if not raw:
+        if is_deploy_environment():
+            raise RuntimeError(
+                "CORS_ALLOW_ORIGINS must be set to an explicit allowlist "
+                "when APP_ENV/ENVIRONMENT is staging/production"
+            )
+        return ["*"]
+    origins = [part.strip() for part in raw.split(",") if part.strip()]
+    if not origins:
+        raise RuntimeError("CORS_ALLOW_ORIGINS is empty after parsing")
+    if is_deploy_environment() and any(origin == "*" for origin in origins):
         raise RuntimeError(
-            "AUTH_MODE=dev is not allowed when APP_ENV/ENVIRONMENT is production"
+            "CORS_ALLOW_ORIGINS must not include '*' in staging/production"
         )
+    return origins
+
+
+def assert_auth_mode_allowed() -> None:
+    """Fail closed on auth / CORS misconfiguration before serving traffic."""
+    mode = auth_mode()
+
+    if mode not in ("dev", "self"):
+        raise RuntimeError("AUTH_MODE must be 'dev' or 'self'")
+
+    if is_deploy_environment():
+        if mode != "self":
+            raise RuntimeError(
+                "AUTH_MODE must be 'self' when APP_ENV/ENVIRONMENT is "
+                f"staging/production (got {mode!r})"
+            )
+        if not _jwt_secret_configured():
+            raise RuntimeError(
+                "AUTH_JWT_SECRET is required when AUTH_MODE=self "
+                "in staging/production"
+            )
+        # Validate CORS config at startup (raises if missing / wildcard).
+        cors_allow_origins()
+        return
+
+    if mode == "self" and not _jwt_secret_configured():
+        raise RuntimeError("AUTH_JWT_SECRET is required when AUTH_MODE=self")
 
 
 def _require_bearer(authorization: str | None) -> str:

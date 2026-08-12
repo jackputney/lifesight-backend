@@ -311,15 +311,25 @@ class SelfHostedAuthTests(unittest.TestCase):
                     self.assertEqual(still.status_code, 429)
 
     def test_15_production_refuses_dev_auth_bypass(self):
-        with _env(AUTH_MODE="dev", APP_ENV="production"):
+        with _env(
+            AUTH_MODE="dev",
+            APP_ENV="production",
+            CORS_ALLOW_ORIGINS="https://app.example",
+        ):
             with self.assertRaises(RuntimeError) as ctx:
                 assert_auth_mode_allowed()
-            self.assertIn("AUTH_MODE=dev", str(ctx.exception))
-        with _env(AUTH_MODE="dev", ENVIRONMENT="prod", APP_ENV=""):
+            self.assertIn("AUTH_MODE must be 'self'", str(ctx.exception))
+        with _env(
+            AUTH_MODE="dev",
+            ENVIRONMENT="prod",
+            APP_ENV="",
+            CORS_ALLOW_ORIGINS="https://app.example",
+        ):
             # ENVIRONMENT alone also counts when APP_ENV empty — auth.py ORs both.
             os.environ.pop("APP_ENV", None)
             os.environ["ENVIRONMENT"] = "prod"
             os.environ["AUTH_MODE"] = "dev"
+            os.environ["CORS_ALLOW_ORIGINS"] = "https://app.example"
             with self.assertRaises(RuntimeError):
                 assert_auth_mode_allowed()
         with _env(AUTH_MODE="dev", APP_ENV="development"):
