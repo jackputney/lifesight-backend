@@ -8,6 +8,7 @@ import os
 _DEFAULT_INPUT_TOKEN_BUDGET = 24_000
 _DEFAULT_RECENT_MESSAGE_CAP = 20
 _DEFAULT_SUMMARY_THRESHOLD = 30
+_DEFAULT_SUMMARY_TOKEN_BUDGET = 1_500
 _DEFAULT_CHARS_PER_TOKEN = 4.0
 
 CONVERSATION_TITLE_MAX_CHARS = 60
@@ -45,6 +46,11 @@ def context_recent_message_cap() -> int:
 
 def context_summary_threshold() -> int:
     return _int_env("CONTEXT_SUMMARY_THRESHOLD", _DEFAULT_SUMMARY_THRESHOLD)
+
+
+def context_summary_token_budget() -> int:
+    """Hard cap on stored/rolling summary_text size (estimated tokens)."""
+    return _int_env("CONTEXT_SUMMARY_TOKEN_BUDGET", _DEFAULT_SUMMARY_TOKEN_BUDGET)
 
 
 def context_chars_per_token() -> float:

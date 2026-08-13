@@ -1,5 +1,5 @@
--- 012: richer user_profiles (1:1 with users) + admin_audit_log for seed tooling.
--- Gaps 010/011 reserved for other draft PRs. Identity fields stay on users.
+-- 010: richer user_profiles (1:1 with users) + admin_audit_log for seed tooling.
+-- Identity fields (display_name, email) stay on users /auth/me.
 
 CREATE TABLE IF NOT EXISTS user_profiles (
     user_id                      UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,

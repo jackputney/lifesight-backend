@@ -1,4 +1,8 @@
-"""Rolling conversation summaries — failure must not break /chat."""
+"""Rolling conversation summaries — failure must not break /chat.
+
+`summary_text` is hard-capped by CONTEXT_SUMMARY_TOKEN_BUDGET so repeated
+compaction cycles cannot grow the stored summary without bound.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,12 @@ import logging
 from typing import Any, Optional
 
 from shared.context_budget import estimate_tokens
-from shared.context_config import context_recent_message_cap, context_summary_threshold
+from shared.context_config import (
+    context_chars_per_token,
+    context_recent_message_cap,
+    context_summary_threshold,
+    context_summary_token_budget,
+)
 
 logger = logging.getLogger("lifesight.summary")
 
@@ -36,6 +45,35 @@ def _content_preview(content: Any, *, limit: int = 400) -> str:
     return text
 
 
+def clamp_summary_text(text: str) -> str:
+    """Enforce CONTEXT_SUMMARY_TOKEN_BUDGET. Keeps the newest compacted tail."""
+    budget = context_summary_token_budget()
+    body = (text or "").strip()
+    if not body:
+        return ""
+    if estimate_tokens(body) <= budget:
+        return body
+
+    max_chars = max(64, int(budget * context_chars_per_token()))
+    if len(body) <= max_chars:
+        # Token estimate still over — trim more aggressively by chars.
+        max_chars = max(64, int(max_chars * 0.75))
+
+    clipped = body[-max_chars:].lstrip()
+    # Prefer starting on a line boundary when cheap.
+    nl = clipped.find("\n")
+    if 0 <= nl < min(120, len(clipped) // 4):
+        clipped = clipped[nl + 1 :].lstrip()
+    if not clipped.startswith("…"):
+        clipped = "…\n" + clipped
+    # Final guarantee.
+    while clipped and estimate_tokens(clipped) > budget:
+        clipped = clipped[max(1, len(clipped) // 10) :].lstrip()
+        if not clipped.startswith("…"):
+            clipped = "…\n" + clipped
+    return clipped
+
+
 def build_extractive_summary(
     messages_with_seq: list[dict],
     *,
@@ -46,32 +84,35 @@ def build_extractive_summary(
 
     Returns (summary_text, summary_through_seq) where through_seq is the last
     seq included in the summarized older span (exclusive of the recent window).
+    Stored summary is always clamped to CONTEXT_SUMMARY_TOKEN_BUDGET.
     """
     keep = keep_recent if keep_recent is not None else context_recent_message_cap()
     if len(messages_with_seq) <= keep:
-        # Nothing older to fold — keep prior summary as-is conceptually.
         if previous_summary:
-            through = messages_with_seq[-keep - 1]["seq"] if len(messages_with_seq) > keep else (
-                messages_with_seq[-1]["seq"] if messages_with_seq else -1
+            through = (
+                messages_with_seq[-keep - 1]["seq"]
+                if len(messages_with_seq) > keep
+                else (messages_with_seq[-1]["seq"] if messages_with_seq else -1)
             )
-            return previous_summary.strip(), int(through) if messages_with_seq else -1
+            return clamp_summary_text(previous_summary), (
+                int(through) if messages_with_seq else -1
+            )
         return "", -1
 
     older = messages_with_seq[:-keep]
     recent_boundary_seq = int(older[-1]["seq"])
     lines: list[str] = []
     if previous_summary and previous_summary.strip():
-        lines.append(previous_summary.strip())
+        lines.append(clamp_summary_text(previous_summary))
     lines.append("Additional earlier turns:")
-    for msg in older[-40:]:  # bound summary growth
+    # Bound how many older rows we fold in one pass; clamp_summary_text is the
+    # hard invariant across cycles.
+    for msg in older[-40:]:
         role = msg.get("role", "user")
         preview = _content_preview(msg.get("content"))
         if preview:
             lines.append(f"- ({role}) {preview}")
-    text = "\n".join(lines)
-    # Soft cap summary size (~2k tokens ≈ 8k chars at 4 chars/token).
-    if estimate_tokens(text) > 2000:
-        text = text[:8000].rstrip() + "…"
+    text = clamp_summary_text("\n".join(lines))
     return text, recent_boundary_seq
 
 

@@ -4,8 +4,8 @@ Additive backend contracts on branch `feature/user-context-history-v1`.
 Existing `/chat` fields remain: `reply`, `mode`, `conversation_id`,
 `pending_action`, `visual_panel`, `research`, `client_actions`.
 
-Migrations: `012_user_profiles.sql`, `013_conversation_context.sql`
-(010/011 reserved for other draft PRs).
+Migrations: `010_user_profiles.sql`, `011_conversation_context.sql`
+(next free number after main's `009`).
 
 ## 1. `visual_panel` — Fitness `exercise`
 
@@ -81,6 +81,7 @@ Env (defaults):
 - `CONTEXT_INPUT_TOKEN_BUDGET=24000`
 - `CONTEXT_RECENT_MESSAGE_CAP=20`
 - `CONTEXT_SUMMARY_THRESHOLD=30`
+- `CONTEXT_SUMMARY_TOKEN_BUDGET=1500` (hard cap on stored `summary_text`)
 - `CONTEXT_CHARS_PER_TOKEN=4`
 
 Model call = system + compact profile + rolling summary + recent raw window

@@ -1,5 +1,4 @@
--- 013: conversation titles, rolling summaries, turn-level context metrics.
--- Gaps 010/011 reserved for other draft PRs.
+-- 011: conversation titles, rolling summaries, turn-level context metrics.
 
 ALTER TABLE conversations
     ADD COLUMN IF NOT EXISTS summary_text TEXT,

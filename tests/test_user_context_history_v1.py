@@ -15,7 +15,12 @@ from pydantic import ValidationError
 from main import app
 from shared.client_actions import NavigateAction, open_conversation_action, parse_navigate_command
 from shared.context_budget import build_model_messages, estimate_tokens
-from shared.conversation_summary import build_extractive_summary, needs_summarization
+from shared.context_config import context_summary_token_budget
+from shared.conversation_summary import (
+    build_extractive_summary,
+    clamp_summary_text,
+    needs_summarization,
+)
 from shared.conversation_titles import fallback_title, title_from_user_text
 from shared.open_conversation import (
     parse_open_conversation_command,
@@ -197,6 +202,95 @@ class SummaryTests(unittest.TestCase):
         )
         self.assertTrue(text)
         self.assertEqual(through, 19)  # last of older span
+        self.assertLessEqual(estimate_tokens(text), context_summary_token_budget())
+
+    def test_clamp_summary_hard_bound(self):
+        huge = "fact " * 5000
+        clamped = clamp_summary_text(huge)
+        self.assertLessEqual(
+            estimate_tokens(clamped), context_summary_token_budget()
+        )
+
+    def test_repeated_compaction_stays_bounded(self):
+        """Simulate 100+ turns with multiple summary cycles.
+
+        Invariants:
+        - stored summary_text stays under CONTEXT_SUMMARY_TOKEN_BUDGET
+        - assembled model context stays under CONTEXT_INPUT_TOKEN_BUDGET
+        - recent messages remain verbatim in the builder window
+        - raw message list length is unchanged (DB rows would remain intact)
+        """
+        with patch.dict(
+            os.environ,
+            {
+                "CONTEXT_SUMMARY_THRESHOLD": "30",
+                "CONTEXT_RECENT_MESSAGE_CAP": "20",
+                "CONTEXT_SUMMARY_TOKEN_BUDGET": "800",
+                "CONTEXT_INPUT_TOKEN_BUDGET": "24000",
+            },
+            clear=False,
+        ):
+            raw: list[dict] = []
+            summary_text: str | None = None
+            summary_through: int | None = None
+            keep = 20
+            threshold = 30
+
+            for i in range(120):
+                raw.append(
+                    {
+                        "seq": i,
+                        "role": "user" if i % 2 == 0 else "assistant",
+                        "content": (
+                            f"Turn {i}: concrete workout detail about set {i} "
+                            f"and a somewhat long coaching note {'x' * 80}."
+                        ),
+                    }
+                )
+                floor = -1 if summary_through is None else int(summary_through)
+                unsummarized = [m for m in raw if int(m["seq"]) > floor]
+                if len(unsummarized) >= threshold:
+                    summary_text, summary_through = build_extractive_summary(
+                        raw,
+                        previous_summary=summary_text,
+                        keep_recent=keep,
+                    )
+                    self.assertLessEqual(
+                        estimate_tokens(summary_text),
+                        context_summary_token_budget(),
+                    )
+
+            self.assertIsNotNone(summary_text)
+            self.assertGreaterEqual(summary_through or -1, 0)
+            # Raw history intact (would be unchanged Postgres rows).
+            self.assertEqual(len(raw), 120)
+            self.assertEqual(raw[0]["content"].startswith("Turn 0:"), True)
+            self.assertIn("Turn 119:", raw[-1]["content"])
+
+            floor = int(summary_through)
+            prior = [
+                {"role": m["role"], "content": m["content"]}
+                for m in raw
+                if int(m["seq"]) > floor
+            ]
+            # Recent window must still contain the latest verbatim turns.
+            self.assertTrue(any("Turn 119:" in m["content"] for m in prior[-keep:]))
+
+            built = build_model_messages(
+                system_prompt="fitness system prompt " + ("y" * 200),
+                profile_block="profile block",
+                summary_text=summary_text,
+                summary_through_seq=summary_through,
+                recent_messages=prior,
+                current_user_message={"role": "user", "content": "What's next?"},
+            )
+            total = built.estimated_system_tokens + built.estimated_message_tokens
+            self.assertLessEqual(total, 24_000 + 500)
+            self.assertTrue(built.summary_used)
+            self.assertLessEqual(
+                estimate_tokens(summary_text or ""),
+                context_summary_token_budget(),
+            )
 
 
 class ChatRouteContextHistoryTests(unittest.TestCase):

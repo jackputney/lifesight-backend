@@ -266,8 +266,7 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(remapped, "fitness")
 
-            # Apply post-009 migrations (gaps allowed; e.g. 012/013 while 010/011
-            # are reserved on other branches).
+            # Apply post-009 migrations in numeric order (010, 011, …).
             for sql_file in sorted(MIGRATIONS.glob("*.sql")):
                 prefix = sql_file.name.split("_", 1)[0]
                 if not prefix.isdigit() or int(prefix) <= 9:
