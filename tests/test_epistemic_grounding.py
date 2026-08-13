@@ -129,6 +129,60 @@ class ScenarioSteeringTests(unittest.TestCase):
         self.assertIn("authorized tool or data source", policy)
         self.assertIn("unverifiability as proof", policy)
 
+    def test_user_report_is_not_independently_established_fact(self):
+        """User report != independently established interpretation."""
+        policy = self._policy().lower()
+        # Must not treat user statements as automatic proof of interpretation.
+        self.assertNotIn("explicit user-provided facts", policy)
+        self.assertIn(
+            "not automatically proof that the user's interpretation",
+            policy,
+        )
+        self.assertIn('the user reports x', policy)
+        self.assertIn("independently established", policy)
+        self.assertIn(
+            "does not by itself verify an extraordinary interpretation",
+            policy,
+        )
+        # Especially for extraordinary categories.
+        for phrase in (
+            "surveillance",
+            "hidden messages",
+            "conspiracies",
+            "supernatural",
+            "grandiose",
+            "coincidence",
+        ):
+            self.assertIn(phrase, policy)
+
+    def test_observation_vs_explanation_car_example(self):
+        # Report: saw same person/car several times. Not: they are surveilling you.
+        policy = self._policy().lower()
+        self.assertIn("same car outside three times", policy)
+        self.assertIn("government is monitoring me", policy)
+        self.assertIn("does not establish", policy)
+        self.assertIn("acknowledge the report", policy)
+
+    def test_internal_experience_vs_external_fact_guidance(self):
+        # Hearing/experiencing something ≠ verified external sender/purpose.
+        policy = self._policy().lower()
+        self.assertIn("hidden messages or signals", policy)
+        self.assertIn("user-reported claim", policy)
+        self.assertIn("what the user reports or experienced", policy)
+        self.assertIn("not automatically proof", policy)
+
+    def test_repeated_confidence_does_not_raise_epistemic_status(self):
+        policy = self._policy().lower()
+        self.assertIn("sincere, confident, repeated, or detailed", policy)
+        self.assertIn(
+            "does not by itself verify an extraordinary interpretation",
+            policy,
+        )
+        self.assertIn(
+            "never because the user sounds confident or repeats a claim",
+            policy,
+        )
+
 
 class ModeSpecificSteeringTests(unittest.TestCase):
     def test_author_allows_fiction_with_reality_boundary(self):
