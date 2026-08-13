@@ -34,6 +34,8 @@ from modes.author.prompt import SYSTEM_PROMPT as AUTHOR_PROMPT
 from modes.author.prompt import TOOLS as AUTHOR_TOOLS
 from modes.brainstorm.prompt import SYSTEM_PROMPT as BRAINSTORM_PROMPT
 from modes.brainstorm.prompt import TOOLS as BRAINSTORM_TOOLS
+from modes.checkin.prompt import SYSTEM_PROMPT as CHECKIN_PROMPT
+from modes.checkin.prompt import TOOLS as CHECKIN_TOOLS
 from modes.diet.prompt import SYSTEM_PROMPT as DIET_PROMPT
 from modes.diet.prompt import TOOLS as DIET_TOOLS
 from modes.fitness.prompt import SYSTEM_PROMPT as FITNESS_PROMPT
@@ -44,6 +46,7 @@ from modes.mail_calendar.prompt import TOOLS as MAIL_CALENDAR_TOOLS
 from routers.auth import router as auth_router
 from routers.author_persistence import router as author_persistence_router
 from routers.conversations import router as conversations_router
+from routers.daily_checkin import router as daily_checkin_router
 from routers.profile import router as profile_router
 from routers.v2 import router as v2_router
 from routers.voice import router as voice_router
@@ -57,15 +60,26 @@ from shared.client_actions import (
     navigate_action,
     open_conversation_action,
     parse_navigate_command,
+    refresh_profile_action,
 )
 from shared.context_budget import build_model_messages
 from shared.conversation_summary import maybe_roll_summary
-from shared.conversation_titles import fallback_title, title_from_user_text
+from shared.conversation_titles import title_from_user_text
+from shared.daily_checkin import (
+    apply_checkin_tool_update,
+    compact_checkin_for_context,
+    get_today_checkin,
+)
 from shared.open_conversation import (
     day_bounds_utc,
     open_conversation_acknowledgement,
     parse_open_conversation_command,
     resolve_open_conversation,
+)
+from shared.personal_context import (
+    PERSONAL_CONTEXT_ENRICHMENT_POLICY,
+    UPDATE_PERSONAL_CONTEXT_TOOL,
+    apply_personal_context_update,
 )
 from shared.profile_schema import compact_profile_for_context
 from shared.profile_service import get_profile
@@ -75,9 +89,7 @@ from shared.visual_panels import (
     parse_exercise_panel_tool_input,
 )
 from shared.research import (
-    ResearchFactCheck,
     ResearchResult,
-    ResearchSource,
     clamp_research_query,
     extract_claim,
     get_research_provider,
@@ -133,6 +145,7 @@ async def database_unavailable_handler(request: Request, exc: db.DatabaseUnavail
 
 app.include_router(auth_router)
 app.include_router(profile_router)
+app.include_router(daily_checkin_router)
 app.include_router(conversations_router)
 app.include_router(v2_router)
 app.include_router(author_persistence_router)
@@ -146,6 +159,8 @@ MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 # jarvis source stays in MODE_REGISTRY / modes/jarvis/ so code is not deleted,
 # but it is hidden from the public /modes list (see PUBLIC_MODE_IDS) and must
 # not be reused for mail_calendar.
+# checkin is a dedicated daily-check-in workflow — chat-acceptable, hidden
+# from GET /modes (iOS opens it via /daily-checkin/start).
 # settings is an iOS screen, not a chat mode.
 MODE_REGISTRY = {
     "fitness": FITNESS_PROMPT,
@@ -154,10 +169,11 @@ MODE_REGISTRY = {
     "brainstorm": BRAINSTORM_PROMPT,
     "mail_calendar": MAIL_CALENDAR_PROMPT,
     "jarvis": JARVIS_PROMPT,
+    "checkin": CHECKIN_PROMPT,
 }
 
 # Authoritative public v2 mode list — exact Home/Sidebar order. Do not sort.
-# Excludes jarvis (legacy, hidden) and health (retired).
+# Excludes jarvis (legacy, hidden), checkin (Home-card workflow), health (retired).
 PUBLIC_MODE_IDS: tuple[str, ...] = (
     "fitness",
     "diet",
@@ -168,13 +184,16 @@ PUBLIC_MODE_IDS: tuple[str, ...] = (
 
 # Per-mode Anthropic tool schemas. Modes with no tools simply aren't a key
 # here — _run_model_turn treats a missing/empty list as "no tools offered".
-# brainstorm / mail_calendar register empty tool lists until later slices.
+# Personal-context enrichment is offered on public chat modes (not jarvis).
+# checkin uses only the daily-check-in tool.
+_PERSONAL_CONTEXT_TOOLS = [UPDATE_PERSONAL_CONTEXT_TOOL]
 MODE_TOOLS: dict[str, list[dict]] = {
-    "author": AUTHOR_TOOLS,
-    "fitness": FITNESS_TOOLS,
-    "diet": DIET_TOOLS,
-    "brainstorm": BRAINSTORM_TOOLS,
-    "mail_calendar": MAIL_CALENDAR_TOOLS,
+    "author": list(AUTHOR_TOOLS) + _PERSONAL_CONTEXT_TOOLS,
+    "fitness": list(FITNESS_TOOLS) + _PERSONAL_CONTEXT_TOOLS,
+    "diet": list(DIET_TOOLS) + _PERSONAL_CONTEXT_TOOLS,
+    "brainstorm": list(BRAINSTORM_TOOLS) + _PERSONAL_CONTEXT_TOOLS,
+    "mail_calendar": list(MAIL_CALENDAR_TOOLS) + _PERSONAL_CONTEXT_TOOLS,
+    "checkin": list(CHECKIN_TOOLS),
 }
 
 # A voice confirm that never arrives shouldn't stay "pending" forever. Passed
@@ -205,8 +224,8 @@ class ChatResponse(BaseModel):
     visual_panel: VisualPanel | None = None
     # Additive Brainstorm field — null for ordinary turns and all other modes.
     research: ResearchResult | None = None
-    # Always an array (never null). V1: navigate only; ordinary turns → [].
-    # Not Confirm Gate — client-local UI actions only.
+    # Always an array (never null). navigate | open_conversation | refresh_profile.
+    # Ordinary turns → []. Not Confirm Gate — client-local UI actions only.
     client_actions: list[ClientAction] = Field(default_factory=list)
 
 
@@ -233,7 +252,12 @@ class DeviceOut(BaseModel):
     last_seen: datetime
 
 
-def _build_system_prompt(mode: str, *, profile_block: str = "") -> str:
+def _build_system_prompt(
+    mode: str,
+    *,
+    profile_block: str = "",
+    checkin_block: str = "",
+) -> str:
     today = date.today().isoformat()
     now_local = datetime.now().strftime("%A %B %d, %Y at %I:%M %p").replace(" 0", " ")
     parts = [
@@ -242,6 +266,10 @@ def _build_system_prompt(mode: str, *, profile_block: str = "") -> str:
     ]
     if profile_block.strip():
         parts.append(profile_block.strip())
+    if checkin_block.strip() and mode in ("fitness", "diet"):
+        parts.append(checkin_block.strip())
+    if mode != "checkin" and mode != "jarvis":
+        parts.append(PERSONAL_CONTEXT_ENRICHMENT_POLICY.strip())
     return "\n\n".join(parts)
 
 
@@ -258,15 +286,16 @@ async def _run_tool(
     user_id: str,
     conversation_id: str,
     mode: str,
-) -> tuple[str, PendingAction | None, VisualPanel | None]:
+) -> tuple[str, PendingAction | None, VisualPanel | None, list[ClientAction]]:
     """Execute one Claude tool call.
 
-    Returns (tool_result text, pending_action or None, visual_panel or None).
+    Returns (tool_result text, pending_action or None, visual_panel or None,
+    client_actions).
     """
     if name == "create_pending_action":
         description = str(tool_input.get("description", "")).strip()
         if not description:
-            return "Error: description must be a non-empty sentence.", None, None
+            return "Error: description must be a non-empty sentence.", None, None, []
         action_type = str(tool_input.get("action_type") or "generic").strip() or "generic"
         payload = tool_input.get("payload")
         if not isinstance(payload, dict):
@@ -289,25 +318,57 @@ async def _run_tool(
             "Do not say the action is done yet.",
             PendingAction(action_id=action_id, description=description),
             None,
+            [],
         )
 
     if name == "present_exercise_panel":
         if mode != "fitness":
-            return "Error: present_exercise_panel is only available in fitness mode.", None, None
+            return (
+                "Error: present_exercise_panel is only available in fitness mode.",
+                None,
+                None,
+                [],
+            )
         try:
             data = parse_exercise_panel_tool_input(
                 tool_input if isinstance(tool_input, dict) else {}
             )
         except Exception as exc:
-            return f"Error: invalid exercise panel ({exc}).", None, None
+            return f"Error: invalid exercise panel ({exc}).", None, None, []
         panel = exercise_visual_panel(data)
         return (
             "Exercise panel shown to the client. Continue with a short spoken reply.",
             None,
             panel,
+            [],
         )
 
-    return f"Error: unknown tool '{name}'.", None, None
+    if name == "update_personal_context":
+        if mode == "checkin":
+            return (
+                "Error: update_personal_context is not available during daily check-in.",
+                None,
+                None,
+                [],
+            )
+        result_text, changed = await apply_personal_context_update(user_id, tool_input)
+        actions: list[ClientAction] = [refresh_profile_action()] if changed else []
+        return result_text, None, None, actions
+
+    if name == "update_daily_checkin":
+        if mode != "checkin":
+            return (
+                "Error: update_daily_checkin is only available in checkin mode.",
+                None,
+                None,
+                [],
+            )
+        result_text = await apply_checkin_tool_update(
+            user_id, tool_input, conversation_id=conversation_id
+        )
+        return result_text, None, None, []
+
+    return f"Error: unknown tool '{name}'.", None, None, []
 
 
 async def _run_model_turn(
@@ -318,11 +379,12 @@ async def _run_model_turn(
     user_id: str,
     system_prompt: str,
     context_meta: dict[str, Any],
-) -> tuple[str, PendingAction | None, VisualPanel | None]:
+) -> tuple[str, PendingAction | None, VisualPanel | None, list[ClientAction]]:
     """Call Claude with a bounded context until a final text reply.
 
-    Tool side-effects (pending_action, exercise panel) are persisted; the
-    full transcript is already/also written by the caller and this function.
+    Tool side-effects (pending_action, exercise panel, client_actions) are
+    persisted; the full transcript is already/also written by the caller and
+    this function.
     """
     create_kwargs: dict = dict(
         model=MODEL,
@@ -340,6 +402,7 @@ async def _run_model_turn(
 
     pending_action: PendingAction | None = None
     visual_panel: VisualPanel | None = None
+    client_actions: list[ClientAction] = []
     working = list(history_for_model)
 
     while message.stop_reason == "tool_use":
@@ -351,7 +414,7 @@ async def _run_model_turn(
         for block in message.content:
             if block.type != "tool_use":
                 continue
-            result_text, created, panel = await _run_tool(
+            result_text, created, panel, actions = await _run_tool(
                 block.name,
                 block.input,
                 user_id=user_id,
@@ -362,6 +425,8 @@ async def _run_model_turn(
                 pending_action = created
             if panel is not None:
                 visual_panel = panel
+            if actions:
+                client_actions.extend(actions)
             tool_results.append(
                 {
                     "type": "tool_result",
@@ -405,7 +470,17 @@ async def _run_model_turn(
         # Metrics must never break chat.
         pass
 
-    return reply, pending_action, visual_panel
+    # Deduplicate refresh_profile if the tool ran more than once.
+    deduped: list[ClientAction] = []
+    seen_refresh = False
+    for action in client_actions:
+        if getattr(action, "type", None) == "refresh_profile":
+            if seen_refresh:
+                continue
+            seen_refresh = True
+        deduped.append(action)
+
+    return reply, pending_action, visual_panel, deduped
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +688,16 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
 
     profile = await get_profile(user_id)
     profile_block = compact_profile_for_context(profile)
-    system_prompt = _build_system_prompt(mode, profile_block=profile_block)
+    checkin_block = ""
+    if mode in ("fitness", "diet"):
+        try:
+            today_checkin = await get_today_checkin(user_id)
+            checkin_block = compact_checkin_for_context(today_checkin)
+        except Exception:
+            checkin_block = ""
+    system_prompt = _build_system_prompt(
+        mode, profile_block=profile_block, checkin_block=checkin_block
+    )
 
     built = build_model_messages(
         system_prompt=system_prompt,
@@ -657,7 +741,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
         research = sanitize_research(turn.research, provider_called=provider_called)
         await db.append_message(conversation_id, "assistant", reply)
     else:
-        reply, pending_action, visual_panel = await _run_model_turn(
+        reply, pending_action, visual_panel, client_actions = await _run_model_turn(
             mode=mode,
             conversation_id=conversation_id,
             history_for_model=built.messages,

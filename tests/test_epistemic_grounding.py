@@ -231,14 +231,22 @@ class RegressionSmokeTests(unittest.TestCase):
     def test_fitness_still_exposes_exercise_panel_tool(self):
         names = [t["name"] for t in MODE_TOOLS["fitness"]]
         self.assertIn("present_exercise_panel", names)
+        self.assertIn("update_personal_context", names)
 
     def test_author_still_exposes_confirm_gate_tool(self):
         names = [t["name"] for t in MODE_TOOLS["author"]]
         self.assertIn("create_pending_action", names)
+        self.assertIn("update_personal_context", names)
 
-    def test_brainstorm_and_mail_still_have_empty_tool_lists(self):
-        self.assertEqual(MODE_TOOLS["brainstorm"], [])
-        self.assertEqual(MODE_TOOLS["mail_calendar"], [])
+    def test_brainstorm_and_mail_expose_personal_context_only(self):
+        self.assertEqual(
+            [t["name"] for t in MODE_TOOLS["brainstorm"]],
+            ["update_personal_context"],
+        )
+        self.assertEqual(
+            [t["name"] for t in MODE_TOOLS["mail_calendar"]],
+            ["update_personal_context"],
+        )
 
     def test_navigate_client_action_still_works(self):
         from shared.client_actions import parse_navigate_command
@@ -263,6 +271,7 @@ class RegressionSmokeTests(unittest.TestCase):
             "Sure — progressive overload means adding stress over time.",
             None,
             None,
+            [],
         ),
     )
     def test_chat_ordinary_turn_still_invokes_model(

@@ -132,6 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["male", "female", "unspecified"],
         help="Formula/reference use only — not gender identity",
     )
+    p.add_argument("--occupation", help="Work/role (<=120 chars)")
+    p.add_argument("--industry", help="Industry/field (<=120 chars)")
+    p.add_argument("--education-context", help="School/education (<=240 chars)")
+    p.add_argument("--interests", help="Comma-separated interests (max 20)")
+    p.add_argument("--typical-schedule", help="Typical schedule free text (<=500)")
     return p
 
 
@@ -172,6 +177,11 @@ async def _run(args: argparse.Namespace) -> int:
             "sex_for_physiological_calculations": (
                 args.sex_for_physiological_calculations
             ),
+            "occupation": args.occupation,
+            "industry": args.industry,
+            "education_context": args.education_context,
+            "interests": _parse_list(args.interests),
+            "typical_schedule": args.typical_schedule,
         }
         # Drop Nones so ProfilePatch exclude_unset works via model_validate partial
         compact = {k: v for k, v in patch_data.items() if v is not None}

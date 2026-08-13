@@ -136,7 +136,7 @@ class ChatOwnershipTests(unittest.TestCase):
                 ), patch(
                     "main._run_model_turn",
                     new_callable=AsyncMock,
-                    return_value=("ok", None, None),
+                    return_value=("ok", None, None, []),
                 ):
                     # A can continue their conversation (model path mocked).
                     os.environ["ANTHROPIC_API_KEY"] = "test-key"  # pragma: allowlist secret

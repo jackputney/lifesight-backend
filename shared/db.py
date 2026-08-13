@@ -27,7 +27,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 import asyncpg
@@ -1482,6 +1482,7 @@ _JSONB_PROFILE_KEYS = frozenset(
         "available_equipment",
         "dietary_preferences",
         "allergies_restrictions",
+        "interests",
     }
 )
 
@@ -1506,6 +1507,11 @@ _PROFILE_COLUMNS = frozenset(
         "training_environment",
         "typical_session_minutes",
         "sex_for_physiological_calculations",
+        "occupation",
+        "industry",
+        "education_context",
+        "interests",
+        "typical_schedule",
     }
 )
 
@@ -1623,3 +1629,128 @@ async def insert_admin_audit(
         target_user_id,
         json.dumps(detail or {}),
     )
+
+
+# ---------------------------------------------------------------------------
+# daily_checkins (013)
+# ---------------------------------------------------------------------------
+
+_DAILY_CHECKIN_FIELDS = frozenset(
+    {
+        "sleep_hours",
+        "sleep_quality",
+        "energy",
+        "mood",
+        "stress",
+        "soreness",
+        "top_priority",
+        "notes",
+        "summary",
+    }
+)
+
+
+async def get_daily_checkin(user_id: str, local_date: date) -> Optional[dict]:
+    row = await pool().fetchrow(
+        """
+        SELECT * FROM daily_checkins
+        WHERE user_id = $1::uuid AND local_date = $2
+        """,
+        user_id,
+        local_date,
+    )
+    return dict(row) if row else None
+
+
+async def upsert_daily_checkin_start(
+    *,
+    user_id: str,
+    local_date: date,
+    timezone_name: str,
+    conversation_id: str,
+) -> dict:
+    """Create or promote today's check-in to in_progress (never reopen completed)."""
+    existing = await get_daily_checkin(user_id, local_date)
+    if existing is not None and existing.get("status") == "completed":
+        return existing
+
+    row = await pool().fetchrow(
+        """
+        INSERT INTO daily_checkins (
+            user_id, local_date, timezone, conversation_id, status, started_at
+        )
+        VALUES ($1::uuid, $2, $3, $4::uuid, 'in_progress', now())
+        ON CONFLICT (user_id, local_date) DO UPDATE SET
+            timezone = EXCLUDED.timezone,
+            conversation_id = COALESCE(
+                daily_checkins.conversation_id, EXCLUDED.conversation_id
+            ),
+            status = CASE
+                WHEN daily_checkins.status = 'completed' THEN daily_checkins.status
+                ELSE 'in_progress'
+            END,
+            started_at = COALESCE(daily_checkins.started_at, now()),
+            updated_at = now()
+        RETURNING *
+        """,
+        user_id,
+        local_date,
+        timezone_name,
+        conversation_id,
+    )
+    return dict(row)
+
+
+async def update_daily_checkin_fields(
+    *,
+    user_id: str,
+    local_date: date,
+    timezone_name: str,
+    conversation_id: str,
+    fields: dict[str, Any],
+    mark_completed: bool = False,
+) -> Optional[dict]:
+    """Patch structured fields on today's check-in; optionally mark completed."""
+    clean = {k: v for k, v in fields.items() if k in _DAILY_CHECKIN_FIELDS}
+    existing = await get_daily_checkin(user_id, local_date)
+    if existing is None:
+        await upsert_daily_checkin_start(
+            user_id=user_id,
+            local_date=local_date,
+            timezone_name=timezone_name,
+            conversation_id=conversation_id,
+        )
+
+    sets: list[str] = []
+    args: list[Any] = [user_id, local_date]
+    idx = 3
+    for key, value in clean.items():
+        sets.append(f"{key} = ${idx}")
+        args.append(value)
+        idx += 1
+    if mark_completed:
+        sets.append("status = 'completed'")
+        sets.append("completed_at = COALESCE(completed_at, now())")
+    elif clean:
+        sets.append(
+            "status = CASE WHEN status = 'completed' THEN status ELSE 'in_progress' END"
+        )
+    if not sets:
+        return await get_daily_checkin(user_id, local_date)
+
+    sets.append("updated_at = now()")
+    if conversation_id:
+        sets.append(f"conversation_id = COALESCE(conversation_id, ${idx}::uuid)")
+        args.append(conversation_id)
+        idx += 1
+
+    row = await pool().fetchrow(
+        f"""
+        UPDATE daily_checkins SET {', '.join(sets)}
+        WHERE user_id = $1::uuid AND local_date = $2
+        RETURNING *
+        """,
+        *args,
+    )
+    return dict(row) if row else None
+

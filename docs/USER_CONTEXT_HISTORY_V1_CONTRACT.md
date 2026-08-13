@@ -5,7 +5,7 @@ Existing `/chat` fields remain: `reply`, `mode`, `conversation_id`,
 `pending_action`, `visual_panel`, `research`, `client_actions`.
 
 Migrations: `010_user_profiles.sql`, `011_conversation_context.sql`,
-`012_profile_onboarding_fields.sql`.
+`012_profile_onboarding_fields.sql`, `013_personal_context_daily_checkin.sql`.
 
 ## 1. `visual_panel` — Fitness `exercise`
 
@@ -56,6 +56,11 @@ Identity remains `/auth/me` (`display_name`, `email`, …).
 | dietary_preferences | string[] |
 | allergies_restrictions | string[] |
 | sex_for_physiological_calculations | `male` \| `female` \| `unspecified` (nullable, optional). **Not gender identity** — formula/reference use only. `unspecified` means do not assume male/female. |
+| occupation | nullable string, **<=120** — work/role (personal context; not daily state) |
+| industry | nullable string, **<=120** |
+| education_context | nullable string, **<=240** — school/education |
+| interests | string[], **max 20**, each **<=120** |
+| typical_schedule | nullable string, **<=500** |
 
 Missing `user_profiles` row → safe nulls / empty arrays. `display_name` may be
 echoed for convenience but is stored only on `users`.
@@ -63,6 +68,19 @@ echoed for convenience but is stored only on `users`.
 There is **no** `onboarding_complete` flag. Backend profile fields are authoritative;
 iOS calls `GET /profile` and asks only for missing/null onboarding answers.
 Sparse/null profiles remain valid for existing users.
+
+Personal-context fields are permanent identity/context. Daily mood/energy/sleep
+belong in `/daily-checkin/*`, not `/profile`.
+
+Chat may update personal-context fields only via the restricted
+`update_personal_context` tool (explicit remember/update or answered enrichment
+question). Successful writes emit:
+
+```json
+{ "type": "refresh_profile" }
+```
+
+so iOS can `GET /profile` and sync. Not Confirm Gate. No navigation.
 
 ## 3. Chat history
 
@@ -73,16 +91,69 @@ Sparse/null profiles remain valid for existing users.
 
 Title V1: first substantive user message (~60 chars) else `"{Mode} chat"`.
 
-## 4. `client_actions` — `open_conversation`
+## 4. `client_actions` — `open_conversation` + `refresh_profile`
 
 ```json
 { "type": "open_conversation", "conversation_id": "<uuid>" }
 ```
 
-Not Confirm Gate. Unique match only; ambiguous → clarify + `[]`.
-Navigate V1 unchanged: `{ "type": "navigate", "target": "..." }`.
+```json
+{ "type": "refresh_profile" }
+```
 
-## 5. Context budget + summaries (server-only)
+Not Confirm Gate. Unique match only for reopen; ambiguous → clarify + `[]`.
+Navigate V1 unchanged: `{ "type": "navigate", "target": "..." }`.
+`refresh_profile` has no payload — client should re-fetch `GET /profile`.
+
+## 5. Daily check-in V1
+
+Dedicated dated state (not `/profile`). Mode `checkin` is chat-acceptable and
+hidden from `GET /modes`.
+
+### `GET /daily-checkin/today`
+
+Resolves “today” from the user’s profile `timezone` (fallback `UTC`).
+
+```json
+{
+  "id": null,
+  "user_id": "<uuid>",
+  "local_date": "2026-08-13",
+  "timezone": "America/Los_Angeles",
+  "conversation_id": null,
+  "status": "not_started",
+  "sleep_hours": null,
+  "sleep_quality": null,
+  "energy": null,
+  "mood": null,
+  "stress": null,
+  "soreness": null,
+  "top_priority": null,
+  "notes": null,
+  "summary": null,
+  "created_at": null,
+  "started_at": null,
+  "completed_at": null,
+  "updated_at": null
+}
+```
+
+`status`: `not_started` | `in_progress` | `completed`.
+Scales `sleep_quality` / `energy` / `mood` / `stress` / `soreness` are 1–5 when set.
+`sleep_hours` is 0–24 when set. Not every field is required.
+
+### `POST /daily-checkin/start` (idempotent per user + local date)
+
+- existing `in_progress` → resume (same `conversation_id`)
+- existing `completed` → return completed state (no new conversation)
+- otherwise create `in_progress` + `mode=checkin` conversation
+
+iOS opens chat with returned `conversation_id` and `mode: "checkin"`.
+
+Structured writes happen via chat tool `update_daily_checkin` (server-side only).
+Fitness/Diet prompts receive a **bounded** today’s check-in summary when available.
+
+## 6. Context budget + summaries (server-only)
 
 Env (defaults):
 
@@ -96,7 +167,7 @@ Model call = system + compact profile + rolling summary + recent raw window
 (capped and trimmed to budget) + current turn. Full raw history stays in Postgres.
 Summary failure never fails `/chat`.
 
-## 6. Admin / seed
+## 7. Admin / seed
 
 No public `/admin/*`. Local/staging: `scripts/seed_user_profile.py` with
 `ADMIN_SEED_TOKEN`, refuses production unless

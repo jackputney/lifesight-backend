@@ -229,6 +229,7 @@ class ChatClientActionsRouteTests(unittest.TestCase):
                 "Progressive overload means gradually increasing demand.",
                 None,
                 None,
+                [],
             ),
         ) as turn:
             resp = self._post("What does progressive overload mean?")

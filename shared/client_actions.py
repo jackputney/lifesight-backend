@@ -1,4 +1,4 @@
-"""Global app client_actions for /chat — navigate + open_conversation.
+"""Global app client_actions for /chat — navigate + open_conversation + refresh_profile.
 
 Deterministic intent layer runs before mode Claude. These actions never use the
 Confirm Gate. jarvis and health are never emit targets.
@@ -13,7 +13,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
-ClientActionType = Literal["navigate", "open_conversation"]
+ClientActionType = Literal["navigate", "open_conversation", "refresh_profile"]
 NavigateTarget = Literal[
     "home",
     "fitness",
@@ -95,8 +95,14 @@ class OpenConversationAction(BaseModel):
         return str(UUID(str(value)))
 
 
+class RefreshProfileAction(BaseModel):
+    """Ask the client to re-fetch GET /profile after chat-driven profile writes."""
+
+    type: Literal["refresh_profile"] = "refresh_profile"
+
+
 ClientAction = Annotated[
-    Union[NavigateAction, OpenConversationAction],
+    Union[NavigateAction, OpenConversationAction, RefreshProfileAction],
     Field(discriminator="type"),
 ]
 
@@ -143,6 +149,10 @@ def open_conversation_action(conversation_id: str) -> OpenConversationAction:
     return OpenConversationAction(
         type="open_conversation", conversation_id=str(conversation_id)
     )
+
+
+def refresh_profile_action() -> RefreshProfileAction:
+    return RefreshProfileAction(type="refresh_profile")
 
 
 def navigate_acknowledgement(target: NavigateTarget) -> str:

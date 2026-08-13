@@ -36,6 +36,7 @@ EXPECTED_TABLES = (
     "user_profiles",
     "admin_audit_log",
     "conversation_turn_metrics",
+    "daily_checkins",
 )
 
 # Looked up by (table, column, ref_table, ref_column); name is diagnostic only.
@@ -67,6 +68,7 @@ EXPECTED_FOREIGN_KEYS = (
         "conversations",
         "id",
     ),
+    ("daily_checkins_user_id_fkey", "daily_checkins", "user_id", "users", "id"),
 )
 
 MODE_CONSTRAINTS = (
@@ -75,13 +77,19 @@ MODE_CONSTRAINTS = (
     ("pending_actions", "source_mode", "pending_actions_source_mode_check"),
 )
 
-EXPECTED_REGISTRY = {
+# Registry frozen at migration 009 (pre-checkin).
+EXPECTED_REGISTRY_009 = {
     "fitness",
     "diet",
     "author",
     "brainstorm",
     "mail_calendar",
     "jarvis",
+}
+
+EXPECTED_REGISTRY = {
+    *EXPECTED_REGISTRY_009,
+    "checkin",
 }
 
 
@@ -171,9 +179,8 @@ class ModeRegistryMigrationStaticTests(unittest.TestCase):
             allowed = latest_modes_from_migrations(name)
             assert_modes_match_registry(allowed, registry, where=f"migration SQL {name}")
 
-    def test_009_matches_mode_registry(self):
+    def test_009_matches_historical_registry(self):
         self.assertTrue(MIGRATION_009.is_file(), "009_fix_mode_check.sql missing")
-        registry = mode_registry_keys()
         sql = MIGRATION_009.read_text(encoding="utf-8")
         for name in (
             "conversations_mode_check",
@@ -181,7 +188,9 @@ class ModeRegistryMigrationStaticTests(unittest.TestCase):
             "pending_actions_source_mode_check",
         ):
             allowed = modes_from_check_sql(sql, name)
-            assert_modes_match_registry(allowed, registry, where=f"009 SQL {name}")
+            assert_modes_match_registry(
+                allowed, EXPECTED_REGISTRY_009, where=f"009 SQL {name}"
+            )
         self.assertIn(
             "UPDATE conversations SET mode = 'fitness' WHERE mode = 'health'",
             sql,

@@ -345,7 +345,7 @@ class ChatRouteContextHistoryTests(unittest.TestCase):
             with patch(
                 "main._run_model_turn",
                 new_callable=AsyncMock,
-                return_value=("Hello.", None, None),
+                return_value=("Hello.", None, None, []),
             ):
                 with TestClient(app) as client:
                     resp = client.post(
@@ -446,7 +446,7 @@ class ChatRouteContextHistoryTests(unittest.TestCase):
             ), patch(
                 "main._run_model_turn",
                 new_callable=AsyncMock,
-                return_value=("Continuing.", None, None),
+                return_value=("Continuing.", None, None, []),
             ) as turn:
                 with TestClient(app) as client:
                     resp = client.post(
