@@ -83,6 +83,7 @@ from shared.personal_context import (
 )
 from shared.profile_schema import compact_profile_for_context
 from shared.profile_service import get_profile
+from shared.prompt_overrides import load_active_customization_block
 from shared.visual_panels import (
     VisualPanel,
     exercise_visual_panel,
@@ -257,13 +258,21 @@ def _build_system_prompt(
     *,
     profile_block: str = "",
     checkin_block: str = "",
+    user_customization_block: str = "",
 ) -> str:
+    """Assemble runtime chat system prompt.
+
+    MODE_REGISTRY[mode] already embeds:
+      IDENTITY → EPISTEMIC_GROUNDING → FEASIBILITY_AND_NON_SYCOPHANCY → MODE
+    Then this function appends subordinate user customization, then
+    date / profile / check-in / enrichment context.
+    """
     today = date.today().isoformat()
     now_local = datetime.now().strftime("%A %B %d, %Y at %I:%M %p").replace(" 0", " ")
-    parts = [
-        MODE_REGISTRY[mode],
-        f"Today's date is {today}. Current local time: {now_local}.",
-    ]
+    parts = [MODE_REGISTRY[mode]]
+    if user_customization_block.strip():
+        parts.append(user_customization_block.strip())
+    parts.append(f"Today's date is {today}. Current local time: {now_local}.")
     if profile_block.strip():
         parts.append(profile_block.strip())
     if checkin_block.strip() and mode in ("fitness", "diet"):
@@ -695,8 +704,18 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
             checkin_block = compact_checkin_for_context(today_checkin)
         except Exception:
             checkin_block = ""
+    try:
+        user_customization_block = await load_active_customization_block(
+            user_id, mode
+        )
+    except Exception:
+        # Prompt overrides must never break chat.
+        user_customization_block = ""
     system_prompt = _build_system_prompt(
-        mode, profile_block=profile_block, checkin_block=checkin_block
+        mode,
+        profile_block=profile_block,
+        checkin_block=checkin_block,
+        user_customization_block=user_customization_block,
     )
 
     built = build_model_messages(

@@ -172,3 +172,8 @@ Summary failure never fails `/chat`.
 No public `/admin/*`. Local/staging: `scripts/seed_user_profile.py` with
 `ADMIN_SEED_TOKEN`, refuses production unless
 `ALLOW_PROFILE_SEED_IN_PRODUCTION=1`. Writes `admin_audit_log`.
+
+Oliver’s separate admin project manages accounts/overrides via Postgres
+directly — see `docs/OLIVER_ADMIN_DATABASE_CONTRACT.md` (migration `014`).
+LifeSight reads active `user_prompt_overrides` during chat construction and
+respects `users.is_active` on every authenticated request.

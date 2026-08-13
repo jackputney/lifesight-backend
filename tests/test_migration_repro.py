@@ -37,6 +37,7 @@ EXPECTED_TABLES = (
     "admin_audit_log",
     "conversation_turn_metrics",
     "daily_checkins",
+    "user_prompt_overrides",
 )
 
 # Looked up by (table, column, ref_table, ref_column); name is diagnostic only.
@@ -69,6 +70,13 @@ EXPECTED_FOREIGN_KEYS = (
         "id",
     ),
     ("daily_checkins_user_id_fkey", "daily_checkins", "user_id", "users", "id"),
+    (
+        "user_prompt_overrides_user_id_fkey",
+        "user_prompt_overrides",
+        "user_id",
+        "users",
+        "id",
+    ),
 )
 
 MODE_CONSTRAINTS = (

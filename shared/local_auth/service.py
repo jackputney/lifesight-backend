@@ -259,4 +259,7 @@ class AuthService:
             or session["expires_at"] <= now
         ):
             raise AuthError("Invalid or expired token", status_code=401)
+        user = await self.store.get_user_by_id(str(user_id))
+        if not user or not user.get("is_active"):
+            raise AuthError("Invalid or expired token", status_code=401)
         await self.store.touch_session(session_id, now=now)

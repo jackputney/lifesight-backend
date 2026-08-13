@@ -1632,6 +1632,48 @@ async def insert_admin_audit(
 
 
 # ---------------------------------------------------------------------------
+# user_prompt_overrides (014) — Oliver admin writes; LifeSight reads active
+# ---------------------------------------------------------------------------
+
+async def get_active_prompt_overrides(
+    user_id: str, *, mode: Optional[str] = None
+) -> list[dict]:
+    """Return active global (mode IS NULL) and optional mode-specific rows.
+
+    Mode-specific row is included only when `mode` is provided. Inactive
+    versions are never returned.
+    """
+    if mode:
+        rows = await pool().fetch(
+            """
+            SELECT *
+            FROM user_prompt_overrides
+            WHERE user_id = $1::uuid
+              AND is_active = TRUE
+              AND (mode IS NULL OR mode = $2)
+            ORDER BY
+              CASE WHEN mode IS NULL THEN 0 ELSE 1 END,
+              version DESC
+            """,
+            user_id,
+            mode,
+        )
+    else:
+        rows = await pool().fetch(
+            """
+            SELECT *
+            FROM user_prompt_overrides
+            WHERE user_id = $1::uuid
+              AND is_active = TRUE
+              AND mode IS NULL
+            ORDER BY version DESC
+            """,
+            user_id,
+        )
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # daily_checkins (013)
 # ---------------------------------------------------------------------------
 
