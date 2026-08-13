@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from main import ChatResponse, app
 from shared.client_actions import (
     ALLOWED_NAVIGATE_TARGETS,
-    ClientAction,
+    NavigateAction,
     parse_navigate_command,
 )
 
@@ -95,7 +95,7 @@ class ChatResponseClientActionsShapeTests(unittest.TestCase):
             reply="Opening Fitness.",
             mode="diet",
             conversation_id="00000000-0000-4000-8000-000000000099",
-            client_actions=[ClientAction(type="navigate", target="fitness")],
+            client_actions=[NavigateAction(type="navigate", target="fitness")],
         ).model_dump(mode="json")
         self.assertEqual(
             payload["client_actions"],
@@ -113,19 +113,45 @@ class ChatClientActionsRouteTests(unittest.TestCase):
         self._create = patch("shared.db.create_conversation", new_callable=AsyncMock)
         self._get = patch("shared.db.get_conversation", new_callable=AsyncMock, return_value=None)
         self._load = patch("shared.db.load_messages", new_callable=AsyncMock, return_value=[])
+        self._load_seq = patch(
+            "shared.db.load_messages_with_seq", new_callable=AsyncMock, return_value=[]
+        )
         self._append = patch("shared.db.append_message", new_callable=AsyncMock)
+        self._title = patch(
+            "shared.db.set_conversation_title_if_empty", new_callable=AsyncMock
+        )
+        self._find_open = patch(
+            "shared.db.find_conversations_for_open",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        self._profile = patch(
+            "main.get_profile",
+            new_callable=AsyncMock,
+            return_value=__import__(
+                "shared.profile_schema", fromlist=["empty_profile"]
+            ).empty_profile("00000000-0000-4000-8000-000000000001"),
+        )
         self._pool_init.start()
         self._pool_close.start()
         self._create.start()
         self._get.start()
         self._load.start()
+        self._load_seq.start()
         self._append.start()
+        self._title.start()
+        self._find_open.start()
+        self._profile.start()
         self.addCleanup(self._pool_init.stop)
         self.addCleanup(self._pool_close.stop)
         self.addCleanup(self._create.stop)
         self.addCleanup(self._get.stop)
         self.addCleanup(self._load.stop)
+        self.addCleanup(self._load_seq.stop)
         self.addCleanup(self._append.stop)
+        self.addCleanup(self._title.stop)
+        self.addCleanup(self._find_open.stop)
+        self.addCleanup(self._profile.stop)
 
     def _post(self, transcript: str, *, mode: str = "fitness"):
         with _env():
@@ -199,7 +225,11 @@ class ChatClientActionsRouteTests(unittest.TestCase):
         with patch(
             "main._run_model_turn",
             new_callable=AsyncMock,
-            return_value=("Progressive overload means gradually increasing demand.", None),
+            return_value=(
+                "Progressive overload means gradually increasing demand.",
+                None,
+                None,
+            ),
         ) as turn:
             resp = self._post("What does progressive overload mean?")
         self.assertEqual(resp.status_code, 200, resp.text)

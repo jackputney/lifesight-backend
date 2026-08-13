@@ -57,12 +57,18 @@ Response:
 `reply` (not `assistant_text`). Older clients that ignore unknown fields remain
 compatible.
 
-### `client_actions` (V1 — navigate only)
-Allowlisted `target` values (closed set):
+### `client_actions` (V1 — navigate + open_conversation)
+Navigate allowlisted `target` values (closed set):
 `home` | `fitness` | `diet` | `author` | `brainstorm` | `mail_calendar` | `settings`
+
+Also: `{ "type": "open_conversation", "conversation_id": "<uuid>" }` when a
+history reopen command uniquely resolves. Ambiguous → clarify + `[]`.
 
 Never emit `jarvis` or `health`. Deterministic whole-utterance commands
 (`open` / `go to` / `take me to` / …) are handled before mode Claude.
+
+See `docs/USER_CONTEXT_HISTORY_V1_CONTRACT.md` for `/profile`, history APIs,
+and Fitness `visual_panel.type == "exercise"`.
 
 Example navigate turn:
 ```json

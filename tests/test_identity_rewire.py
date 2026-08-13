@@ -106,6 +106,8 @@ class ChatOwnershipTests(unittest.TestCase):
                     "id": "11111111-1111-4111-8111-111111111111",
                     "user_id": a["user"]["id"],
                     "mode": "fitness",
+                    "summary_text": None,
+                    "summary_through_seq": None,
                 }
 
                 async def fake_get(cid: str):
@@ -118,11 +120,23 @@ class ChatOwnershipTests(unittest.TestCase):
                 ) as create, patch(
                     "shared.db.load_messages", new_callable=AsyncMock, return_value=[]
                 ), patch(
+                    "shared.db.load_messages_with_seq",
+                    new_callable=AsyncMock,
+                    return_value=[],
+                ), patch(
+                    "shared.db.set_conversation_title_if_empty", new_callable=AsyncMock
+                ), patch(
                     "shared.db.append_message", new_callable=AsyncMock
+                ), patch(
+                    "main.get_profile",
+                    new_callable=AsyncMock,
+                    return_value=__import__(
+                        "shared.profile_schema", fromlist=["empty_profile"]
+                    ).empty_profile(a["user"]["id"]),
                 ), patch(
                     "main._run_model_turn",
                     new_callable=AsyncMock,
-                    return_value=("ok", None),
+                    return_value=("ok", None, None),
                 ):
                     # A can continue their conversation (model path mocked).
                     os.environ["ANTHROPIC_API_KEY"] = "test-key"  # pragma: allowlist secret

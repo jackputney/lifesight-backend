@@ -1,6 +1,6 @@
-"""Global app client_actions for /chat — V1 navigation only.
+"""Global app client_actions for /chat — navigate + open_conversation.
 
-Deterministic intent layer runs before mode Claude. Navigation never uses the
+Deterministic intent layer runs before mode Claude. These actions never use the
 Confirm Gate. jarvis and health are never emit targets.
 """
 
@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional, Union
+from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
-ClientActionType = Literal["navigate"]
+ClientActionType = Literal["navigate", "open_conversation"]
 NavigateTarget = Literal[
     "home",
     "fitness",
@@ -35,7 +36,6 @@ ALLOWED_NAVIGATE_TARGETS: frozenset[str] = frozenset(
     }
 )
 
-# Spoken / retired names that must never become navigate targets.
 BLOCKED_NAVIGATE_ALIASES: frozenset[str] = frozenset(
     {
         "health",
@@ -73,7 +73,6 @@ _SPOKEN_LABELS: dict[NavigateTarget, str] = {
     "settings": "Settings",
 }
 
-# Whole-utterance navigation commands only — conservative V1.
 _NAVIGATE_CMD = re.compile(
     r"(?is)^\s*(?:please\s+)?"
     r"(?:open|go\s+to|take\s+me\s+to|switch\s+to|navigate\s+to)"
@@ -81,36 +80,42 @@ _NAVIGATE_CMD = re.compile(
 )
 
 
-class ClientAction(BaseModel):
-    """Wire shape for /chat client_actions items (V1: navigate only)."""
-
-    type: ClientActionType = "navigate"
+class NavigateAction(BaseModel):
+    type: Literal["navigate"] = "navigate"
     target: NavigateTarget
+
+
+class OpenConversationAction(BaseModel):
+    type: Literal["open_conversation"] = "open_conversation"
+    conversation_id: str
+
+    @field_validator("conversation_id")
+    @classmethod
+    def _uuid(cls, value: str) -> str:
+        return str(UUID(str(value)))
+
+
+ClientAction = Annotated[
+    Union[NavigateAction, OpenConversationAction],
+    Field(discriminator="type"),
+]
 
 
 @dataclass(frozen=True)
 class NavigateMatch:
-    """Result of deterministic global navigate intent parsing."""
-
     target: Optional[NavigateTarget]
-    """Allowlisted target, or None when the command named a blocked alias."""
-
     blocked_alias: Optional[str] = None
-    """Normalized blocked name when target is None (health / jarvis)."""
 
 
 def normalize_command_text(text: str) -> str:
-    collapsed = re.sub(r"\s+", " ", (text or "").strip().lower())
-    return collapsed
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
 def parse_navigate_command(transcript: str) -> Optional[NavigateMatch]:
-    """Return a navigate match for whole-utterance app commands, else None.
-
-    Allowlisted targets become ClientAction(navigate). Blocked aliases
-    (health, jarvis) return NavigateMatch(target=None, blocked_alias=...).
-    Ordinary chat returns None so mode Claude handles the turn.
-    """
+    """Whole-utterance app screen navigation. History reopen is handled separately."""
+    lowered = normalize_command_text(transcript or "")
+    if re.search(r"\b(chat|conversation|thread)\b", lowered):
+        return None
     match = _NAVIGATE_CMD.match(transcript or "")
     if not match:
         return None
@@ -128,15 +133,20 @@ def parse_navigate_command(transcript: str) -> Optional[NavigateMatch]:
     return NavigateMatch(target=target)
 
 
-def navigate_action(target: NavigateTarget) -> ClientAction:
+def navigate_action(target: NavigateTarget) -> NavigateAction:
     if target not in ALLOWED_NAVIGATE_TARGETS:
         raise ValueError(f"navigate target not allowlisted: {target}")
-    return ClientAction(type="navigate", target=target)
+    return NavigateAction(type="navigate", target=target)
+
+
+def open_conversation_action(conversation_id: str) -> OpenConversationAction:
+    return OpenConversationAction(
+        type="open_conversation", conversation_id=str(conversation_id)
+    )
 
 
 def navigate_acknowledgement(target: NavigateTarget) -> str:
-    label = _SPOKEN_LABELS[target]
-    return f"Opening {label}."
+    return f"Opening {_SPOKEN_LABELS[target]}."
 
 
 def blocked_navigate_reply(alias: str) -> str:
@@ -147,5 +157,5 @@ def blocked_navigate_reply(alias: str) -> str:
     return "That screen isn't available."
 
 
-def empty_client_actions() -> list[ClientAction]:
+def empty_client_actions() -> list:
     return []

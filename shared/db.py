@@ -363,19 +363,32 @@ async def check_db() -> dict[str, Any]:
 
 async def get_conversation(conversation_id: str) -> Optional[dict]:
     row = await pool().fetchrow(
-        "SELECT id, user_id, mode FROM conversations WHERE id = $1::uuid",
+        """
+        SELECT id, user_id, mode, title, started_at, last_message_at, created_at,
+               summary_text, summary_through_seq
+        FROM conversations WHERE id = $1::uuid
+        """,
         conversation_id,
     )
     return dict(row) if row else None
 
 
-async def create_conversation(conversation_id: str, user_id: str, mode: str) -> None:
+async def create_conversation(
+    conversation_id: str,
+    user_id: str,
+    mode: str,
+    *,
+    title: Optional[str] = None,
+) -> None:
     await pool().execute(
         """
-        INSERT INTO conversations (id, user_id, mode)
-        VALUES ($1::uuid, $2::uuid, $3)
+        INSERT INTO conversations (id, user_id, mode, title)
+        VALUES ($1::uuid, $2::uuid, $3, $4)
         """,
-        conversation_id, user_id, mode,
+        conversation_id,
+        user_id,
+        mode,
+        title,
     )
 
 
@@ -391,24 +404,230 @@ async def load_messages(conversation_id: str) -> list[dict]:
     return [{"role": r["role"], "content": json.loads(r["content_json"])} for r in rows]
 
 
-async def append_message(conversation_id: str, role: str, content: Any) -> None:
-    """Append with the next seq for this conversation and bump last_message_at.
+async def load_messages_with_seq(conversation_id: str) -> list[dict]:
+    """Like load_messages but includes seq for summary / history APIs."""
+    rows = await pool().fetch(
+        """
+        SELECT seq, role, content_json, created_at FROM messages
+        WHERE conversation_id = $1::uuid ORDER BY seq
+        """,
+        conversation_id,
+    )
+    return [
+        {
+            "seq": int(r["seq"]),
+            "role": r["role"],
+            "content": json.loads(r["content_json"]),
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
 
-    content is stored exactly as it appears in the Anthropic messages array
-    (a string today; content-block lists later when tool-calling lands).
-    """
-    await pool().execute(
+
+async def append_message(conversation_id: str, role: str, content: Any) -> int:
+    """Append with the next seq; bump last_message_at. Returns assigned seq."""
+    row = await pool().fetchrow(
         """
         INSERT INTO messages (conversation_id, role, content_json, seq)
         SELECT $1::uuid, $2, $3::jsonb, COALESCE(MAX(seq) + 1, 0)
         FROM messages WHERE conversation_id = $1::uuid
+        RETURNING seq
         """,
-        conversation_id, role, json.dumps(content),
+        conversation_id,
+        role,
+        json.dumps(content),
     )
     await pool().execute(
         "UPDATE conversations SET last_message_at = now() WHERE id = $1::uuid",
         conversation_id,
     )
+    return int(row["seq"]) if row else 0
+
+
+async def set_conversation_title_if_empty(conversation_id: str, title: str) -> None:
+    await pool().execute(
+        """
+        UPDATE conversations
+        SET title = $2
+        WHERE id = $1::uuid AND (title IS NULL OR BTRIM(title) = '')
+        """,
+        conversation_id,
+        title,
+    )
+
+
+async def update_conversation_summary(
+    conversation_id: str,
+    *,
+    summary_text: str,
+    summary_through_seq: int,
+) -> None:
+    await pool().execute(
+        """
+        UPDATE conversations
+        SET summary_text = $2, summary_through_seq = $3
+        WHERE id = $1::uuid
+        """,
+        conversation_id,
+        summary_text,
+        summary_through_seq,
+    )
+
+
+async def insert_turn_metrics(
+    conversation_id: str,
+    *,
+    input_tokens: Optional[int],
+    output_tokens: Optional[int],
+    raw_messages_included: int,
+    summary_used: bool,
+    summary_through_seq: Optional[int],
+    approx_context_utilization: Optional[float],
+    supplemental: Optional[dict] = None,
+) -> None:
+    await pool().execute(
+        """
+        INSERT INTO conversation_turn_metrics (
+            conversation_id, input_tokens, output_tokens, raw_messages_included,
+            summary_used, summary_through_seq, approx_context_utilization, supplemental
+        )
+        VALUES (
+            $1::uuid, $2, $3, $4,
+            $5, $6, $7, $8::jsonb
+        )
+        """,
+        conversation_id,
+        input_tokens,
+        output_tokens,
+        raw_messages_included,
+        summary_used,
+        summary_through_seq,
+        approx_context_utilization,
+        json.dumps(supplemental or {}),
+    )
+
+
+async def list_conversations(
+    user_id: str,
+    *,
+    limit: int = 20,
+    cursor: Optional[str] = None,
+) -> list[dict]:
+    """Cursor is last_message_at ISO + id for stable pagination (desc)."""
+    limit = max(1, min(int(limit), 50))
+    if cursor:
+        # cursor format: "<iso_ts>|<uuid>"
+        try:
+            ts_raw, cid = cursor.split("|", 1)
+            cursor_ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            uuid.UUID(cid)
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("invalid cursor") from exc
+        rows = await pool().fetch(
+            """
+            SELECT id, mode, title, started_at, last_message_at, created_at
+            FROM conversations
+            WHERE user_id = $1::uuid
+              AND (
+                    COALESCE(last_message_at, created_at) < $2::timestamptz
+                 OR (
+                        COALESCE(last_message_at, created_at) = $2::timestamptz
+                    AND id < $3::uuid
+                 )
+              )
+            ORDER BY COALESCE(last_message_at, created_at) DESC, id DESC
+            LIMIT $4
+            """,
+            user_id,
+            cursor_ts,
+            cid,
+            limit,
+        )
+    else:
+        rows = await pool().fetch(
+            """
+            SELECT id, mode, title, started_at, last_message_at, created_at
+            FROM conversations
+            WHERE user_id = $1::uuid
+            ORDER BY COALESCE(last_message_at, created_at) DESC, id DESC
+            LIMIT $2
+            """,
+            user_id,
+            limit,
+        )
+    return [dict(r) for r in rows]
+
+
+async def list_messages_page(
+    conversation_id: str,
+    *,
+    limit: int = 50,
+    before_seq: Optional[int] = None,
+) -> list[dict]:
+    limit = max(1, min(int(limit), 100))
+    if before_seq is None:
+        rows = await pool().fetch(
+            """
+            SELECT seq, role, content_json, created_at FROM messages
+            WHERE conversation_id = $1::uuid
+            ORDER BY seq DESC
+            LIMIT $2
+            """,
+            conversation_id,
+            limit,
+        )
+    else:
+        rows = await pool().fetch(
+            """
+            SELECT seq, role, content_json, created_at FROM messages
+            WHERE conversation_id = $1::uuid AND seq < $2
+            ORDER BY seq DESC
+            LIMIT $3
+            """,
+            conversation_id,
+            before_seq,
+            limit,
+        )
+    # Return ascending for clients.
+    ordered = list(reversed([dict(r) for r in rows]))
+    for item in ordered:
+        item["content"] = json.loads(item.pop("content_json"))
+    return ordered
+
+
+async def find_conversations_for_open(
+    user_id: str,
+    *,
+    mode: Optional[str] = None,
+    started_after: Optional[datetime] = None,
+    started_before: Optional[datetime] = None,
+    limit: int = 10,
+) -> list[dict]:
+    clauses = ["user_id = $1::uuid"]
+    args: list[Any] = [user_id]
+    idx = 2
+    if mode:
+        clauses.append(f"mode = ${idx}")
+        args.append(mode)
+        idx += 1
+    if started_after is not None:
+        clauses.append(f"COALESCE(last_message_at, created_at) >= ${idx}::timestamptz")
+        args.append(started_after)
+        idx += 1
+    if started_before is not None:
+        clauses.append(f"COALESCE(last_message_at, created_at) < ${idx}::timestamptz")
+        args.append(started_before)
+        idx += 1
+    args.append(max(1, min(int(limit), 20)))
+    sql = f"""
+        SELECT id, mode, title, started_at, last_message_at, created_at
+        FROM conversations
+        WHERE {' AND '.join(clauses)}
+        ORDER BY COALESCE(last_message_at, created_at) DESC, id DESC
+        LIMIT ${idx}
+    """
+    rows = await pool().fetch(sql, *args)
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1219,3 +1438,169 @@ async def revoke_all_auth_sessions(user_id: str, *, now: datetime) -> int:
         return int(status.split()[-1])
     except (IndexError, ValueError):
         return 0
+
+
+# ---------------------------------------------------------------------------
+# user_profiles + admin_audit_log (012)
+# ---------------------------------------------------------------------------
+
+def _json_list(value: Any) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return list(value)
+
+
+async def get_user_display_name(user_id: str) -> Optional[str]:
+    row = await pool().fetchrow(
+        "SELECT display_name FROM users WHERE id = $1::uuid",
+        user_id,
+    )
+    if not row:
+        return None
+    return row["display_name"]
+
+
+async def get_user_profile_row(user_id: str) -> Optional[dict]:
+    row = await pool().fetchrow(
+        "SELECT * FROM user_profiles WHERE user_id = $1::uuid",
+        user_id,
+    )
+    return dict(row) if row else None
+
+
+_JSONB_PROFILE_KEYS = frozenset(
+    {
+        "primary_goals",
+        "available_equipment",
+        "dietary_preferences",
+        "allergies_restrictions",
+    }
+)
+
+_PROFILE_COLUMNS = frozenset(
+    {
+        "timezone",
+        "date_of_birth",
+        "height_cm",
+        "weight_kg",
+        "interaction_style",
+        "vision_preference",
+        "spoken_response_preference",
+        "experience_level",
+        "primary_goals",
+        "training_frequency",
+        "available_equipment",
+        "injuries_limitations",
+        "nutrition_goal",
+        "dietary_preferences",
+        "allergies_restrictions",
+    }
+)
+
+
+async def upsert_user_profile(user_id: str, updates: dict[str, Any]) -> dict:
+    """Insert or patch user_profiles. `updates` keys are column names."""
+    clean = {k: v for k, v in updates.items() if k in _PROFILE_COLUMNS}
+    for key in _JSONB_PROFILE_KEYS:
+        if key in clean and clean[key] is not None and not isinstance(clean[key], str):
+            clean[key] = json.dumps(clean[key])
+
+    existing = await get_user_profile_row(user_id)
+    if existing is None:
+        if not clean:
+            row = await pool().fetchrow(
+                """
+                INSERT INTO user_profiles (user_id) VALUES ($1::uuid)
+                RETURNING *
+                """,
+                user_id,
+            )
+            return dict(row)
+        cols = ["user_id", *clean.keys()]
+        ph: list[str] = ["$1::uuid"]
+        args: list[Any] = [user_id]
+        for i, key in enumerate(clean.keys(), start=2):
+            ph.append(f"${i}::jsonb" if key in _JSONB_PROFILE_KEYS else f"${i}")
+            args.append(clean[key])
+        row = await pool().fetchrow(
+            f"""
+            INSERT INTO user_profiles ({', '.join(cols)})
+            VALUES ({', '.join(ph)})
+            RETURNING *
+            """,
+            *args,
+        )
+        return dict(row)
+
+    if not clean:
+        return existing
+    sets: list[str] = []
+    args: list[Any] = [user_id]
+    for i, (key, value) in enumerate(clean.items(), start=2):
+        sets.append(
+            f"{key} = ${i}::jsonb" if key in _JSONB_PROFILE_KEYS else f"{key} = ${i}"
+        )
+        args.append(value)
+    sets.append("updated_at = now()")
+    row = await pool().fetchrow(
+        f"""
+        UPDATE user_profiles SET {', '.join(sets)}
+        WHERE user_id = $1::uuid
+        RETURNING *
+        """,
+        *args,
+    )
+    return dict(row) if row else existing
+
+
+async def find_user_for_seed(
+    *,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+    email: Optional[str] = None,
+) -> Optional[dict]:
+    if user_id:
+        row = await pool().fetchrow(
+            "SELECT id, username, email, display_name FROM users WHERE id = $1::uuid",
+            user_id,
+        )
+    elif username:
+        row = await pool().fetchrow(
+            "SELECT id, username, email, display_name FROM users WHERE username = $1",
+            username.strip().lower(),
+        )
+    elif email:
+        row = await pool().fetchrow(
+            "SELECT id, username, email, display_name FROM users WHERE email = $1",
+            email.strip().lower(),
+        )
+    else:
+        return None
+    return dict(row) if row else None
+
+
+async def insert_admin_audit(
+    *,
+    actor: str,
+    action: str,
+    target_user_id: Optional[str],
+    detail: Optional[dict] = None,
+) -> None:
+    await pool().execute(
+        """
+        INSERT INTO admin_audit_log (actor, action, target_user_id, detail)
+        VALUES ($1, $2, $3::uuid, $4::jsonb)
+        """,
+        actor,
+        action,
+        target_user_id,
+        json.dumps(detail or {}),
+    )

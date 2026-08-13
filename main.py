@@ -43,6 +43,8 @@ from modes.mail_calendar.prompt import SYSTEM_PROMPT as MAIL_CALENDAR_PROMPT
 from modes.mail_calendar.prompt import TOOLS as MAIL_CALENDAR_TOOLS
 from routers.auth import router as auth_router
 from routers.author_persistence import router as author_persistence_router
+from routers.conversations import router as conversations_router
+from routers.profile import router as profile_router
 from routers.v2 import router as v2_router
 from routers.voice import router as voice_router
 from shared import db
@@ -53,7 +55,24 @@ from shared.client_actions import (
     empty_client_actions,
     navigate_acknowledgement,
     navigate_action,
+    open_conversation_action,
     parse_navigate_command,
+)
+from shared.context_budget import build_model_messages
+from shared.conversation_summary import maybe_roll_summary
+from shared.conversation_titles import fallback_title, title_from_user_text
+from shared.open_conversation import (
+    day_bounds_utc,
+    open_conversation_acknowledgement,
+    parse_open_conversation_command,
+    resolve_open_conversation,
+)
+from shared.profile_schema import compact_profile_for_context
+from shared.profile_service import get_profile
+from shared.visual_panels import (
+    VisualPanel,
+    exercise_visual_panel,
+    parse_exercise_panel_tool_input,
 )
 from shared.research import (
     ResearchFactCheck,
@@ -113,6 +132,8 @@ async def database_unavailable_handler(request: Request, exc: db.DatabaseUnavail
 
 
 app.include_router(auth_router)
+app.include_router(profile_router)
+app.include_router(conversations_router)
 app.include_router(v2_router)
 app.include_router(author_persistence_router)
 app.include_router(voice_router)
@@ -176,13 +197,6 @@ class PendingAction(BaseModel):
     description: str
 
 
-class VisualPanel(BaseModel):
-    """Optional inline visual for the chat-style UI (quarter-screen panels).
-    Additive — absent/null must not break older clients."""
-    type: str
-    data: dict[str, Any] = Field(default_factory=dict)
-
-
 class ChatResponse(BaseModel):
     reply: str
     mode: str
@@ -219,13 +233,16 @@ class DeviceOut(BaseModel):
     last_seen: datetime
 
 
-def _build_system_prompt(mode: str) -> str:
+def _build_system_prompt(mode: str, *, profile_block: str = "") -> str:
     today = date.today().isoformat()
     now_local = datetime.now().strftime("%A %B %d, %Y at %I:%M %p").replace(" 0", " ")
-    return (
-        f"{MODE_REGISTRY[mode]}\n\n"
-        f"Today's date is {today}. Current local time: {now_local}."
-    )
+    parts = [
+        MODE_REGISTRY[mode],
+        f"Today's date is {today}. Current local time: {now_local}.",
+    ]
+    if profile_block.strip():
+        parts.append(profile_block.strip())
+    return "\n\n".join(parts)
 
 
 async def _call_model(create_kwargs: dict):
@@ -235,23 +252,29 @@ async def _call_model(create_kwargs: dict):
 
 
 async def _run_tool(
-    name: str, tool_input: dict, *, user_id: str, conversation_id: str, mode: str
-) -> tuple[str, PendingAction | None]:
-    """Execute one Claude tool call. Returns (tool_result text for Claude,
-    pending_action to surface to the client, or None if this tool didn't
-    create one). Writes go to Postgres via shared/db.py so /confirm always
-    sees them — no in-memory pending state."""
+    name: str,
+    tool_input: dict,
+    *,
+    user_id: str,
+    conversation_id: str,
+    mode: str,
+) -> tuple[str, PendingAction | None, VisualPanel | None]:
+    """Execute one Claude tool call.
+
+    Returns (tool_result text, pending_action or None, visual_panel or None).
+    """
     if name == "create_pending_action":
-        # Confirm Gate for destructive / irreversible actions only
-        # (delete_scene, overwrite_chapter, generic). Ordinary scene edits
-        # and set logs do NOT use this path.
         description = str(tool_input.get("description", "")).strip()
         if not description:
-            return "Error: description must be a non-empty sentence.", None
+            return "Error: description must be a non-empty sentence.", None, None
         action_type = str(tool_input.get("action_type") or "generic").strip() or "generic"
         payload = tool_input.get("payload")
         if not isinstance(payload, dict):
-            payload = {k: v for k, v in tool_input.items() if k not in ("description", "action_type")}
+            payload = {
+                k: v
+                for k, v in tool_input.items()
+                if k not in ("description", "action_type")
+            }
         action_id = await db.create_pending_action(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -265,56 +288,97 @@ async def _run_tool(
             "Pending action created and shown to the user for confirmation. "
             "Do not say the action is done yet.",
             PendingAction(action_id=action_id, description=description),
+            None,
         )
 
-    return f"Error: unknown tool '{name}'.", None
+    if name == "present_exercise_panel":
+        if mode != "fitness":
+            return "Error: present_exercise_panel is only available in fitness mode.", None, None
+        try:
+            data = parse_exercise_panel_tool_input(
+                tool_input if isinstance(tool_input, dict) else {}
+            )
+        except Exception as exc:
+            return f"Error: invalid exercise panel ({exc}).", None, None
+        panel = exercise_visual_panel(data)
+        return (
+            "Exercise panel shown to the client. Continue with a short spoken reply.",
+            None,
+            panel,
+        )
+
+    return f"Error: unknown tool '{name}'.", None, None
 
 
 async def _run_model_turn(
-    *, mode: str, conversation_id: str, history: list[dict], user_id: str
-) -> tuple[str, PendingAction | None]:
-    """Call Claude, executing any tool calls it makes and persisting every
-    turn to Postgres, until it produces a final text reply. Returns
-    (reply_text, pending_action or None)."""
+    *,
+    mode: str,
+    conversation_id: str,
+    history_for_model: list[dict],
+    user_id: str,
+    system_prompt: str,
+    context_meta: dict[str, Any],
+) -> tuple[str, PendingAction | None, VisualPanel | None]:
+    """Call Claude with a bounded context until a final text reply.
+
+    Tool side-effects (pending_action, exercise panel) are persisted; the
+    full transcript is already/also written by the caller and this function.
+    """
     create_kwargs: dict = dict(
         model=MODEL,
         max_tokens=1024,
-        system=_build_system_prompt(mode),
-        messages=history,
+        system=system_prompt,
+        messages=history_for_model,
     )
     tools = MODE_TOOLS.get(mode)
     if tools:
         create_kwargs["tools"] = tools
 
     message = await _call_model(create_kwargs)
+    input_tokens = getattr(getattr(message, "usage", None), "input_tokens", None)
+    output_tokens = getattr(getattr(message, "usage", None), "output_tokens", None)
 
     pending_action: PendingAction | None = None
-    # Defensive loop, not just an if: today create_pending_action never needs
-    # a second round trip, but a future multi-tool mode (or Claude calling
-    # more than one tool before it's done talking) needs the same shape.
+    visual_panel: VisualPanel | None = None
+    working = list(history_for_model)
+
     while message.stop_reason == "tool_use":
-        # message.content is a list of Anthropic SDK block objects — dump to
-        # plain dicts so both the in-memory history and the DB's jsonb column
-        # get the same JSON-serializable shape.
         assistant_blocks = [block.model_dump() for block in message.content]
-        history.append({"role": "assistant", "content": assistant_blocks})
+        working.append({"role": "assistant", "content": assistant_blocks})
         await db.append_message(conversation_id, "assistant", assistant_blocks)
 
         tool_results = []
         for block in message.content:
             if block.type != "tool_use":
                 continue
-            result_text, created = await _run_tool(
-                block.name, block.input, user_id=user_id, conversation_id=conversation_id, mode=mode
+            result_text, created, panel = await _run_tool(
+                block.name,
+                block.input,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                mode=mode,
             )
             if created is not None:
                 pending_action = created
-            tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result_text})
+            if panel is not None:
+                visual_panel = panel
+            tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                }
+            )
 
-        history.append({"role": "user", "content": tool_results})
+        working.append({"role": "user", "content": tool_results})
         await db.append_message(conversation_id, "user", tool_results)
-
+        create_kwargs["messages"] = working
         message = await _call_model(create_kwargs)
+        # Prefer final-turn usage when present.
+        input_tokens = getattr(getattr(message, "usage", None), "input_tokens", input_tokens)
+        out = getattr(getattr(message, "usage", None), "output_tokens", None)
+        if out is not None:
+            output_tokens = (output_tokens or 0) + out
 
     text_blocks = [block.text for block in message.content if block.type == "text"]
     if not text_blocks:
@@ -322,7 +386,26 @@ async def _run_model_turn(
 
     reply = text_blocks[0].strip()
     await db.append_message(conversation_id, "assistant", reply)
-    return reply, pending_action
+
+    try:
+        await db.insert_turn_metrics(
+            conversation_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            raw_messages_included=int(context_meta.get("raw_messages_included") or 0),
+            summary_used=bool(context_meta.get("summary_used")),
+            summary_through_seq=context_meta.get("summary_through_seq"),
+            approx_context_utilization=context_meta.get("approx_context_utilization"),
+            supplemental={
+                "estimated_message_tokens": context_meta.get("estimated_message_tokens"),
+                "estimated_system_tokens": context_meta.get("estimated_system_tokens"),
+            },
+        )
+    except Exception:
+        # Metrics must never break chat.
+        pass
+
+    return reply, pending_action, visual_panel
 
 
 # ---------------------------------------------------------------------------
@@ -375,45 +458,102 @@ async def me(user_id: str = Depends(get_current_user_id)):
 
 async def _ensure_conversation(
     conversation_id: str | None, *, user_id: str, mode: str
-) -> str:
-    """Resolve / create conversation_id with ownership checks."""
+) -> tuple[str, str]:
+    """Resolve / create conversation_id with ownership checks.
+
+    Returns (conversation_id, authoritative_mode). Stored mode wins when the
+    conversation already exists — request mode is not silently rewritten onto it.
+    """
     if conversation_id is None:
         conversation_id = str(uuid.uuid4())
-        await db.create_conversation(conversation_id, user_id, mode)
-        return conversation_id
+        await db.create_conversation(conversation_id, user_id, mode, title=None)
+        return conversation_id, mode
     try:
         uuid.UUID(conversation_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="conversation_id must be a UUID")
     convo = await db.get_conversation(conversation_id)
     if convo is None:
-        # Client sent an id we've never seen (e.g. minted before the DB
-        # existed) — start fresh under that id rather than erroring out.
-        await db.create_conversation(conversation_id, user_id, mode)
-    elif str(convo["user_id"]) != user_id:
+        await db.create_conversation(conversation_id, user_id, mode, title=None)
+        return conversation_id, mode
+    if str(convo["user_id"]) != user_id:
         raise HTTPException(
             status_code=403, detail="conversation_id does not belong to this user"
         )
-    return conversation_id
+    return conversation_id, str(convo["mode"])
+
+
+async def _maybe_set_title(conversation_id: str, *, mode: str, user_text: str) -> None:
+    title = title_from_user_text(user_text, mode=mode)
+    await db.set_conversation_title_if_empty(conversation_id, title)
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
-    mode = req.mode.lower().strip()
-    if mode not in MODE_REGISTRY:
+    request_mode = req.mode.lower().strip()
+    if request_mode not in MODE_REGISTRY:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported mode '{mode}'. Valid modes: {sorted(PUBLIC_MODE_IDS)}",
+            detail=(
+                f"Unsupported mode '{request_mode}'. "
+                f"Valid modes: {sorted(PUBLIC_MODE_IDS)}"
+            ),
         )
 
-    # Global app commands (V1: navigate) — before mode Claude / API key.
-    # Never Confirm Gate; never jarvis/health targets.
-    navigate = parse_navigate_command(req.transcript)
-    if navigate is not None:
-        conversation_id = await _ensure_conversation(
-            req.conversation_id, user_id=user_id, mode=mode
+    # History reopen (open_conversation) before screen navigate — more specific.
+    open_intent = parse_open_conversation_command(req.transcript)
+    if open_intent is not None:
+        conversation_id, mode = await _ensure_conversation(
+            req.conversation_id, user_id=user_id, mode=request_mode
         )
         await db.append_message(conversation_id, "user", req.transcript)
+        await _maybe_set_title(
+            conversation_id, mode=mode, user_text=req.transcript
+        )
+        bounds = day_bounds_utc(open_intent.day)
+        started_after = bounds[0] if bounds else None
+        started_before = bounds[1] if bounds else None
+        candidates = await db.find_conversations_for_open(
+            user_id,
+            mode=open_intent.mode,
+            started_after=started_after,
+            started_before=started_before,
+            limit=10,
+        )
+        # For "most recent" without day/mode, candidates are already newest-first.
+        # Uniqueness: if more than one match for a scoped query, clarify.
+        # For pure most-recent with no mode/day, take only the single newest if
+        # we intentionally want last chat — that is unique by definition (top 1).
+        if open_intent.mode is None and open_intent.day == "any" and open_intent.most_recent:
+            candidates = candidates[:1]
+        resolution = resolve_open_conversation(candidates, intent=open_intent)
+        if resolution.conversation_id:
+            reply = open_conversation_acknowledgement(resolution.mode)
+            actions = [open_conversation_action(resolution.conversation_id)]
+        else:
+            reply = resolution.clarify_reply or "I couldn't find that conversation."
+            actions = empty_client_actions()
+        await db.append_message(conversation_id, "assistant", reply)
+        return ChatResponse(
+            reply=reply,
+            mode=mode,
+            conversation_id=conversation_id,
+            pending_action=None,
+            visual_panel=None,
+            research=None,
+            client_actions=actions,
+        )
+
+    # Global app commands (navigate) — before mode Claude / API key.
+    navigate = parse_navigate_command(req.transcript)
+    if navigate is not None:
+        conversation_id, mode = await _ensure_conversation(
+            req.conversation_id, user_id=user_id, mode=request_mode
+        )
+        await db.append_message(conversation_id, "user", req.transcript)
+        await _maybe_set_title(
+            conversation_id, mode=mode, user_text=req.transcript
+        )
         if navigate.target is not None:
             reply = navigate_acknowledgement(navigate.target)
             actions = [navigate_action(navigate.target)]
@@ -434,20 +574,69 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
 
-    conversation_id = await _ensure_conversation(
-        req.conversation_id, user_id=user_id, mode=mode
+    conversation_id, mode = await _ensure_conversation(
+        req.conversation_id, user_id=user_id, mode=request_mode
     )
 
-    history = await db.load_messages(conversation_id)
-    history.append({"role": "user", "content": req.transcript})
+    convo = await db.get_conversation(conversation_id)
+    summary_text = (convo or {}).get("summary_text")
+    summary_through_seq = (convo or {}).get("summary_through_seq")
+
+    messages_with_seq = await db.load_messages_with_seq(conversation_id)
+
+    async def _persist_summary(text: str, through: int) -> None:
+        await db.update_conversation_summary(
+            conversation_id, summary_text=text, summary_through_seq=through
+        )
+
+    summary_text, summary_through_seq, _ = await maybe_roll_summary(
+        conversation_id=conversation_id,
+        messages_with_seq=messages_with_seq,
+        summary_text=summary_text,
+        summary_through_seq=summary_through_seq,
+        persist=_persist_summary,
+    )
+
     await db.append_message(conversation_id, "user", req.transcript)
+    await _maybe_set_title(conversation_id, mode=mode, user_text=req.transcript)
+
+    # Recent raw window: messages after summary_through_seq (excluding current,
+    # which we pass separately). Reload after append for complete seq list?
+    # Current turn is not yet in messages_with_seq — good.
+    floor = -1 if summary_through_seq is None else int(summary_through_seq)
+    prior = [
+        {"role": m["role"], "content": m["content"]}
+        for m in messages_with_seq
+        if int(m["seq"]) > floor
+    ]
+    current_user_message = {"role": "user", "content": req.transcript}
+
+    profile = await get_profile(user_id)
+    profile_block = compact_profile_for_context(profile)
+    system_prompt = _build_system_prompt(mode, profile_block=profile_block)
+
+    built = build_model_messages(
+        system_prompt=system_prompt,
+        profile_block=profile_block,
+        summary_text=summary_text,
+        summary_through_seq=summary_through_seq,
+        recent_messages=prior,
+        current_user_message=current_user_message,
+    )
+    context_meta = {
+        "raw_messages_included": built.raw_messages_included,
+        "summary_used": built.summary_used,
+        "summary_through_seq": built.summary_through_seq,
+        "approx_context_utilization": built.approx_context_utilization,
+        "estimated_message_tokens": built.estimated_message_tokens,
+        "estimated_system_tokens": built.estimated_system_tokens,
+    }
 
     research: ResearchResult | None = None
     pending_action: PendingAction | None = None
+    visual_panel: VisualPanel | None = None
     client_actions = empty_client_actions()
 
-    # Brainstorm research is opt-in via explicit verify/research/check language.
-    # No Confirm Gate — read-only. Other modes never attach a research object.
     if mode == "brainstorm" and wants_research(req.transcript):
         provider = get_research_provider()
         if provider is None:
@@ -464,15 +653,17 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
                 claim=extract_claim(req.transcript),
             )
         reply = turn.reply
-        # Re-sanitize every provider payload so unsupported statuses / sneaky
-        # fact_check objects cannot reach the client. Treat unavailable as
-        # "no real web-search call"; completed/failed as a real attempt.
         provider_called = turn.research.status != "unavailable"
         research = sanitize_research(turn.research, provider_called=provider_called)
         await db.append_message(conversation_id, "assistant", reply)
     else:
-        reply, pending_action = await _run_model_turn(
-            mode=mode, conversation_id=conversation_id, history=history, user_id=user_id
+        reply, pending_action, visual_panel = await _run_model_turn(
+            mode=mode,
+            conversation_id=conversation_id,
+            history_for_model=built.messages,
+            user_id=user_id,
+            system_prompt=system_prompt,
+            context_meta=context_meta,
         )
 
     return ChatResponse(
@@ -480,7 +671,7 @@ async def chat(req: ChatRequest, user_id: str = Depends(get_current_user_id)):
         mode=mode,
         conversation_id=conversation_id,
         pending_action=pending_action,
-        visual_panel=None,
+        visual_panel=visual_panel,
         research=research,
         client_actions=client_actions,
     )

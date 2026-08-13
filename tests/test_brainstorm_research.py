@@ -338,6 +338,29 @@ class BrainstormChatResearchTests(unittest.TestCase):
         os.environ["AUTH_MODE"] = "dev"
         self._prev_app_env = os.environ.get("APP_ENV")
         os.environ["APP_ENV"] = "test"
+        from shared.profile_schema import empty_profile
+
+        self._extra_patches = [
+            patch("shared.db.get_conversation", new_callable=AsyncMock, return_value=None),
+            patch(
+                "shared.db.load_messages_with_seq",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "shared.db.set_conversation_title_if_empty", new_callable=AsyncMock
+            ),
+            patch(
+                "main.get_profile",
+                new_callable=AsyncMock,
+                return_value=empty_profile(
+                    "00000000-0000-4000-8000-000000000001"
+                ),
+            ),
+        ]
+        for p in self._extra_patches:
+            p.start()
+            self.addCleanup(p.stop)
 
     def tearDown(self) -> None:
         clear_research_provider_override()
@@ -358,7 +381,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
     @patch(
         "main._run_model_turn",
         new_callable=AsyncMock,
-        return_value=("Just brainstorming with you.", None),
+        return_value=("Just brainstorming with you.", None, None),
     )
     def test_ordinary_brainstorm_returns_research_null(
         self,
@@ -532,7 +555,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
     @patch(
         "main._run_model_turn",
         new_callable=AsyncMock,
-        return_value=("Fitness reply.", None),
+        return_value=("Fitness reply.", None, None),
     )
     def test_other_modes_unchanged_no_research(
         self,
