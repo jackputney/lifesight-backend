@@ -187,8 +187,9 @@ class ScenarioSteeringTests(unittest.TestCase):
 class ModeSpecificSteeringTests(unittest.TestCase):
     def test_author_allows_fiction_with_reality_boundary(self):
         text = author_prompt.SYSTEM_PROMPT.lower()
-        self.assertIn("creative fiction is encouraged", text)
-        self.assertIn("fiction/reality boundary", text)
+        self.assertIn("clearly fictional content should be treated as fiction", text)
+        self.assertIn("without unsolicited reality checks", text)
+        self.assertIn("activate reality-grounding only when", text)
         self.assertIn(EPISTEMIC_GROUNDING.lower().splitlines()[0], text)
 
     def test_brainstorm_labels_speculation_and_ranks_plausibility(self):
@@ -217,6 +218,52 @@ class ModeSpecificSteeringTests(unittest.TestCase):
         self.assertIn("never invent inbox contents", text)
         self.assertIn("absence of retrieved information", text)
         self.assertIn("hidden message", text)
+
+
+class AuthorFictionBoundaryContractTests(unittest.TestCase):
+    """Prompt-contract coverage for Author fiction vs boundary-crossing."""
+
+    def test_pure_fiction_must_remain_unrestricted(self):
+        # Write a scene where streetlights are government transmitters…
+        text = author_prompt.INSTRUCTIONS.lower()
+        self.assertIn("without unsolicited reality checks", text)
+        self.assertIn("mental-health disclaimers", text)
+        self.assertIn("do not interrupt a fictional scene", text)
+        self.assertIn("append a disclaimer", text)
+        self.assertIn("surveillance", text)
+        self.assertIn("hidden messages", text)
+        # Shared layer also forbids unsolicited disclaimers during clear fiction.
+        shared = EPISTEMIC_GROUNDING.lower()
+        self.assertIn("unsolicited real-world disclaimers", shared)
+        self.assertIn("mental-health coda", shared)
+
+    def test_fiction_brainstorming_must_remain_unrestricted(self):
+        # In my novel, everyone is secretly an alien… make the conspiracy convincing.
+        text = author_prompt.INSTRUCTIONS.lower()
+        self.assertIn("conspiracies", text)
+        self.assertIn("developed freely", text)
+        self.assertIn("fictional worlds", text)
+        self.assertIn("corrections to the fictional premise", text)
+
+    def test_boundary_crossing_activates_grounding_without_preemption(self):
+        # Turn 1 fiction → unrestricted; turn 2 real-life ask → ground.
+        text = author_prompt.INSTRUCTIONS.lower()
+        self.assertIn(
+            "activate reality-grounding only when the user explicitly or reasonably",
+            text,
+        )
+        self.assertIn("connects the fictional premise to their own real life", text)
+        self.assertIn(
+            "asks whether the fictional explanation is actually happening to them",
+            text,
+        )
+        self.assertIn(
+            "do not carry fictional assumptions into real-world reasoning",
+            text,
+        )
+        # Must not instruct preemptive personal/feeling disclaimers on pure fiction.
+        self.assertNotIn("if any of this starts feeling personal", text)
+        self.assertNotIn("in the real world, streetlights", text)
 
 
 class RegressionSmokeTests(unittest.TestCase):
