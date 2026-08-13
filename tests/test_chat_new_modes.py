@@ -23,22 +23,38 @@ class ChatNewModesTests(unittest.TestCase):
     @patch("shared.db.init_pool", new_callable=AsyncMock)
     @patch("shared.db.close_pool", new_callable=AsyncMock)
     @patch("shared.db.create_conversation", new_callable=AsyncMock)
+    @patch("shared.db.get_conversation", new_callable=AsyncMock, return_value=None)
     @patch("shared.db.load_messages", new_callable=AsyncMock, return_value=[])
+    @patch("shared.db.load_messages_with_seq", new_callable=AsyncMock, return_value=[])
     @patch("shared.db.append_message", new_callable=AsyncMock)
+    @patch("shared.db.set_conversation_title_if_empty", new_callable=AsyncMock)
+    @patch(
+        "main.get_profile",
+        new_callable=AsyncMock,
+    )
     @patch(
         "main._run_model_turn",
         new_callable=AsyncMock,
-        return_value=("Shell reply.", None),
+        return_value=("Shell reply.", None, None),
     )
     def test_chat_accepts_brainstorm_and_mail_calendar(
         self,
         _turn: AsyncMock,
+        mock_profile: AsyncMock,
+        _title: AsyncMock,
         _append: AsyncMock,
+        _load_seq: AsyncMock,
         _load: AsyncMock,
+        _get: AsyncMock,
         _create: AsyncMock,
         _close: AsyncMock,
         _init: AsyncMock,
     ) -> None:
+        from shared.profile_schema import empty_profile
+
+        mock_profile.return_value = empty_profile(
+            "00000000-0000-4000-8000-000000000001"
+        )
         headers = {"Authorization": "Bearer test"}
         prev = os.environ.get("ANTHROPIC_API_KEY")
         # Placeholder only — never a real credential (detect-secrets).

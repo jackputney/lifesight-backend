@@ -33,6 +33,9 @@ EXPECTED_TABLES = (
     "conversations",
     "pending_actions",
     "action_log",
+    "user_profiles",
+    "admin_audit_log",
+    "conversation_turn_metrics",
 )
 
 # Looked up by (table, column, ref_table, ref_column); name is diagnostic only.
