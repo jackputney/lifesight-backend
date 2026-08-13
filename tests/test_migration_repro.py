@@ -59,6 +59,14 @@ EXPECTED_FOREIGN_KEYS = (
         "id",
     ),
     ("conversations_user_id_fkey", "conversations", "user_id", "users", "id"),
+    ("user_profiles_user_id_fkey", "user_profiles", "user_id", "users", "id"),
+    (
+        "conversation_turn_metrics_conversation_id_fkey",
+        "conversation_turn_metrics",
+        "conversation_id",
+        "conversations",
+        "id",
+    ),
 )
 
 MODE_CONSTRAINTS = (
@@ -257,6 +265,15 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
                 health_convo,
             )
             self.assertEqual(remapped, "fitness")
+
+            # Apply post-009 migrations (gaps allowed; e.g. 012/013 while 010/011
+            # are reserved on other branches).
+            for sql_file in sorted(MIGRATIONS.glob("*.sql")):
+                prefix = sql_file.name.split("_", 1)[0]
+                if not prefix.isdigit() or int(prefix) <= 9:
+                    continue
+                print(f"APPLY {sql_file.name}", flush=True)
+                await conn.execute(sql_file.read_text(encoding="utf-8"))
 
             for table in EXPECTED_TABLES:
                 exists = await conn.fetchval(
