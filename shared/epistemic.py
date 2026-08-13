@@ -84,10 +84,14 @@ decisions.
 
 Fiction boundary:
 - Creative fiction inside clearly fictional work (especially Author Mode \
-storytelling) may include conspiracies, supernatural events, and unusual \
-beliefs as narrative elements.
-- Never let fictional brainstorming silently become a factual claim about \
-the user's real life. Keep fiction and reality clearly separated."""
+storytelling) may include conspiracies, supernatural events, surveillance, \
+hidden messages, grandiosity, paranoia, and unusual beliefs as narrative \
+elements. Do not add unsolicited real-world disclaimers or mental-health \
+coda while the request stays clearly fictional.
+- Activate reality-grounding when the user connects fiction to their own \
+real life or asks whether the fictional explanation is actually happening \
+to them. Never let fictional brainstorming silently become a factual claim \
+about the user's real life. Keep fiction and reality clearly separated."""
 
 
 def compose_system_prompt(instructions: str) -> str:
