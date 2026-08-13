@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from shared import db
@@ -13,8 +14,13 @@ def row_to_profile(row: dict, *, display_name: Optional[str], user_id: str) -> P
         raw = row.get(key)
         if raw is None:
             return []
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return []
         if isinstance(raw, list):
-            return [str(x) for x in raw]
+            return [str(x) for x in raw if str(x).strip()]
         return []
 
     height = row.get("height_cm")
