@@ -23,7 +23,11 @@ from modes.brainstorm import prompt as brainstorm_prompt
 from modes.diet import prompt as diet_prompt
 from modes.fitness import prompt as fitness_prompt
 from modes.mail_calendar import prompt as mail_calendar_prompt
-from shared.epistemic import EPISTEMIC_GROUNDING, compose_system_prompt
+from shared.epistemic import (
+    EPISTEMIC_GROUNDING,
+    FEASIBILITY_AND_NON_SYCOPHANCY,
+    compose_system_prompt,
+)
 from shared.identity import IDENTITY
 
 
@@ -40,24 +44,28 @@ def _env(**overrides: str):
 
 
 class ComposeArchitectureTests(unittest.TestCase):
-    def test_compose_order_identity_then_epistemic_then_mode(self):
+    def test_compose_order_identity_then_epistemic_then_feasibility_then_mode(self):
         prompt = compose_system_prompt("MODE BODY")
         self.assertTrue(prompt.startswith(IDENTITY))
         id_end = prompt.index(IDENTITY) + len(IDENTITY)
         ep_start = prompt.index(EPISTEMIC_GROUNDING)
+        feas_start = prompt.index(FEASIBILITY_AND_NON_SYCOPHANCY)
         mode_start = prompt.index("MODE BODY")
         self.assertLess(id_end, ep_start)
-        self.assertLess(ep_start, mode_start)
+        self.assertLess(ep_start, feas_start)
+        self.assertLess(feas_start, mode_start)
 
-    def test_all_registry_modes_include_shared_epistemic_layer(self):
+    def test_all_registry_modes_include_shared_epistemic_and_feasibility_layers(self):
         for mode, prompt in MODE_REGISTRY.items():
             with self.subTest(mode=mode):
                 self.assertIn(IDENTITY, prompt)
                 self.assertIn(EPISTEMIC_GROUNDING, prompt)
+                self.assertIn(FEASIBILITY_AND_NON_SYCOPHANCY, prompt)
 
-    def test_runtime_build_preserves_epistemic_layer(self):
+    def test_runtime_build_preserves_epistemic_and_feasibility_layers(self):
         built = _build_system_prompt("fitness")
         self.assertIn(EPISTEMIC_GROUNDING, built)
+        self.assertIn(FEASIBILITY_AND_NON_SYCOPHANCY, built)
         self.assertIn("Today's date is", built)
 
     def test_policy_not_exposed_via_modes_endpoint(self):
@@ -71,7 +79,9 @@ class ComposeArchitectureTests(unittest.TestCase):
         body = resp.json()
         blob = str(body)
         self.assertNotIn("Epistemic grounding", blob)
+        self.assertNotIn("Feasibility, calibration", blob)
         self.assertNotIn(EPISTEMIC_GROUNDING[:40], blob)
+        self.assertNotIn(FEASIBILITY_AND_NON_SYCOPHANCY[:40], blob)
         self.assertEqual(body["modes"], list(PUBLIC_MODE_IDS))
 
 
@@ -182,6 +192,98 @@ class ScenarioSteeringTests(unittest.TestCase):
             "never because the user sounds confident or repeats a claim",
             policy,
         )
+
+
+class FeasibilityCalibrationTests(unittest.TestCase):
+    """Shared feasibility / non-sycophancy contract present in every mode."""
+
+    def _policy(self) -> str:
+        return FEASIBILITY_AND_NON_SYCOPHANCY.lower()
+
+    def test_no_default_praise(self):
+        policy = self._policy()
+        self.assertIn("without being flattering by default", policy)
+        self.assertIn("do not praise an idea merely because the user proposed it", policy)
+        self.assertIn("great idea", policy)
+        self.assertIn("prefer substantive analysis over affirmation", policy)
+
+    def test_feasibility_independent_of_user_confidence(self):
+        policy = self._policy()
+        self.assertIn(
+            "evaluate feasibility independently of the user's confidence",
+            policy,
+        )
+        self.assertIn("feasible with current tools/technology", policy)
+        self.assertIn("speculative/research-grade", policy)
+        self.assertIn("not currently feasible as described", policy)
+
+    def test_identify_concrete_technical_constraints(self):
+        policy = self._policy()
+        for phrase in (
+            "available apis or platform restrictions",
+            "model reliability",
+            "latency",
+            "privacy/security",
+            "engineering complexity",
+            "realistic development time",
+        ):
+            self.assertIn(phrase, policy)
+
+    def test_prototype_does_not_imply_production_reliability(self):
+        policy = self._policy()
+        self.assertIn(
+            "prototype demonstrates production reliability",
+            policy,
+        )
+        self.assertIn(
+            "convincing examples of that capability",
+            policy,
+        )
+
+    def test_offer_simplified_buildable_version(self):
+        policy = self._policy()
+        self.assertIn("closest useful version", policy)
+        self.assertIn("realistically buildable", policy)
+        self.assertIn("what was removed or changed", policy)
+
+    def test_effort_estimates_only_when_decision_relevant(self):
+        policy = self._policy()
+        self.assertIn(
+            "when it would affect the user's decision",
+            policy,
+        )
+        self.assertIn(
+            "do not add estimates to trivial implementation questions",
+            policy,
+        )
+        self.assertIn("avoid false precision", policy)
+
+    def test_personalization_does_not_constitute_independent_verification(self):
+        policy = self._policy()
+        self.assertIn(
+            "personalization does not increase evidentiary weight",
+            policy,
+        )
+        self.assertIn(
+            "does not independently verify the user's interpretation",
+            policy,
+        )
+        self.assertIn('the user reports x', policy)
+        self.assertIn("independently established", policy)
+        self.assertIn("daily check-ins", policy)
+
+    def test_not_reflexively_contrarian(self):
+        policy = self._policy()
+        self.assertIn("do not become reflexively contrarian", policy)
+        self.assertIn(
+            "neither automatic agreement nor automatic skepticism",
+            policy,
+        )
+
+    def test_every_registry_mode_receives_feasibility_layer(self):
+        for mode, prompt in MODE_REGISTRY.items():
+            with self.subTest(mode=mode):
+                self.assertIn(FEASIBILITY_AND_NON_SYCOPHANCY, prompt)
 
 
 class ModeSpecificSteeringTests(unittest.TestCase):
@@ -304,6 +406,7 @@ class RegressionSmokeTests(unittest.TestCase):
         kwargs = turn.await_args.kwargs
         self.assertIn("system_prompt", kwargs)
         self.assertIn(EPISTEMIC_GROUNDING, kwargs["system_prompt"])
+        self.assertIn(FEASIBILITY_AND_NON_SYCOPHANCY, kwargs["system_prompt"])
 
 
 if __name__ == "__main__":
