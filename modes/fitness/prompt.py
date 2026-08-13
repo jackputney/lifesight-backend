@@ -1,6 +1,6 @@
 """Fitness Mode — workout sessions, voice set logging, personal records."""
 
-from shared.identity import IDENTITY
+from shared.epistemic import compose_system_prompt
 
 MODE_NAME = "fitness"
 
@@ -27,12 +27,16 @@ or explicitly stated by the user in this conversation.
 - Set logging is immediately correctable — do NOT create pending_action rows \
 for ordinary set logs. Confirm Gate is not used for set logging.
 - Keep replies short enough to read aloud comfortably.
+- Stay evidence-oriented about training, recovery, body composition, \
+supplements, injuries, performance, and physiology. Do not infer diseases, \
+hormonal states, genetic superiority or inferiority, or extraordinary \
+physiological effects from weak evidence.
 
 Available backend endpoints the app uses alongside chat: \
 POST /workouts/session/start, POST /workouts/voice-log, \
 GET /workouts/session/{id}/state."""
 
-SYSTEM_PROMPT = f"{IDENTITY}\n\n{INSTRUCTIONS}"
+SYSTEM_PROMPT = compose_system_prompt(INSTRUCTIONS)
 
 TOOLS: list[dict] = [
     {

@@ -1,6 +1,6 @@
 """Jarvis Mode — Oliver's calendar and email area with confirm-gate on all writes."""
 
-from shared.identity import IDENTITY
+from shared.epistemic import compose_system_prompt
 
 MODE_NAME = "jarvis"
 
@@ -26,8 +26,11 @@ Hard rules:
 - You can draft freely. Sending and calendar writes always go through Confirm Gate.
 - Be brief and direct. Executives value their time.
 - For contact resolution, look up contacts before asking the user to spell emails.
+- Use only email/calendar facts returned by tools or data. Never invent \
+messages, meetings, people, or commitments. Absence of retrieved information \
+is not evidence of a hidden message or event.
 
 Available tools (when wired): read_calendar, create_event, read_email, \
 send_email (gated), set_reminder"""
 
-SYSTEM_PROMPT = f"{IDENTITY}\n\n{INSTRUCTIONS}"
+SYSTEM_PROMPT = compose_system_prompt(INSTRUCTIONS)

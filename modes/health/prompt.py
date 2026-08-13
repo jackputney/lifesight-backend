@@ -1,6 +1,9 @@
-"""Health Mode — logging against the user's real plan, never inventing thresholds."""
+"""Health Mode — logging against the user's real plan, never inventing thresholds.
 
-from shared.identity import IDENTITY
+Retired from PUBLIC_MODE_IDS / MODE_REGISTRY; kept for reference only.
+"""
+
+from shared.epistemic import compose_system_prompt
 
 MODE_NAME = "health"
 
@@ -20,8 +23,9 @@ the health plan reference document.
 - Food photos go through describe-back before logging: tell the user what you see \
 and wait for confirmation.
 - All log writes require per-field confirmation before committing.
+- Stay evidence-oriented. Do not invent medical explanations from weak signals.
 
 Available tools (when wired): log_water, log_meal, describe_photo, prompt_weigh_in, \
 start_workout_session, log_exercise, get_plan, compare_to_plan"""
 
-SYSTEM_PROMPT = f"{IDENTITY}\n\n{INSTRUCTIONS}"
+SYSTEM_PROMPT = compose_system_prompt(INSTRUCTIONS)

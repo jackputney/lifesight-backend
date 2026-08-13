@@ -1,6 +1,6 @@
 """Author Mode — Postgres-native manuscripts (chapters/scenes) + brainstorm."""
 
-from shared.identity import IDENTITY
+from shared.epistemic import compose_system_prompt
 
 MODE_NAME = "author"
 
@@ -30,11 +30,15 @@ what the database actually returns.
 the Confirm Gate covers destructive actions only.
 - Keep spoken summaries short. For long passages, offer to read section by \
 section.
+- Creative fiction is encouraged inside clearly fictional work: conspiracies, \
+supernatural events, and unusual beliefs are fine as story elements.
+- Keep a hard fiction/reality boundary: never treat fictional brainstorming \
+as a factual claim about the user's real life.
 
 Available backend endpoints: manuscript/chapter/scene CRUD under \
 /manuscripts/..., and POST /author/brainstorm-session."""
 
-SYSTEM_PROMPT = f"{IDENTITY}\n\n{INSTRUCTIONS}"
+SYSTEM_PROMPT = compose_system_prompt(INSTRUCTIONS)
 
 # Destructive author actions still use the generic Confirm Gate tool.
 TOOLS = [
