@@ -6,7 +6,9 @@ No public HTTP admin surface. Refuses production by default.
 Usage examples:
   ADMIN_SEED_TOKEN=... python scripts/seed_user_profile.py \\
     --username smoke_tester --timezone America/Los_Angeles \\
-    --experience-level intermediate --primary-goals strength,hypertrophy
+    --experience-level intermediate --primary-goals build_muscle,get_stronger \\
+    --preferred-units imperial --training-environment commercial_gym \\
+    --typical-session-minutes 60 --training-frequency 3
 
 Requires DATABASE_URL and matching ADMIN_SEED_TOKEN in the environment.
 Never prints passwords or secrets.
@@ -90,13 +92,46 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vision-preference")
     p.add_argument("--spoken-response-preference")
     p.add_argument("--experience-level")
-    p.add_argument("--primary-goals", help="Comma-separated")
-    p.add_argument("--training-frequency")
+    p.add_argument(
+        "--primary-goals",
+        help=(
+            "Comma-separated ordered goals (max 3): index 0 = primary. "
+            "Values: build_muscle,get_stronger,lose_body_fat,improve_endurance,"
+            "general_fitness,longevity_health,track_nutrition,return_to_training,"
+            "better_habits"
+        ),
+    )
+    p.add_argument(
+        "--training-frequency",
+        choices=["0_1", "2", "3", "4", "5", "6_plus"],
+        help="Canonical weekly frequency wire value",
+    )
     p.add_argument("--available-equipment", help="Comma-separated")
     p.add_argument("--injuries-limitations")
     p.add_argument("--nutrition-goal")
     p.add_argument("--dietary-preferences", help="Comma-separated")
     p.add_argument("--allergies-restrictions", help="Comma-separated")
+    p.add_argument("--preferred-units", choices=["imperial", "metric"])
+    p.add_argument(
+        "--training-environment",
+        choices=[
+            "commercial_gym",
+            "home_gym",
+            "limited_equipment",
+            "bodyweight_outdoors",
+            "mixed",
+        ],
+    )
+    p.add_argument(
+        "--typical-session-minutes",
+        type=int,
+        help="Typical session length in minutes (10–300)",
+    )
+    p.add_argument(
+        "--sex-for-physiological-calculations",
+        choices=["male", "female", "unspecified"],
+        help="Formula/reference use only — not gender identity",
+    )
     return p
 
 
@@ -131,6 +166,12 @@ async def _run(args: argparse.Namespace) -> int:
             "nutrition_goal": args.nutrition_goal,
             "dietary_preferences": _parse_list(args.dietary_preferences),
             "allergies_restrictions": _parse_list(args.allergies_restrictions),
+            "preferred_units": args.preferred_units,
+            "training_environment": args.training_environment,
+            "typical_session_minutes": args.typical_session_minutes,
+            "sex_for_physiological_calculations": (
+                args.sex_for_physiological_calculations
+            ),
         }
         # Drop Nones so ProfilePatch exclude_unset works via model_validate partial
         compact = {k: v for k, v in patch_data.items() if v is not None}

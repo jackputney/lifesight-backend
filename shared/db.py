@@ -1502,6 +1502,10 @@ _PROFILE_COLUMNS = frozenset(
         "nutrition_goal",
         "dietary_preferences",
         "allergies_restrictions",
+        "preferred_units",
+        "training_environment",
+        "typical_session_minutes",
+        "sex_for_physiological_calculations",
     }
 )
 

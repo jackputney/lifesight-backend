@@ -43,6 +43,16 @@ def row_to_profile(row: dict, *, display_name: Optional[str], user_id: str) -> P
         nutrition_goal=row.get("nutrition_goal"),
         dietary_preferences=_list("dietary_preferences"),
         allergies_restrictions=_list("allergies_restrictions"),
+        preferred_units=row.get("preferred_units"),
+        training_environment=row.get("training_environment"),
+        typical_session_minutes=(
+            int(row["typical_session_minutes"])
+            if row.get("typical_session_minutes") is not None
+            else None
+        ),
+        sex_for_physiological_calculations=row.get(
+            "sex_for_physiological_calculations"
+        ),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
     )

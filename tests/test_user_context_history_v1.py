@@ -90,10 +90,21 @@ class ProfileSchemaTests(unittest.TestCase):
         p = empty_profile("u1")
         self.assertEqual(p.primary_goals, [])
         self.assertIsNone(p.timezone)
+        self.assertIsNone(p.preferred_units)
+        self.assertIsNone(p.training_environment)
+        self.assertIsNone(p.typical_session_minutes)
+        self.assertIsNone(p.sex_for_physiological_calculations)
 
-    def test_patch_bounds_arrays(self):
+    def test_patch_primary_goals_max_three(self):
         with self.assertRaises(ValidationError):
-            ProfilePatch(primary_goals=["x"] * 21)
+            ProfilePatch(
+                primary_goals=[
+                    "build_muscle",
+                    "get_stronger",
+                    "lose_body_fat",
+                    "general_fitness",
+                ]
+            )
 
 
 class TitleTests(unittest.TestCase):

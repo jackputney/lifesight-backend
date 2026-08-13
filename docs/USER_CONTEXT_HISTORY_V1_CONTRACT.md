@@ -4,8 +4,8 @@ Additive backend contracts on branch `feature/user-context-history-v1`.
 Existing `/chat` fields remain: `reply`, `mode`, `conversation_id`,
 `pending_action`, `visual_panel`, `research`, `client_actions`.
 
-Migrations: `010_user_profiles.sql`, `011_conversation_context.sql`
-(next free number after main's `009`).
+Migrations: `010_user_profiles.sql`, `011_conversation_context.sql`,
+`012_profile_onboarding_fields.sql`.
 
 ## 1. `visual_panel` — Fitness `exercise`
 
@@ -41,20 +41,28 @@ Identity remains `/auth/me` (`display_name`, `email`, …).
 | timezone | IANA string |
 | date_of_birth | date |
 | height_cm / weight_kg | numbers |
+| preferred_units | `imperial` \| `metric` (nullable) |
 | interaction_style | `standard` \| `voice_first` \| `high_accessibility` |
 | vision_preference | nullable string |
 | spoken_response_preference | nullable string |
 | experience_level | nullable string |
-| primary_goals | string[] (max 20) |
-| training_frequency | nullable string |
+| primary_goals | ordered string[] — **index 0 = primary**, 1–2 optional secondary; **max 3**. Supported onboarding values: `build_muscle`, `get_stronger`, `lose_body_fat`, `improve_endurance`, `general_fitness`, `longevity_health`, `track_nutrition`, `return_to_training`, `better_habits`. Legacy stored values may still appear on GET. |
+| training_frequency | canonical V1 wire (nullable): `0_1` (0–1 days/week), `2`, `3`, `4`, `5`, `6_plus`. Reuses the same column — no duplicate field. Legacy free-text may still appear on GET. |
+| training_environment | `commercial_gym` \| `home_gym` \| `limited_equipment` \| `bodyweight_outdoors` \| `mixed` (nullable) |
+| typical_session_minutes | nullable int, **10–300** |
 | available_equipment | string[] |
 | injuries_limitations | nullable text |
 | nutrition_goal | nullable string |
 | dietary_preferences | string[] |
 | allergies_restrictions | string[] |
+| sex_for_physiological_calculations | `male` \| `female` \| `unspecified` (nullable, optional). **Not gender identity** — formula/reference use only. `unspecified` means do not assume male/female. |
 
 Missing `user_profiles` row → safe nulls / empty arrays. `display_name` may be
 echoed for convenience but is stored only on `users`.
+
+There is **no** `onboarding_complete` flag. Backend profile fields are authoritative;
+iOS calls `GET /profile` and asks only for missing/null onboarding answers.
+Sparse/null profiles remain valid for existing users.
 
 ## 3. Chat history
 
