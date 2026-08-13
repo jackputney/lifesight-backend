@@ -1506,12 +1506,24 @@ _PROFILE_COLUMNS = frozenset(
 )
 
 
+def _profile_jsonb_arg(value: Any) -> str:
+    """Serialize list values for `$n::text::jsonb` binds (never store a JSON string scalar)."""
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if not isinstance(parsed, list):
+            raise ValueError("profile jsonb fields must be arrays")
+        return json.dumps(parsed)
+    if not isinstance(value, list):
+        raise ValueError("profile jsonb fields must be arrays")
+    return json.dumps(value)
+
+
 async def upsert_user_profile(user_id: str, updates: dict[str, Any]) -> dict:
     """Insert or patch user_profiles. `updates` keys are column names."""
     clean = {k: v for k, v in updates.items() if k in _PROFILE_COLUMNS}
     for key in _JSONB_PROFILE_KEYS:
-        if key in clean and clean[key] is not None and not isinstance(clean[key], str):
-            clean[key] = json.dumps(clean[key])
+        if key in clean and clean[key] is not None:
+            clean[key] = _profile_jsonb_arg(clean[key])
 
     existing = await get_user_profile_row(user_id)
     if existing is None:
@@ -1528,7 +1540,8 @@ async def upsert_user_profile(user_id: str, updates: dict[str, Any]) -> dict:
         ph: list[str] = ["$1::uuid"]
         args: list[Any] = [user_id]
         for i, key in enumerate(clean.keys(), start=2):
-            ph.append(f"${i}::jsonb" if key in _JSONB_PROFILE_KEYS else f"${i}")
+            # text→jsonb so a Python str bind parses as JSON, not a jsonb string.
+            ph.append(f"${i}::text::jsonb" if key in _JSONB_PROFILE_KEYS else f"${i}")
             args.append(clean[key])
         row = await pool().fetchrow(
             f"""
@@ -1546,7 +1559,9 @@ async def upsert_user_profile(user_id: str, updates: dict[str, Any]) -> dict:
     args: list[Any] = [user_id]
     for i, (key, value) in enumerate(clean.items(), start=2):
         sets.append(
-            f"{key} = ${i}::jsonb" if key in _JSONB_PROFILE_KEYS else f"{key} = ${i}"
+            f"{key} = ${i}::text::jsonb"
+            if key in _JSONB_PROFILE_KEYS
+            else f"{key} = ${i}"
         )
         args.append(value)
     sets.append("updated_at = now()")
