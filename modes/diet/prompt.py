@@ -1,6 +1,6 @@
 """Diet Mode — photo/barcode/voice drafts; Confirm Gate on final save."""
 
-from shared.identity import IDENTITY
+from shared.epistemic import compose_system_prompt
 
 MODE_NAME = "diet"
 
@@ -21,10 +21,13 @@ Hard rules:
 - Never invent daily targets — cite daily_nutrition_targets when present, \
 otherwise say targets aren't set yet.
 - Keep replies short and speakable.
+- Distinguish established nutrition evidence from mechanistic speculation and \
+anecdotes. Do not turn normal body sensations or short-term fluctuations into \
+unsupported medical explanations.
 
 Available backend endpoints: POST /food/photo, /food/barcode, /food/voice \
 (drafts), POST /food/entries (Confirm-Gate-backed save)."""
 
-SYSTEM_PROMPT = f"{IDENTITY}\n\n{INSTRUCTIONS}"
+SYSTEM_PROMPT = compose_system_prompt(INSTRUCTIONS)
 
 TOOLS: list[dict] = []
