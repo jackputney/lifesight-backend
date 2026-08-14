@@ -78,6 +78,40 @@ def normalize_capabilities(raw: Iterable[str] | None) -> list[str]:
     return [cap for cap in CAPABILITY_IDS if cap in requested]
 
 
+def granted_capability_ids(granted_scopes: Iterable[str] | None) -> list[str]:
+    """Capability ids currently true for stored granted scopes (stable order)."""
+    flags = capabilities_from_scopes(granted_scopes)
+    return [cap for cap in CAPABILITY_IDS if flags.get(cap)]
+
+
+def resolve_start_capabilities(
+    requested: Iterable[str] | None,
+    *,
+    connected: bool = False,
+    granted_scopes: Iterable[str] | None = None,
+) -> list[str]:
+    """Capabilities to request on /start.
+
+    Disconnected: default identity+calendar (or explicit allowlisted request).
+    Connected: union of already-granted capabilities with the new request.
+    Backend owns the union — clients need not resend prior capabilities.
+    """
+    if not connected:
+        return normalize_capabilities(requested)
+
+    existing = granted_capability_ids(granted_scopes)
+    if requested is None:
+        # Re-consent with no new caps → preserve what they already have.
+        return normalize_capabilities(existing or None)
+
+    requested_list = [str(x).strip() for x in requested if str(x).strip()]
+    if not requested_list:
+        return normalize_capabilities(existing or None)
+
+    # Union existing + newly requested (normalize validates + dedupes + orders).
+    return normalize_capabilities(existing + requested_list)
+
+
 def scopes_for_capabilities(capabilities: Iterable[str] | None) -> list[str]:
     caps = normalize_capabilities(capabilities)
     scopes: list[str] = []

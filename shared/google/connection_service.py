@@ -71,8 +71,28 @@ class GoogleConnectionService:
 
     @classmethod
     async def disconnect(cls, user_id: str) -> bool:
-        """Revoke (soft) this user's active connection. Leaves other users untouched."""
-        return await connection_store.revoke_active_google_connection(user_id)
+        """Best-effort Google revoke, then always revoke locally.
+
+        Provider/network failures must not block removing LifeSight access.
+        Never exposes tokens. Leaves other users' connections untouched.
+        """
+        from shared.google import oauth as google_oauth
+
+        row = await cls.get_active_connection(user_id)
+        if row is None:
+            return True
+
+        try:
+            refresh = GoogleTokenService.decrypt_refresh_token(
+                row["encrypted_refresh_token"]
+            )
+            await google_oauth.revoke_google_token(refresh)
+        except Exception:
+            # Outage / bad ciphertext / provider reject — continue locally.
+            pass
+
+        await connection_store.revoke_active_google_connection(user_id)
+        return True
 
     @classmethod
     async def load_credentials_for_user(cls, user_id: str):

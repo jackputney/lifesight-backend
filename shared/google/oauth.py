@@ -28,6 +28,7 @@ from shared.google.transactions import (
 OAUTH_STATE_TTL_SECONDS = 600
 GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+GOOGLE_REVOKE_URI = "https://oauth2.googleapis.com/revoke"
 GOOGLE_USERINFO_URI = "https://openidconnect.googleapis.com/v1/userinfo"
 
 APP_RETURN_RESULTS = frozenset({"success", "error", "reauth_required"})
@@ -179,12 +180,22 @@ async def start_authorization(
     """Create single-use transaction + PKCE; return Google authorization URL.
 
     `user_id` MUST come from authenticated Depends(get_current_user_id).
+    When the user already has a connection, newly requested capabilities are
+    unioned with already-granted ones (progressive authorization).
     """
     cfg = require_oauth_config()
     return_uri = validate_app_return_uri(
         app_return_uri, allowlist_csv=cfg["app_return_allowlist"]
     )
-    capability_list = caps.normalize_capabilities(requested_capabilities)
+
+    from shared.google.connection_service import GoogleConnectionService
+
+    existing = await GoogleConnectionService.get_active_connection(user_id)
+    capability_list = caps.resolve_start_capabilities(
+        requested_capabilities,
+        connected=existing is not None,
+        granted_scopes=(existing or {}).get("granted_scopes"),
+    )
     scope_list = caps.scopes_for_capabilities(capability_list)
 
     issued = now or datetime.now(timezone.utc)
@@ -344,3 +355,22 @@ async def _fetch_userinfo(access_token: str) -> dict[str, Any]:
         if resp.status_code >= 400:
             raise RuntimeError(f"Userinfo HTTP {resp.status_code}")
         return resp.json()
+
+
+async def revoke_google_token(token: str) -> None:
+    """Best-effort Google token revocation. Never logs the token.
+
+    Raises on HTTP failure so callers can ignore provider/network errors while
+    still completing local disconnect.
+    """
+    if not (token or "").strip():
+        raise ValueError("token required for revoke")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            GOOGLE_REVOKE_URI,
+            data={"token": token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        # Google returns 200 on success; treat other statuses as failure.
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Google revoke HTTP {resp.status_code}")

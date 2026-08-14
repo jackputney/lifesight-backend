@@ -77,6 +77,212 @@ class CapabilityMappingTests(unittest.TestCase):
         self.assertFalse(flags["gmail_read"])
 
 
+class ProgressiveAuthorizationTests(unittest.TestCase):
+    def test_disconnected_default_remains_identity_and_calendar(self):
+        self.assertEqual(
+            caps.resolve_start_capabilities(None, connected=False),
+            ["google_identity", "calendar"],
+        )
+        self.assertEqual(
+            caps.resolve_start_capabilities([], connected=False),
+            ["google_identity", "calendar"],
+        )
+
+    def test_calendar_connected_add_gmail_send_preserves_calendar(self):
+        granted = caps.scopes_for_capabilities(["google_identity", "calendar"])
+        resolved = caps.resolve_start_capabilities(
+            ["gmail_send"],
+            connected=True,
+            granted_scopes=granted,
+        )
+        self.assertEqual(
+            resolved, ["google_identity", "calendar", "gmail_send"]
+        )
+
+    def test_gmail_send_connected_add_calendar_preserves_gmail_send(self):
+        granted = caps.scopes_for_capabilities(["google_identity", "gmail_send"])
+        resolved = caps.resolve_start_capabilities(
+            ["calendar"],
+            connected=True,
+            granted_scopes=granted,
+        )
+        self.assertEqual(
+            resolved, ["google_identity", "calendar", "gmail_send"]
+        )
+
+    def test_duplicate_capabilities_dedupe(self):
+        granted = caps.scopes_for_capabilities(["google_identity", "calendar"])
+        resolved = caps.resolve_start_capabilities(
+            ["calendar", "calendar", "gmail_send", "gmail_send"],
+            connected=True,
+            granted_scopes=granted,
+        )
+        self.assertEqual(
+            resolved, ["google_identity", "calendar", "gmail_send"]
+        )
+        self.assertEqual(len(resolved), len(set(resolved)))
+
+    def test_still_rejects_arbitrary_scopes_as_capabilities(self):
+        with self.assertRaises(caps.UnknownCapabilityError):
+            caps.resolve_start_capabilities(
+                ["https://www.googleapis.com/auth/drive"],
+                connected=True,
+                granted_scopes=caps.scopes_for_capabilities(["calendar"]),
+            )
+
+
+class ProgressiveStartAuthorizationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._env_ctx = _env()
+        self._env_ctx.start()
+        transactions.use_memory_transactions(True)
+        connection_store.use_memory_connections(True)
+        transactions.clear_memory_transactions()
+        connection_store.clear_memory_connections()
+
+    async def asyncTearDown(self):
+        transactions.use_memory_transactions(False)
+        connection_store.use_memory_connections(False)
+        self._env_ctx.stop()
+
+    async def test_start_unions_existing_calendar_when_requesting_gmail_send(self):
+        await GoogleConnectionService.persist_authorized_connection(
+            user_id=USER_A,
+            google_subject="sub-a",
+            google_email="a@example.com",
+            display_name="A",
+            refresh_token="refresh-a",
+            granted_scopes=caps.scopes_for_capabilities(
+                ["google_identity", "calendar"]
+            ),
+        )
+        started = await oauth.start_authorization(
+            USER_A,
+            app_return_uri=APP_RETURN,
+            requested_capabilities=["gmail_send"],
+        )
+        url = started["authorization_url"]
+        self.assertIn("calendar.events", url)
+        self.assertIn("gmail.send", url)
+        state = next(iter(transactions._MEMORY.keys()))
+        row = transactions._MEMORY[state]
+        self.assertEqual(
+            row["requested_capabilities"],
+            ["google_identity", "calendar", "gmail_send"],
+        )
+
+
+class DisconnectRevokeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._env_ctx = _env()
+        self._env_ctx.start()
+        connection_store.use_memory_connections(True)
+        connection_store.clear_memory_connections()
+
+    async def asyncTearDown(self):
+        connection_store.use_memory_connections(False)
+        self._env_ctx.stop()
+
+    async def test_provider_revoke_success_then_local_disconnect(self):
+        await GoogleConnectionService.persist_authorized_connection(
+            user_id=USER_A,
+            google_subject="sub-a",
+            google_email="a@example.com",
+            display_name="A",
+            refresh_token="refresh-a-secret",
+            granted_scopes=caps.scopes_for_capabilities(None),
+        )
+        with patch.object(
+            oauth, "revoke_google_token", new_callable=AsyncMock
+        ) as rev:
+            ok = await GoogleConnectionService.disconnect(USER_A)
+        self.assertTrue(ok)
+        rev.assert_awaited_once_with("refresh-a-secret")
+        self.assertFalse((await GoogleConnectionService.get_status(USER_A))["connected"])
+        # Token must not leak via status.
+        self.assertNotIn("refresh-a-secret", str(await GoogleConnectionService.get_status(USER_A)))
+
+    async def test_provider_revoke_failure_still_revokes_locally(self):
+        await GoogleConnectionService.persist_authorized_connection(
+            user_id=USER_A,
+            google_subject="sub-a",
+            google_email="a@example.com",
+            display_name="A",
+            refresh_token="refresh-a",
+            granted_scopes=caps.scopes_for_capabilities(None),
+        )
+        with patch.object(
+            oauth,
+            "revoke_google_token",
+            new=AsyncMock(side_effect=RuntimeError("Google revoke HTTP 503")),
+        ):
+            ok = await GoogleConnectionService.disconnect(USER_A)
+        self.assertTrue(ok)
+        self.assertFalse((await GoogleConnectionService.get_status(USER_A))["connected"])
+
+    async def test_disconnect_a_leaves_b_untouched(self):
+        await GoogleConnectionService.persist_authorized_connection(
+            user_id=USER_A,
+            google_subject="sub-a",
+            google_email="a@example.com",
+            display_name="A",
+            refresh_token="refresh-a",
+            granted_scopes=caps.scopes_for_capabilities(None),
+        )
+        await GoogleConnectionService.persist_authorized_connection(
+            user_id=USER_B,
+            google_subject="sub-b",
+            google_email="b@example.com",
+            display_name="B",
+            refresh_token="refresh-b",
+            granted_scopes=caps.scopes_for_capabilities(None),
+        )
+        with patch.object(oauth, "revoke_google_token", new_callable=AsyncMock):
+            await GoogleConnectionService.disconnect(USER_A)
+        self.assertFalse((await GoogleConnectionService.get_status(USER_A))["connected"])
+        self.assertTrue((await GoogleConnectionService.get_status(USER_B))["connected"])
+
+
+class OAuthErrorConsumesTransactionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._env_ctx = _env()
+        self._env_ctx.start()
+        transactions.use_memory_transactions(True)
+        connection_store.use_memory_connections(True)
+        transactions.clear_memory_transactions()
+        connection_store.clear_memory_connections()
+
+    async def asyncTearDown(self):
+        transactions.use_memory_transactions(False)
+        connection_store.use_memory_connections(False)
+        self._env_ctx.stop()
+
+    async def test_error_callback_consumes_state_so_it_cannot_be_reused(self):
+        await oauth.start_authorization(
+            USER_A, app_return_uri=APP_RETURN, requested_capabilities=None
+        )
+        state = next(iter(transactions._MEMORY.keys()))
+        with patch("shared.db.init_pool", new_callable=AsyncMock), patch(
+            "shared.db.close_pool", new_callable=AsyncMock
+        ):
+            from main import app
+
+            with TestClient(app) as client:
+                resp = client.get(
+                    "/integrations/google/callback",
+                    params={"error": "access_denied", "state": state},
+                    follow_redirects=False,
+                )
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("result=error", resp.headers.get("location", ""))
+        row = await transactions.get_transaction(state)
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(row.get("consumed_at"))
+        with self.assertRaises(oauth.OAuthFlowError) as ctx:
+            await oauth.complete_authorization(code="any-code", state=state)
+        self.assertIn("already used", str(ctx.exception).lower())
+
+
 class EncryptionReuseTests(unittest.TestCase):
     def test_fernet_roundtrip_via_token_service(self):
         with _env():
@@ -169,7 +375,8 @@ class IsolationAndOAuthStateTests(unittest.IsolatedAsyncioTestCase):
             refresh_token="refresh-b",
             granted_scopes=caps.scopes_for_capabilities(None),
         )
-        await GoogleConnectionService.disconnect(USER_A)
+        with patch.object(oauth, "revoke_google_token", new_callable=AsyncMock):
+            await GoogleConnectionService.disconnect(USER_A)
         self.assertFalse((await GoogleConnectionService.get_status(USER_A))["connected"])
         self.assertTrue((await GoogleConnectionService.get_status(USER_B))["connected"])
         self.assertEqual(
@@ -353,20 +560,25 @@ class HttpContractTests(unittest.TestCase):
 
     def test_start_rejects_unknown_capability(self):
         with _env():
-            with patch("shared.db.init_pool", new_callable=AsyncMock), patch(
-                "shared.db.close_pool", new_callable=AsyncMock
-            ):
-                from main import app
+            connection_store.use_memory_connections(True)
+            connection_store.clear_memory_connections()
+            try:
+                with patch("shared.db.init_pool", new_callable=AsyncMock), patch(
+                    "shared.db.close_pool", new_callable=AsyncMock
+                ):
+                    from main import app
 
-                with TestClient(app) as client:
-                    resp = client.post(
-                        "/integrations/google/start",
-                        json={
-                            "app_return_uri": APP_RETURN,
-                            "capabilities": ["drive_full"],
-                        },
-                    )
-                    self.assertEqual(resp.status_code, 400)
+                    with TestClient(app) as client:
+                        resp = client.post(
+                            "/integrations/google/start",
+                            json={
+                                "app_return_uri": APP_RETURN,
+                                "capabilities": ["drive_full"],
+                            },
+                        )
+                        self.assertEqual(resp.status_code, 400)
+            finally:
+                connection_store.use_memory_connections(False)
 
 
 class FailureStateTests(unittest.TestCase):

@@ -91,11 +91,17 @@ async def google_callback(
     app_return: str | None = None
     try:
         if error:
-            # Best-effort: if state present, recover app_return for redirect.
+            # Consume/invalidate the transaction so denial cannot be redeemed
+            # later; still recover allowlisted app_return_uri for redirect.
             if state:
-                from shared.google.transactions import get_transaction
+                from shared.google.transactions import (
+                    consume_transaction,
+                    get_transaction,
+                )
 
-                row = await get_transaction(state)
+                row = await consume_transaction(state)
+                if row is None:
+                    row = await get_transaction(state)
                 if row:
                     app_return = row.get("app_return_uri")
             if app_return:
@@ -145,5 +151,5 @@ async def google_callback(
 
 @router.post("/disconnect", response_model=GoogleDisconnectResponse)
 async def google_disconnect(user_id: str = Depends(get_current_user_id)):
-    revoked = await GoogleConnectionService.disconnect(user_id)
-    return GoogleDisconnectResponse(disconnected=bool(revoked) or True)
+    await GoogleConnectionService.disconnect(user_id)
+    return GoogleDisconnectResponse(disconnected=True)
