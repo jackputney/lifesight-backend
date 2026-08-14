@@ -47,9 +47,14 @@ from routers.auth import router as auth_router
 from routers.author_persistence import router as author_persistence_router
 from routers.conversations import router as conversations_router
 from routers.daily_checkin import router as daily_checkin_router
+from routers.integrations_google import router as integrations_google_router
 from routers.profile import router as profile_router
 from routers.v2 import router as v2_router
 from routers.voice import router as voice_router
+from shared.mail_calendar.tools import (
+    execute_mail_calendar_action,
+    run_list_calendar_events,
+)
 from shared import db
 from shared.auth import assert_auth_mode_allowed, cors_allow_origins, get_current_user_id
 from shared.client_actions import (
@@ -151,6 +156,7 @@ app.include_router(conversations_router)
 app.include_router(v2_router)
 app.include_router(author_persistence_router)
 app.include_router(voice_router)
+app.include_router(integrations_google_router)
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
@@ -375,6 +381,23 @@ async def _run_tool(
         result_text = await apply_checkin_tool_update(
             user_id, tool_input, conversation_id=conversation_id
         )
+        return result_text, None, None, []
+
+    if name == "list_calendar_events":
+        if mode != "mail_calendar":
+            return (
+                "Error: list_calendar_events is only available in mail_calendar mode.",
+                None,
+                None,
+                [],
+            )
+        try:
+            result_text = await run_list_calendar_events(user_id, tool_input)
+        except Exception:
+            result_text = (
+                "Error [provider_unavailable]: Google Calendar is temporarily "
+                "unavailable. Try again shortly."
+            )
         return result_text, None, None, []
 
     return f"Error: unknown tool '{name}'.", None, None, []
@@ -846,6 +869,19 @@ async def confirm(req: ConfirmRequest, user_id: str = Depends(get_current_user_i
 
     if action["action_type"] == "delete_scene":
         result = await _execute_delete_scene(action)
+        return ConfirmResponse(result=result)
+
+    if action["action_type"] in (
+        "create_calendar_event",
+        "update_calendar_event",
+        "delete_calendar_event",
+        "send_email",
+    ):
+        result = await execute_mail_calendar_action(
+            action["action_type"],
+            str(action["user_id"]),
+            action.get("payload") or {},
+        )
         return ConfirmResponse(result=result)
 
     # generic / unknown action_types resolve the pending state only.

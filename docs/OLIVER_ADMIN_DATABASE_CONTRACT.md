@@ -159,6 +159,14 @@ LifeSight seed script `scripts/seed_user_profile.py` already writes this table.
 | `daily_checkins` | Dated mood/recovery state (`013`) — **not** permanent profile |
 | `auth_sessions` | Refresh sessions — revoke on disable |
 | `conversations` / `messages` | Chat history |
+| `google_connections` | Per-user Google link metadata (`015`) — email, scopes, timestamps, `revoked_at` |
+
+### Google connections (`015`)
+
+Oliver may inspect connection **metadata** only (`google_email`, `google_subject`,
+`granted_scopes`, `created_at` / `updated_at` / `revoked_at` / `last_refresh_at`).
+Oliver must **never** decrypt or require `encrypted_refresh_token`. Do not treat
+email as the security identity — `google_subject` is the account anchor.
 
 ### Personal-context profile fields (`013`)
 
@@ -186,6 +194,7 @@ One row per `(user_id, local_date)`. Status: `not_started` | `in_progress` | `co
 - Do not expect LifeSight `/admin/*` endpoints — there are none for this.
 - Do not put shared epistemic/feasibility policy into overrides; those are owned by `shared/epistemic.py`.
 - Do not use `is_active = false` alone without revoking sessions if you need immediate logout (runtime JWT check also blocks, but revocation is still best practice).
+- Do not decrypt Google refresh tokens; metadata-only for `google_connections`.
 
 ---
 

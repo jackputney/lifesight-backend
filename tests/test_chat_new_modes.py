@@ -57,8 +57,10 @@ class ChatNewModesTests(unittest.TestCase):
         )
         headers = {"Authorization": "Bearer test"}
         prev = os.environ.get("ANTHROPIC_API_KEY")
+        prev_auth = os.environ.get("AUTH_MODE")
         # Placeholder only — never a real credential (detect-secrets).
         os.environ["ANTHROPIC_API_KEY"] = "unittest-placeholder"  # pragma: allowlist secret
+        os.environ["AUTH_MODE"] = "dev"
         try:
             with TestClient(app) as client:
                 for mode in ("brainstorm", "mail_calendar"):
@@ -83,6 +85,10 @@ class ChatNewModesTests(unittest.TestCase):
                 os.environ.pop("ANTHROPIC_API_KEY", None)
             else:
                 os.environ["ANTHROPIC_API_KEY"] = prev
+            if prev_auth is None:
+                os.environ.pop("AUTH_MODE", None)
+            else:
+                os.environ["AUTH_MODE"] = prev_auth
 
     @patch("shared.db.init_pool", new_callable=AsyncMock)
     @patch("shared.db.close_pool", new_callable=AsyncMock)
@@ -91,18 +97,26 @@ class ChatNewModesTests(unittest.TestCase):
         _close: AsyncMock,
         _init: AsyncMock,
     ) -> None:
-        with TestClient(app) as client:
-            resp = client.post(
-                "/chat",
-                json={
-                    "transcript": "Hello.",
-                    "mode": "health",
-                    "conversation_id": None,
-                },
-                headers={"Authorization": "Bearer test"},
-            )
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("Unsupported mode", resp.json()["detail"])
+        prev_auth = os.environ.get("AUTH_MODE")
+        os.environ["AUTH_MODE"] = "dev"
+        try:
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/chat",
+                    json={
+                        "transcript": "Hello.",
+                        "mode": "health",
+                        "conversation_id": None,
+                    },
+                    headers={"Authorization": "Bearer test"},
+                )
+            self.assertEqual(resp.status_code, 400)
+            self.assertIn("Unsupported mode", resp.json()["detail"])
+        finally:
+            if prev_auth is None:
+                os.environ.pop("AUTH_MODE", None)
+            else:
+                os.environ["AUTH_MODE"] = prev_auth
 
 
 if __name__ == "__main__":

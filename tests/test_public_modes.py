@@ -35,7 +35,11 @@ class PublicModesTests(unittest.TestCase):
         )
         self.assertEqual(
             [t["name"] for t in MODE_TOOLS.get("mail_calendar") or []],
-            ["update_personal_context"],
+            [
+                "list_calendar_events",
+                "create_pending_action",
+                "update_personal_context",
+            ],
         )
 
     def test_jarvis_remains_registered_but_not_public(self) -> None:

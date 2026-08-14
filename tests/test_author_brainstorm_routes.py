@@ -9,6 +9,7 @@ Caller search before rename (both repos):
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -77,17 +78,18 @@ class AuthorBrainstormRouteTests(unittest.TestCase):
         _init: AsyncMock,
     ) -> None:
         headers = {"Authorization": "Bearer test"}
-        with TestClient(app) as client:
-            canonical = client.post(
-                "/author/brainstorm-session",
-                json=REQUEST_BODY,
-                headers=headers,
-            )
-            compat = client.post(
-                "/author/brainstorm",
-                json=REQUEST_BODY,
-                headers=headers,
-            )
+        with patch.dict(os.environ, {"AUTH_MODE": "dev"}, clear=False):
+            with TestClient(app) as client:
+                canonical = client.post(
+                    "/author/brainstorm-session",
+                    json=REQUEST_BODY,
+                    headers=headers,
+                )
+                compat = client.post(
+                    "/author/brainstorm",
+                    json=REQUEST_BODY,
+                    headers=headers,
+                )
 
         self.assertEqual(canonical.status_code, 200, canonical.text)
         self.assertEqual(compat.status_code, 200, compat.text)

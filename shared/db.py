@@ -1796,3 +1796,180 @@ async def update_daily_checkin_fields(
     )
     return dict(row) if row else None
 
+
+
+# ---------------------------------------------------------------------------
+# Google connections + OAuth transactions (015)
+# Ownership is always the authenticated user_id argument — never client body.
+# ---------------------------------------------------------------------------
+
+async def create_google_oauth_transaction(
+    *,
+    state: str,
+    user_id: str,
+    code_verifier_enc: str,
+    app_return_uri: str,
+    requested_capabilities: list[str],
+    expires_at: datetime,
+) -> None:
+    await pool().execute(
+        """
+        INSERT INTO google_oauth_transactions (
+            state, user_id, code_verifier_enc, app_return_uri,
+            requested_capabilities, expires_at
+        )
+        VALUES ($1, $2::uuid, $3, $4, $5, $6)
+        """,
+        state,
+        user_id,
+        code_verifier_enc,
+        app_return_uri,
+        requested_capabilities,
+        expires_at,
+    )
+
+
+async def get_google_oauth_transaction(state: str) -> Optional[dict]:
+    row = await pool().fetchrow(
+        "SELECT * FROM google_oauth_transactions WHERE state = $1",
+        state,
+    )
+    return dict(row) if row else None
+
+
+async def consume_google_oauth_transaction(state: str) -> Optional[dict]:
+    """Single-use consume if unexpired and not yet consumed."""
+    row = await pool().fetchrow(
+        """
+        UPDATE google_oauth_transactions
+        SET consumed_at = now()
+        WHERE state = $1
+          AND consumed_at IS NULL
+          AND expires_at > now()
+        RETURNING *
+        """,
+        state,
+    )
+    return dict(row) if row else None
+
+
+async def get_active_google_connection(user_id: str) -> Optional[dict]:
+    row = await pool().fetchrow(
+        """
+        SELECT *
+        FROM google_connections
+        WHERE user_id = $1::uuid AND revoked_at IS NULL
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        user_id,
+    )
+    return dict(row) if row else None
+
+
+async def get_google_connection_for_user(
+    connection_id: str, user_id: str
+) -> Optional[dict]:
+    row = await pool().fetchrow(
+        """
+        SELECT *
+        FROM google_connections
+        WHERE id = $1::uuid AND user_id = $2::uuid
+        """,
+        connection_id,
+        user_id,
+    )
+    return dict(row) if row else None
+
+
+async def upsert_active_google_connection(
+    *,
+    user_id: str,
+    google_subject: str,
+    google_email: Optional[str],
+    display_name: Optional[str],
+    encrypted_refresh_token: str,
+    granted_scopes: list[str],
+) -> dict:
+    """Revoke any other active connection for this user, then upsert by subject."""
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE google_connections
+                SET revoked_at = now(), updated_at = now()
+                WHERE user_id = $1::uuid
+                  AND revoked_at IS NULL
+                  AND google_subject IS DISTINCT FROM $2
+                """,
+                user_id,
+                google_subject,
+            )
+            row = await conn.fetchrow(
+                """
+                INSERT INTO google_connections (
+                    user_id, google_subject, google_email, display_name,
+                    encrypted_refresh_token, granted_scopes, last_refresh_at
+                )
+                VALUES ($1::uuid, $2, $3, $4, $5, $6, now())
+                ON CONFLICT (user_id, google_subject) DO UPDATE
+                SET google_email = EXCLUDED.google_email,
+                    display_name = EXCLUDED.display_name,
+                    encrypted_refresh_token = EXCLUDED.encrypted_refresh_token,
+                    granted_scopes = EXCLUDED.granted_scopes,
+                    revoked_at = NULL,
+                    updated_at = now(),
+                    last_refresh_at = now()
+                RETURNING *
+                """,
+                user_id,
+                google_subject,
+                google_email,
+                display_name,
+                encrypted_refresh_token,
+                granted_scopes,
+            )
+    return dict(row)
+
+
+async def revoke_active_google_connection(user_id: str) -> bool:
+    result = await pool().execute(
+        """
+        UPDATE google_connections
+        SET revoked_at = now(), updated_at = now()
+        WHERE user_id = $1::uuid AND revoked_at IS NULL
+        """,
+        user_id,
+    )
+    # asyncpg returns e.g. "UPDATE 1"
+    try:
+        return int(str(result).split()[-1]) > 0
+    except (ValueError, IndexError):
+        return False
+
+
+async def touch_google_connection_refresh(connection_id: str, user_id: str) -> None:
+    await pool().execute(
+        """
+        UPDATE google_connections
+        SET last_refresh_at = now(), updated_at = now()
+        WHERE id = $1::uuid AND user_id = $2::uuid AND revoked_at IS NULL
+        """,
+        connection_id,
+        user_id,
+    )
+
+
+async def update_google_connection_refresh_token(
+    connection_id: str, user_id: str, encrypted_refresh_token: str
+) -> None:
+    await pool().execute(
+        """
+        UPDATE google_connections
+        SET encrypted_refresh_token = $3, updated_at = now()
+        WHERE id = $1::uuid AND user_id = $2::uuid AND revoked_at IS NULL
+        """,
+        connection_id,
+        user_id,
+        encrypted_refresh_token,
+    )
