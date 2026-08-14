@@ -35,7 +35,7 @@ class ChatNewModesTests(unittest.TestCase):
     @patch(
         "main._run_model_turn",
         new_callable=AsyncMock,
-        return_value=("Shell reply.", None, None),
+        return_value=("Shell reply.", None, None, []),
     )
     def test_chat_accepts_brainstorm_and_mail_calendar(
         self,

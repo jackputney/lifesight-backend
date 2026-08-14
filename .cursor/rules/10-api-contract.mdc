@@ -51,24 +51,31 @@ Response:
 `pending_action.description` is READ ALOUD — a natural spoken sentence.
 `visual_panel` is optional/nullable (`{type, data} | null`).
 `research` is optional/nullable and **separate from** `visual_panel`.
-`client_actions` is always an array (never null). V1 items are
-`{ "type": "navigate", "target": "<allowlist>" }` only. Ordinary turns return
-`[]`. Navigation is client-local — **not** Confirm Gate. Spoken field remains
-`reply` (not `assistant_text`). Older clients that ignore unknown fields remain
-compatible.
+`client_actions` is always an array (never null). Items are one of:
+`{ "type": "navigate", "target": "<allowlist>" }`,
+`{ "type": "open_conversation", "conversation_id": "<uuid>" }`,
+`{ "type": "refresh_profile" }` (no payload — client should GET /profile).
+Ordinary turns return `[]`. Navigation and profile refresh are client-local —
+**not** Confirm Gate. Spoken field remains `reply`.
 
-### `client_actions` (V1 — navigate + open_conversation)
+### `client_actions` (V1 — navigate + open_conversation + refresh_profile)
 Navigate allowlisted `target` values (closed set):
 `home` | `fitness` | `diet` | `author` | `brainstorm` | `mail_calendar` | `settings`
 
 Also: `{ "type": "open_conversation", "conversation_id": "<uuid>" }` when a
 history reopen command uniquely resolves. Ambiguous → clarify + `[]`.
 
+Also: `{ "type": "refresh_profile" }` when chat successfully wrote personal-context
+profile fields via `update_personal_context` — client re-fetches GET /profile.
+
 Never emit `jarvis` or `health`. Deterministic whole-utterance commands
 (`open` / `go to` / `take me to` / …) are handled before mode Claude.
 
+`mode` may also be `"checkin"` for the Home daily-check-in workflow (hidden from
+`GET /modes`). See `docs/USER_CONTEXT_HISTORY_V1_CONTRACT.md`.
+
 See `docs/USER_CONTEXT_HISTORY_V1_CONTRACT.md` for `/profile`, history APIs,
-and Fitness `visual_panel.type == "exercise"`.
+daily check-in, and Fitness `visual_panel.type == "exercise"`.
 
 Example navigate turn:
 ```json

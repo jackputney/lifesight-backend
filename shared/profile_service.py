@@ -53,6 +53,11 @@ def row_to_profile(row: dict, *, display_name: Optional[str], user_id: str) -> P
         sex_for_physiological_calculations=row.get(
             "sex_for_physiological_calculations"
         ),
+        occupation=row.get("occupation"),
+        industry=row.get("industry"),
+        education_context=row.get("education_context"),
+        interests=_list("interests"),
+        typical_schedule=row.get("typical_schedule"),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
     )

@@ -101,6 +101,11 @@ class ProfilePatch(BaseModel):
         default=None, ge=MIN_SESSION_MINUTES, le=MAX_SESSION_MINUTES
     )
     sex_for_physiological_calculations: Optional[SexForPhysiologicalCalculations] = None
+    occupation: Optional[str] = Field(default=None, max_length=MAX_SHORT_TEXT)
+    industry: Optional[str] = Field(default=None, max_length=MAX_SHORT_TEXT)
+    education_context: Optional[str] = Field(default=None, max_length=240)
+    interests: Optional[list[str]] = None
+    typical_schedule: Optional[str] = Field(default=None, max_length=500)
 
     @field_validator("timezone")
     @classmethod
@@ -148,6 +153,21 @@ class ProfilePatch(BaseModel):
             return None
         return _normalize_str_list(value, field="allergies_restrictions")
 
+    @field_validator("interests")
+    @classmethod
+    def _interests(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        if value is None:
+            return None
+        return _normalize_str_list(value, field="interests", max_items=MAX_ARRAY_ITEMS)
+
+    @field_validator("occupation", "industry", "education_context", "typical_schedule")
+    @classmethod
+    def _trim_optional(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
     def as_update_dict(self) -> dict[str, Any]:
         return self.model_dump(exclude_unset=True)
 
@@ -181,6 +201,11 @@ class ProfileOut(BaseModel):
     training_environment: Optional[TrainingEnvironment] = None
     typical_session_minutes: Optional[int] = None
     sex_for_physiological_calculations: Optional[SexForPhysiologicalCalculations] = None
+    occupation: Optional[str] = None
+    industry: Optional[str] = None
+    education_context: Optional[str] = None
+    interests: list[str] = Field(default_factory=list)
+    typical_schedule: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -212,6 +237,10 @@ def compact_profile_for_context(profile: ProfileOut) -> str:
         ("typical_session_minutes", profile.typical_session_minutes),
         ("nutrition_goal", profile.nutrition_goal),
         ("injuries_limitations", profile.injuries_limitations),
+        ("occupation", profile.occupation),
+        ("industry", profile.industry),
+        ("education_context", profile.education_context),
+        ("typical_schedule", profile.typical_schedule),
     ]
     for key, value in mapping:
         if value is not None and value != "":
@@ -227,6 +256,8 @@ def compact_profile_for_context(profile: ProfileOut) -> str:
         lines.append(
             f"- allergies_restrictions: {', '.join(profile.allergies_restrictions)}"
         )
+    if profile.interests:
+        lines.append(f"- interests: {', '.join(profile.interests)}")
     sex = profile.sex_for_physiological_calculations
     if sex in ("male", "female"):
         lines.append(

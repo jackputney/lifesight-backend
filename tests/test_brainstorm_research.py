@@ -381,7 +381,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
     @patch(
         "main._run_model_turn",
         new_callable=AsyncMock,
-        return_value=("Just brainstorming with you.", None, None),
+        return_value=("Just brainstorming with you.", None, None, []),
     )
     def test_ordinary_brainstorm_returns_research_null(
         self,
@@ -555,7 +555,7 @@ class BrainstormChatResearchTests(unittest.TestCase):
     @patch(
         "main._run_model_turn",
         new_callable=AsyncMock,
-        return_value=("Fitness reply.", None, None),
+        return_value=("Fitness reply.", None, None, []),
     )
     def test_other_modes_unchanged_no_research(
         self,
