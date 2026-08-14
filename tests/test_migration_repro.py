@@ -38,6 +38,8 @@ EXPECTED_TABLES = (
     "conversation_turn_metrics",
     "daily_checkins",
     "user_prompt_overrides",
+    "google_connections",
+    "google_oauth_transactions",
 )
 
 # Looked up by (table, column, ref_table, ref_column); name is diagnostic only.
@@ -73,6 +75,20 @@ EXPECTED_FOREIGN_KEYS = (
     (
         "user_prompt_overrides_user_id_fkey",
         "user_prompt_overrides",
+        "user_id",
+        "users",
+        "id",
+    ),
+    (
+        "google_connections_user_id_fkey",
+        "google_connections",
+        "user_id",
+        "users",
+        "id",
+    ),
+    (
+        "google_oauth_transactions_user_id_fkey",
+        "google_oauth_transactions",
         "user_id",
         "users",
         "id",

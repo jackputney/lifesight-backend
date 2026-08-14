@@ -289,8 +289,9 @@ class FeasibilityCalibrationTests(unittest.TestCase):
 class ModeSpecificSteeringTests(unittest.TestCase):
     def test_author_allows_fiction_with_reality_boundary(self):
         text = author_prompt.SYSTEM_PROMPT.lower()
-        self.assertIn("creative fiction is encouraged", text)
-        self.assertIn("fiction/reality boundary", text)
+        self.assertIn("write fiction normally", text)
+        self.assertIn("fiction / reality boundary", text)
+        self.assertIn("shared epistemic grounding applies", text)
         self.assertIn(EPISTEMIC_GROUNDING.lower().splitlines()[0], text)
 
     def test_brainstorm_labels_speculation_and_ranks_plausibility(self):
@@ -316,7 +317,7 @@ class ModeSpecificSteeringTests(unittest.TestCase):
 
     def test_mail_calendar_no_invented_connected_data(self):
         text = mail_calendar_prompt.INSTRUCTIONS.lower()
-        self.assertIn("never invent inbox contents", text)
+        self.assertIn("never invent", text)
         self.assertIn("absence of retrieved information", text)
         self.assertIn("hidden message", text)
 
@@ -340,15 +341,15 @@ class RegressionSmokeTests(unittest.TestCase):
         self.assertIn("create_pending_action", names)
         self.assertIn("update_personal_context", names)
 
-    def test_brainstorm_and_mail_expose_personal_context_only(self):
+    def test_brainstorm_and_mail_tools(self):
         self.assertEqual(
             [t["name"] for t in MODE_TOOLS["brainstorm"]],
             ["update_personal_context"],
         )
-        self.assertEqual(
-            [t["name"] for t in MODE_TOOLS["mail_calendar"]],
-            ["update_personal_context"],
-        )
+        mail_names = [t["name"] for t in MODE_TOOLS["mail_calendar"]]
+        self.assertIn("list_calendar_events", mail_names)
+        self.assertIn("create_pending_action", mail_names)
+        self.assertIn("update_personal_context", mail_names)
 
     def test_navigate_client_action_still_works(self):
         from shared.client_actions import parse_navigate_command
