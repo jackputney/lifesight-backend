@@ -710,11 +710,15 @@ async def wearables_terra_webhook(
     """Normalize Terra metrics into health_samples (provider='terra').
 
     Terra has no stable per-sample id, so ingest synthesizes a deterministic
-    one (see shared/health/service.terra_external_id) and a replayed webhook
-    upserts instead of duplicating: `written` is 0 on replay. Terra metrics
-    outside the closed sample_type allowlist are dropped and counted in
-    `ignored` rather than inventing a type. Legacy health_metrics is no longer
-    written (migration 016 deprecates it).
+    one from metric_type + recorded_at + source + value (see
+    shared/health/service.terra_external_id); a replayed webhook therefore
+    upserts instead of duplicating and `written` is 0 on replay. That holds
+    only for metrics Terra timestamps, so a metric with no parseable
+    recorded_at is dropped and counted in `ignored` rather than stamped with
+    now() — which would both fabricate a reading time and break the replay
+    guarantee. Metrics outside the closed sample_type allowlist, and metrics
+    with no numeric value, are dropped and counted the same way. Legacy
+    health_metrics is no longer written (migration 016 deprecates it).
     """
     body_bytes = await request.body()
     if not terra.verify_webhook_signature(body_bytes, terra_signature):

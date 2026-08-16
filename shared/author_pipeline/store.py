@@ -6,7 +6,11 @@ Request bodies never supply ownership fields.
 Immutability: there is intentionally NO update or delete statement against
 author_captures anywhere in this module. Captures are inserted and read only —
 refinement inserts author_draft_versions rows instead. Migration 017 backs this
-with a trigger that raises on UPDATE or DELETE of author_captures.
+with a trigger that raises on any direct UPDATE or DELETE of author_captures.
+
+Every id that reaches SQL passes normalized_uuid() first, so a malformed path
+parameter returns the ordinary "not found" answer instead of raising DataError
+out of a `$1::uuid` bind.
 """
 from __future__ import annotations
 
@@ -16,10 +20,21 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import asyncpg
+
 from shared import db
 
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 100
+
+# One dictation chunk. Generous for a long spoken paragraph, small enough that no
+# single request can bloat the table or the refine prompt on its own.
+MAX_CAPTURE_CHARS = 20_000
+
+# Concurrent appends in separate transactions can read the same MAX(sequence)
+# under READ COMMITTED and one loses the UNIQUE (session_id, sequence) race.
+# Losing that race is expected, not exceptional: re-read and retry.
+CAPTURE_SEQUENCE_ATTEMPTS = 5
 
 SESSION_STATUSES = ("active", "ended")
 CAPTURE_SOURCES = ("voice", "typed")
@@ -50,6 +65,29 @@ DECISION_STATUS = {
     "edit": "edited",
     "defer": "deferred",
 }
+
+
+class CaptureSequenceContention(Exception):
+    """Every sequence-allocation attempt lost the UNIQUE (session_id, sequence) race."""
+
+
+def normalized_uuid(value: Any) -> Optional[str]:
+    """Canonical UUID string, or None when the value is not a UUID at all.
+
+    Path parameters arrive as arbitrary strings. Without this guard a malformed
+    id reaches a `$1::uuid` bind, asyncpg raises DataError, and the request 500s
+    instead of taking the ordinary 404 path. Deliberately duplicated in
+    shared/author_persistence/store.py rather than shared between the two author
+    surfaces, which otherwise import nothing from each other.
+    """
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
 
 
 def clamp_pagination(limit: Optional[int], offset: Optional[int]) -> tuple[int, int]:
@@ -158,6 +196,10 @@ class _MemoryStore:
     draft_versions: dict[str, dict] = field(default_factory=dict)
     flags: dict[str, dict] = field(default_factory=dict)
     flag_decisions: dict[str, dict] = field(default_factory=dict)
+    # Read-only stand-ins for the conversations / manuscripts tables, so the
+    # soft-reference ownership check below is exercisable without Postgres.
+    conversations: dict[str, dict] = field(default_factory=dict)
+    manuscripts: dict[str, dict] = field(default_factory=dict)
 
 
 _memory: Optional[_MemoryStore] = None
@@ -176,6 +218,67 @@ def _mem() -> Optional[_MemoryStore]:
     return _memory
 
 
+def _require_memory() -> _MemoryStore:
+    store = _mem()
+    if store is None:
+        raise RuntimeError("memory-store helper called while Postgres store is active")
+    return store
+
+
+def memory_seed_conversation(user_id: str, conversation_id: Optional[str] = None) -> str:
+    """Memory-store only: register a conversation owned by `user_id`."""
+    store = _require_memory()
+    cid = conversation_id or str(uuid.uuid4())
+    store.conversations[cid] = {"id": cid, "user_id": user_id}
+    return cid
+
+
+def memory_seed_manuscript(user_id: str, manuscript_id: Optional[str] = None) -> str:
+    """Memory-store only: register a manuscript owned by `user_id`."""
+    store = _require_memory()
+    mid = manuscript_id or str(uuid.uuid4())
+    store.manuscripts[mid] = {"id": mid, "user_id": user_id}
+    return mid
+
+
+# ---------------------------------------------------------------------------
+# Soft references — validated at session creation, never FK-enforced
+# ---------------------------------------------------------------------------
+
+async def conversation_is_owned(conversation_id: str, user_id: str) -> bool:
+    """True when the conversation exists and belongs to `user_id`."""
+    canonical = normalized_uuid(conversation_id)
+    if canonical is None:
+        return False
+
+    if _mem() is not None:
+        row = _mem().conversations.get(canonical)
+        return row is not None and row["user_id"] == user_id
+
+    found = await db.pool().fetchval(
+        "SELECT 1 FROM conversations WHERE id = $1::uuid AND user_id = $2::uuid",
+        canonical, user_id,
+    )
+    return found is not None
+
+
+async def manuscript_is_owned(manuscript_id: str, user_id: str) -> bool:
+    """True when the manuscript exists and belongs to `user_id`."""
+    canonical = normalized_uuid(manuscript_id)
+    if canonical is None:
+        return False
+
+    if _mem() is not None:
+        row = _mem().manuscripts.get(canonical)
+        return row is not None and row["user_id"] == user_id
+
+    found = await db.pool().fetchval(
+        "SELECT 1 FROM manuscripts WHERE id = $1::uuid AND user_id = $2::uuid",
+        canonical, user_id,
+    )
+    return found is not None
+
+
 # ---------------------------------------------------------------------------
 # Sessions
 # ---------------------------------------------------------------------------
@@ -190,6 +293,8 @@ async def create_session(
     clean_title = title.strip() if isinstance(title, str) else None
     if clean_title == "":
         clean_title = None
+    conversation_id = None if conversation_id is None else normalized_uuid(conversation_id)
+    manuscript_id = None if manuscript_id is None else normalized_uuid(manuscript_id)
 
     if _mem() is not None:
         row = {
@@ -218,6 +323,10 @@ async def create_session(
 
 
 async def get_session(session_id: str, user_id: str) -> Optional[dict]:
+    session_id = normalized_uuid(session_id)
+    if session_id is None:
+        return None
+
     if _mem() is not None:
         row = _mem().sessions.get(session_id)
         if row is None or row["user_id"] != user_id:
@@ -267,6 +376,10 @@ async def list_sessions(
 
 async def end_session(session_id: str, user_id: str) -> Optional[dict]:
     """Mark the session ended. Idempotent; keeps the original ended_at."""
+    session_id = normalized_uuid(session_id)
+    if session_id is None:
+        return None
+
     if _mem() is not None:
         row = _mem().sessions.get(session_id)
         if row is None or row["user_id"] != user_id:
@@ -301,9 +414,14 @@ async def append_capture(
     source: str,
     raw_text: str,
 ) -> Optional[dict]:
-    """Append raw dictation with the next sequence. None if session not owned."""
-    if await get_session(session_id, user_id) is None:
+    """Append raw dictation with the next sequence. None if session not owned.
+
+    Raises CaptureSequenceContention if every attempt loses the sequence race.
+    """
+    session = await get_session(session_id, user_id)
+    if session is None:
         return None
+    session_id = str(session["id"])
 
     if _mem() is not None:
         existing = [
@@ -323,19 +441,32 @@ async def append_capture(
         _mem().captures[row["id"]] = row
         return deepcopy(row)
 
-    # Single statement so concurrent voice chunks cannot collide on sequence;
-    # the UNIQUE (session_id, sequence) index is the final arbiter.
-    row = await db.pool().fetchrow(
-        """
-        INSERT INTO author_captures (session_id, user_id, sequence, source, raw_text)
-        SELECT $1::uuid, $2::uuid, COALESCE(MAX(sequence) + 1, 0), $3::text, $4::text
-        FROM author_captures WHERE session_id = $1::uuid
-        RETURNING id, session_id, user_id, sequence, source, raw_text,
-                  captured_at, created_at
-        """,
-        session_id, user_id, source, raw_text,
+    # One statement reads MAX(sequence) and inserts, but that is NOT collision
+    # proof: under READ COMMITTED two concurrent appends in separate
+    # transactions read the same MAX and the loser hits
+    # UNIQUE (session_id, sequence). The index is the arbiter and this loop is
+    # the recovery — each retry re-reads MAX and takes the next free sequence,
+    # so a voice client streaming chunks in parallel still gets gap-free
+    # sequences instead of a 500.
+    for _attempt in range(CAPTURE_SEQUENCE_ATTEMPTS):
+        try:
+            row = await db.pool().fetchrow(
+                """
+                INSERT INTO author_captures (session_id, user_id, sequence, source, raw_text)
+                SELECT $1::uuid, $2::uuid, COALESCE(MAX(sequence) + 1, 0), $3::text, $4::text
+                FROM author_captures WHERE session_id = $1::uuid
+                RETURNING id, session_id, user_id, sequence, source, raw_text,
+                          captured_at, created_at
+                """,
+                session_id, user_id, source, raw_text,
+            )
+        except asyncpg.UniqueViolationError:
+            continue
+        return dict(row) if row else None
+
+    raise CaptureSequenceContention(
+        f"sequence allocation lost {CAPTURE_SEQUENCE_ATTEMPTS} consecutive races"
     )
-    return dict(row) if row else None
 
 
 async def list_captures(
@@ -345,8 +476,10 @@ async def list_captures(
     offset: int = 0,
 ) -> Optional[tuple[list[dict], int]]:
     """Paginated provenance view. None if the session is not owned."""
-    if await get_session(session_id, user_id) is None:
+    session = await get_session(session_id, user_id)
+    if session is None:
         return None
+    session_id = str(session["id"])
     limit, offset = clamp_pagination(limit, offset)
 
     if _mem() is not None:
@@ -380,6 +513,10 @@ async def list_captures(
 
 async def all_captures(session_id: str, user_id: str) -> list[dict]:
     """Every capture in sequence order (session ownership checked by caller)."""
+    session_id = normalized_uuid(session_id)
+    if session_id is None:
+        return []
+
     if _mem() is not None:
         rows = [
             deepcopy(c) for c in _mem().captures.values()
@@ -408,6 +545,10 @@ async def captures_in_range(
     sequence_to: int,
 ) -> list[dict]:
     """Captures with sequence in [sequence_from, sequence_to], inclusive."""
+    session_id = normalized_uuid(session_id)
+    if session_id is None:
+        return []
+
     if _mem() is not None:
         rows = [
             deepcopy(c) for c in _mem().captures.values()
@@ -438,6 +579,10 @@ async def captures_in_range(
 
 async def list_draft_versions(session_id: str, user_id: str) -> list[dict]:
     """Newest version first (session ownership checked by caller)."""
+    session_id = normalized_uuid(session_id)
+    if session_id is None:
+        return []
+
     if _mem() is not None:
         rows = [
             deepcopy(v) for v in _mem().draft_versions.values()
@@ -461,6 +606,10 @@ async def list_draft_versions(session_id: str, user_id: str) -> list[dict]:
 
 
 async def get_draft_version(version_id: str, user_id: str) -> Optional[dict]:
+    version_id = normalized_uuid(version_id)
+    if version_id is None:
+        return None
+
     if _mem() is not None:
         row = _mem().draft_versions.get(version_id)
         if row is None or row["user_id"] != user_id:
@@ -620,6 +769,10 @@ async def list_flags(
     *,
     status: Optional[str] = None,
 ) -> list[dict]:
+    session_id = normalized_uuid(session_id)
+    if session_id is None:
+        return []
+
     if _mem() is not None:
         rows = [
             deepcopy(f) for f in _mem().flags.values()
@@ -658,6 +811,10 @@ async def list_flags(
 
 
 async def get_flag(flag_id: str, user_id: str) -> Optional[dict]:
+    flag_id = normalized_uuid(flag_id)
+    if flag_id is None:
+        return None
+
     if _mem() is not None:
         row = _mem().flags.get(flag_id)
         if row is None or row["user_id"] != user_id:

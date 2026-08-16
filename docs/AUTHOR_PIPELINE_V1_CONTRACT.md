@@ -68,17 +68,38 @@ new `author_draft_versions` rows and never write back to a capture.
 ```sql
 CREATE TRIGGER author_captures_no_update_delete
     BEFORE UPDATE OR DELETE ON author_captures
-    FOR EACH ROW EXECUTE FUNCTION author_captures_reject_mutation();
+    FOR EACH ROW
+    WHEN (pg_trigger_depth() = 0)
+    EXECUTE FUNCTION author_captures_reject_mutation();
 ```
 
 `author_captures_reject_mutation()` raises with SQLSTATE `restrict_violation`,
-so any statement that touches an existing capture aborts even if it bypasses
-the API.
+so any **direct** statement that touches an existing capture aborts even if it
+bypasses the API.
 
-Consequence, accepted deliberately: the raise also fires for cascaded deletes,
-so removing a user or a session that owns captures needs an explicit maintenance
-transaction that disables the trigger first. No HTTP route in this PR deletes a
-user, a session, or a capture.
+`WHEN (pg_trigger_depth() = 0)` scopes the guard to statements a client or an
+operator issues directly. Ownership cascades run their `DELETE` on
+`author_captures` from inside the referential-integrity trigger, at depth `>= 1`,
+so they pass:
+
+| Statement | Result |
+|-----------|--------|
+| `UPDATE author_captures SET raw_text = …` | raises `restrict_violation` |
+| `DELETE FROM author_captures WHERE id = …` | raises `restrict_violation` |
+| `DELETE FROM author_sessions WHERE id = …` | succeeds; its captures cascade away |
+| `DELETE FROM public.users WHERE id = …` | succeeds; the account's captures cascade away |
+
+Account deletion and GDPR erasure therefore need no maintenance transaction and
+no `DISABLE TRIGGER` step. Immutability here is about never rewriting history,
+not about being unable to erase a user who asks to be forgotten.
+
+**Owner consistency.** Every child row's `user_id` must equal its session's
+owner. Alongside the single-column foreign keys, `author_sessions` carries
+`UNIQUE (id, user_id)` and `author_captures`, `author_draft_versions`, and
+`author_flags` each carry a composite
+`FOREIGN KEY (session_id, user_id) REFERENCES author_sessions (id, user_id)
+ON DELETE CASCADE`. No route can produce a mismatched pair, and now neither can
+a hand-written `INSERT`.
 
 Draft versions are append-only too. Accepting or editing a flag never rewrites
 the version it was raised against — it inserts the next version with
@@ -92,12 +113,14 @@ JWT only; a `user_id` in a request body is ignored, never stored.
 | Status | When |
 |--------|------|
 | 401 | Missing or invalid bearer token. |
-| 400 | Bad range, empty capture range, unsupported level, `edit` with no `replacement_text`, `accept` on a flag with no appliable suggestion. |
-| 404 | Session or flag missing **or owned by another user** — the same response either way, so the API is not an existence oracle. |
+| 400 | Bad range, empty capture range, unsupported level, `edit` with no `replacement_text`, `accept` on a flag with no appliable suggestion, `conversation_id` / `manuscript_id` that is not a UUID. |
+| 404 | Session, flag, conversation, or manuscript missing **or owned by another user** — and also a path id that is not a UUID at all. The same response every way, so the API is neither an existence oracle nor a well-formedness oracle. |
 | 405 | `PATCH` / `PUT` / `DELETE` on a capture path. Captures cannot be mutated. |
 | 409 | Capture appended to an ended session; decision on an already-resolved flag. |
-| 422 | Body fails schema validation (unknown `source`, unknown `decision`, negative offsets). |
+| 413 | `raw_text` over the capture cap, or a refine range over the prompt budget. See §10. |
+| 422 | Body fails schema validation (unknown `source`, unknown `decision`, negative offsets, `raw_text` over the declared `max_length`). |
 | 502 | The refinement model returned something unparseable. Nothing is stored. |
+| 503 | Capture sequence contention that outlived its retries — nothing was stored, send the chunk again. See §5. |
 
 Pagination is the house shape: `{items, total, limit, offset}` with
 `limit` 1–100 (default 50) and `offset >= 0`.
@@ -121,10 +144,15 @@ irreversible or destructive action to gate.
 
 All three fields are optional and nullable, and the whole body may be omitted —
 `POST /author/sessions` with no body starts an untitled session.
-`title` is capped at 200 characters;
-blank titles are stored as `null`. `conversation_id` and `manuscript_id` are
-soft references (no foreign key) so a session outlives whatever it was linked
-to.
+`title` is capped at 200 characters; blank titles are stored as `null`.
+
+`conversation_id` and `manuscript_id` are soft references (no foreign key) so a
+session outlives whatever it was linked to. Because no foreign key enforces it,
+the server checks **at creation** that each one names a row the caller owns:
+a value that is not a UUID is `400`, and one that does not exist or belongs to
+someone else is `404` (`Conversation not found` / `Manuscript not found`). The
+referenced row can still change hands or be deleted afterwards, so anything that
+later dereferences either id must re-check ownership at that point too.
 
 ```json
 {
@@ -250,11 +278,22 @@ captures (`409`) but can still be refined and reviewed.
 { "source": "voice", "raw_text": "um so the rain hadn't stopped for three days you know" }
 ```
 
-Both fields are required. `raw_text` must be non-empty after trimming; it is
-stored byte-for-byte as sent, disfluencies included. The **server** assigns
-`sequence` — the first capture in a session is `0` and each append takes the
-next integer, allocated in a single statement so concurrent voice chunks cannot
-collide. Clients never send a sequence.
+Both fields are required. `raw_text` must be non-empty after trimming and is
+capped at **20,000 characters** (`422` over that — see §10); it is stored
+byte-for-byte as sent, disfluencies included.
+
+The **server** assigns `sequence` — the first capture in a session is `0` and
+each append takes the next integer. Clients never send a sequence.
+
+Sequence allocation reads `MAX(sequence)` and inserts in one statement, but that
+is not collision-proof: under `READ COMMITTED` two appends racing in separate
+transactions read the same maximum and one loses on
+`UNIQUE (session_id, sequence)`. The loser is retried (up to 5 attempts), each
+retry re-reading the maximum, so a client streaming dictation chunks in parallel
+still gets gap-free sequences. If every attempt loses — pathological contention
+only — the response is `503` and **nothing is stored**; send that chunk again.
+The one guarantee worth relying on is that sequences within a session are unique
+and increasing, not that concurrent appends land in the order they were sent.
 
 ```json
 {
@@ -353,8 +392,9 @@ raw words behind it. `model_identifier` is the model that produced the text.
 Error cases: `404` if the session is missing or not yours (checked before the
 model is called, so a blocked refine costs nothing); `400` if the session has no
 captures, if `capture_from > capture_to`, or if the range selects no captures;
-`502` if the model reply cannot be parsed into refined content — in which case
-no version and no flags are written.
+`413` if the selected range exceeds the prompt budget in §10; `502` if the model
+reply cannot be parsed into refined content — in which case no version and no
+flags are written.
 
 ## 7. Flags
 
@@ -460,7 +500,28 @@ and `decision.resulting_draft_version_id` is `null`.
 6. `POST /author/sessions/{id}/end` when the sitting is over. Review still
    works afterwards.
 
-## 10. Not in this PR
+## 10. Size limits
+
+Two hard ceilings, both about cost rather than taste: a session accumulates
+captures forever, and `/refine` sends a range of them to a paid model on every
+call.
+
+| Limit | Value | Enforced where | Over the limit |
+|-------|-------|----------------|----------------|
+| One capture's `raw_text` | 20,000 characters | `POST /captures` body schema, re-checked in the service layer | `422` from the schema, `413` from the service |
+| Captures in one `/refine` range | 500 | `POST /refine`, before the model call | `413` |
+| Assembled refine prompt | 120,000 characters | `POST /refine`, before the model call | `413` |
+
+The `413` `detail` states the actual size and the ceiling, so the client can
+narrow `capture_from` / `capture_to` and retry without guessing. Nothing is sent
+upstream and nothing is stored when a limit is hit.
+
+20,000 characters is far more than any single dictation chunk needs — roughly
+half an hour of continuous speech — so a voice client streaming per-utterance
+chunks will never approach it. Long sittings are refined a range at a time, which
+is also how the app should read a draft back anyway.
+
+## 11. Not in this PR
 
 - No chat-tool wiring: Author `/chat` does not yet call this pipeline, so there
   are no new `pending_action`, `visual_panel`, or `client_actions` shapes.

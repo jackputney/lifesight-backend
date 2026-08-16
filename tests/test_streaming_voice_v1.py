@@ -16,21 +16,37 @@ import json
 import os
 import time
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketDenialResponse
+from starlette.websockets import WebSocketDisconnect
 
+from routers.chat_stream import (
+    MAX_CONNECTIONS_PER_USER,
+    OPEN_CONNECTIONS_PER_USER,
+    WS_CLOSE_TOO_MANY_CONNECTIONS,
+    _http_error_code,
+    _persist_tool_round,
+    _TurnVoice,
+)
+from shared.context_budget import build_model_messages, repair_tool_call_pairs
 from shared.elevenlabs_stream import ElevenLabsStreamError, ElevenLabsStreamSession
 from shared.local_auth.store import use_memory_store
 from shared.profile_schema import empty_profile
 from shared.streaming.phrases import SpeechChunker
 from shared.streaming.protocol import (
+    ERROR_FORBIDDEN_CONVERSATION,
+    ERROR_INTERNAL,
+    ERROR_INVALID_CONVERSATION,
     ERROR_INVALID_FRAME,
     ERROR_TTS_UNAVAILABLE,
     ERROR_UNSUPPORTED_MODE,
+    MAX_FRAME_CHARS,
+    MAX_MESSAGE_CHARS,
     ProtocolError,
     error_frame,
     parse_client_frame,
@@ -462,6 +478,352 @@ class ProtocolParsingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             error_frame(turn_id=None, code="made_up", message="x")
 
+    def test_oversize_raw_frame_is_rejected_before_json_parsing(self):
+        huge = '{"type":"user_turn","message":"' + "z" * 200_000 + '"}'
+        self.assertGreater(len(huge), MAX_FRAME_CHARS)
+        with patch(
+            "shared.streaming.protocol.json.loads",
+            side_effect=AssertionError("oversize frame must not be parsed"),
+        ):
+            with self.assertRaises(ProtocolError) as ctx:
+                parse_client_frame(huge)
+        self.assertEqual(ctx.exception.code, ERROR_INVALID_FRAME)
+        self.assertNotIn("zzzz", ctx.exception.message)
+
+    def test_oversize_raw_bytes_frame_is_rejected_before_decoding(self):
+        with self.assertRaises(ProtocolError):
+            parse_client_frame(b"{" + b"z" * (MAX_FRAME_CHARS + 1))
+
+    def test_max_length_message_still_parses(self):
+        raw = json.dumps(
+            {"type": "user_turn", "message": "y" * MAX_MESSAGE_CHARS}
+        )
+        self.assertLessEqual(len(raw), MAX_FRAME_CHARS)
+        frame = parse_client_frame(raw)
+        self.assertEqual(len(frame.message), MAX_MESSAGE_CHARS)
+
+
+class ErrorCodeMappingTests(unittest.TestCase):
+    def test_conversation_failures_keep_their_specific_codes(self):
+        self.assertEqual(_http_error_code(400), ERROR_INVALID_CONVERSATION)
+        self.assertEqual(_http_error_code(403), ERROR_FORBIDDEN_CONVERSATION)
+
+    def test_503_is_internal_not_a_recoverable_voice_failure(self):
+        # tts_unavailable promises the client a response_complete still follows
+        # (contract §8). A 503 from the turn machinery is a dead turn, so
+        # labelling it that way would hang the client forever.
+        self.assertEqual(_http_error_code(503), ERROR_INTERNAL)
+        self.assertNotEqual(_http_error_code(503), ERROR_TTS_UNAVAILABLE)
+
+    def test_unmapped_status_codes_are_internal(self):
+        for status in (404, 500, 502, 504):
+            self.assertEqual(_http_error_code(status), ERROR_INTERNAL)
+
+
+class ContextToolPairRepairTests(unittest.TestCase):
+    """A half-written tool round must not poison a conversation forever.
+
+    Anthropic rejects the whole conversation when history holds a `tool_use`
+    with no `tool_result` (or the reverse), so build_model_messages repairs it
+    on read for both the streamed and the REST path.
+    """
+
+    @staticmethod
+    def _built(recent: list[dict]):
+        return build_model_messages(
+            system_prompt="sys",
+            profile_block="",
+            summary_text=None,
+            summary_through_seq=None,
+            recent_messages=recent,
+            current_user_message={"role": "user", "content": "and now?"},
+        )
+
+    @staticmethod
+    def _blocks(messages: list[dict]) -> list[dict]:
+        return [
+            block
+            for message in messages
+            for block in (
+                message["content"] if isinstance(message["content"], list) else []
+            )
+        ]
+
+    def test_dangling_tool_use_is_dropped_but_its_text_survives(self):
+        built = self._built(
+            [
+                {"role": "user", "content": "What's on my calendar?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Let me check."},
+                        {
+                            "type": "tool_use",
+                            "id": "tu_1",
+                            "name": "list_calendar_events",
+                            "input": {},
+                        },
+                    ],
+                },
+            ]
+        )
+        kinds = [block["type"] for block in self._blocks(built.messages)]
+        self.assertEqual(kinds, ["text"])
+        self.assertIn("Let me check.", json.dumps(built.messages))
+
+    def test_assistant_message_of_only_unmatched_tool_use_is_dropped(self):
+        built = self._built(
+            [
+                {"role": "user", "content": "Log my oatmeal."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu_9",
+                            "name": "create_pending_action",
+                            "input": {},
+                        }
+                    ],
+                },
+            ]
+        )
+        self.assertNotIn("tu_9", json.dumps(built.messages))
+        self.assertEqual([m["role"] for m in built.messages], ["user", "user"])
+        self.assertEqual(built.raw_messages_included, 2)
+
+    def test_orphan_tool_result_is_dropped(self):
+        built = self._built(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu_missing",
+                            "content": "2 events today.",
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": "You have two meetings."},
+            ]
+        )
+        self.assertNotIn("tool_result", json.dumps(built.messages))
+        self.assertIn("You have two meetings.", json.dumps(built.messages))
+
+    def test_matched_tool_round_is_passed_through_verbatim(self):
+        pair = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Checking."},
+                    {
+                        "type": "tool_use",
+                        "id": "tu_1",
+                        "name": "list_calendar_events",
+                        "input": {"range": "today"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_1",
+                        "content": "2 events today.",
+                    }
+                ],
+            },
+        ]
+        built = self._built([dict(m) for m in pair])
+        self.assertEqual(built.messages[:2], pair)
+
+    def test_partially_matched_assistant_message_keeps_the_matched_call(self):
+        built = self._built(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tu_ok", "name": "a", "input": {}},
+                        {"type": "tool_use", "id": "tu_lost", "name": "b", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu_ok",
+                            "content": "done",
+                        }
+                    ],
+                },
+            ]
+        )
+        blob = json.dumps(built.messages)
+        self.assertIn("tu_ok", blob)
+        self.assertNotIn("tu_lost", blob)
+
+    def test_trimming_away_a_tool_use_also_drops_its_result(self):
+        built = self._built(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu_1",
+                            "name": "search",
+                            "input": {"query": "x" * 400_000},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu_1",
+                            "content": "ok",
+                        }
+                    ],
+                },
+            ]
+        )
+        # The oversized tool_use is trimmed for budget; its result must not be
+        # left behind on its own.
+        self.assertNotIn("tu_1", json.dumps(built.messages))
+        self.assertEqual(built.raw_messages_included, 1)
+
+    def test_repair_is_a_no_op_for_plain_text_history(self):
+        history = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        self.assertEqual(repair_tool_call_pairs(history), history)
+
+
+class ToolRoundPersistenceTests(unittest.TestCase):
+    """The two history writes of a tool round are one unit or the conversation
+    is permanently broken for every later model call."""
+
+    def test_write_pair_survives_a_hard_cancel_between_the_appends(self):
+        async def _run():
+            store = _Store()
+            assistant_written = asyncio.Event()
+            release_results = asyncio.Event()
+
+            async def append(conversation_id, role, content):
+                if role == "user":
+                    # The hard cancel lands here — between the two appends.
+                    await release_results.wait()
+                seq = await store.append_message(conversation_id, role, content)
+                if role == "assistant":
+                    assistant_written.set()
+                return seq
+
+            with patch("shared.db.append_message", new=append):
+                task = asyncio.create_task(
+                    _persist_tool_round(
+                        "conv-1",
+                        assistant_blocks=[
+                            {"type": "tool_use", "id": "tu_1", "name": "t", "input": {}}
+                        ],
+                        tool_results=[
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tu_1",
+                                "content": "ok",
+                            }
+                        ],
+                    )
+                )
+                await assistant_written.wait()
+                task.cancel()
+                release_results.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            return store.messages
+
+        messages = asyncio.run(_run())
+        self.assertEqual([m["role"] for m in messages], ["assistant", "user"])
+        self.assertEqual(
+            messages[1]["content"][0]["tool_use_id"],
+            messages[0]["content"][0]["id"],
+            "a cancelled tool round must never persist tool_use without its result",
+        )
+
+
+class TurnVoiceStartTests(unittest.TestCase):
+    def test_hard_cancel_inside_open_closes_the_upstream_socket(self):
+        class _HangingOpen(_FakeTTSSession):
+            """Connects, then blocks where open() sends its init message."""
+
+            def __init__(self):
+                super().__init__()
+                self.open_entered = asyncio.Event()
+
+            async def open(self) -> None:
+                self.opened = True
+                self.open_entered.set()
+                await asyncio.sleep(3600)
+
+        async def _run():
+            session = _HangingOpen()
+            turn = StreamTurn("turn-a")
+            sender = TurnSender(_RecordingWebSocket())
+            sender.set_active_turn(turn)
+            voice = _TurnVoice(turn=turn, sender=sender, requested=True)
+            with patch(
+                "routers.chat_stream._new_tts_session", new=Mock(return_value=session)
+            ):
+                task = asyncio.create_task(voice.start())
+                await session.open_entered.wait()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            return session, voice
+
+        session, voice = asyncio.run(_run())
+        self.assertTrue(
+            session.closed, "an abandoned open() must not leak the upstream socket"
+        )
+        self.assertFalse(voice.streaming)
+
+    def test_cooperative_cancel_during_open_also_aborts_the_socket(self):
+        class _HangingOpen(_FakeTTSSession):
+            def __init__(self):
+                super().__init__()
+                self.open_entered = asyncio.Event()
+
+            async def open(self) -> None:
+                self.opened = True
+                self.open_entered.set()
+                await asyncio.sleep(3600)
+
+        async def _run():
+            session = _HangingOpen()
+            turn = StreamTurn("turn-a")
+            sender = TurnSender(_RecordingWebSocket())
+            sender.set_active_turn(turn)
+            voice = _TurnVoice(turn=turn, sender=sender, requested=True)
+            with patch(
+                "routers.chat_stream._new_tts_session", new=Mock(return_value=session)
+            ):
+                task = asyncio.create_task(voice.start())
+                await session.open_entered.wait()
+                # Barge-in path: the turn aborts the TTS socket it was told about.
+                turn.cancel()
+                await turn.abort_tts()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            return session
+
+        session = asyncio.run(_run())
+        self.assertTrue(session.aborted, "barge-in must reach a session still opening")
+
 
 class SpeechChunkerTests(unittest.TestCase):
     def test_chunks_end_with_space_and_preserve_order(self):
@@ -702,6 +1064,8 @@ class StreamingChatRouteTests(unittest.TestCase):
         for item in self.patches:
             item.start()
             self.addCleanup(item.stop)
+        OPEN_CONNECTIONS_PER_USER.clear()
+        self.addCleanup(OPEN_CONNECTIONS_PER_USER.clear)
 
     def _client(self) -> TestClient:
         from main import app
@@ -800,6 +1164,106 @@ class StreamingChatRouteTests(unittest.TestCase):
         self.assertEqual(frame["type"], "error")
         self.assertEqual(frame["code"], ERROR_UNSUPPORTED_MODE)
         self.assertIsNone(frame["turn_id"])
+
+    def test_non_uuid_conversation_id_errors_before_turn_started(self):
+        stream = _FakeStream(["Fresh conversation."], _message("end_turn"))
+        with _env():
+            with self._anthropic([stream]):
+                with self._client() as client:
+                    with client.websocket_connect("/chat/stream") as ws:
+                        ws.send_json(
+                            {
+                                "type": "user_turn",
+                                "mode": "fitness",
+                                "message": "Where were we?",
+                                "conversation_id": "not-a-uuid",
+                                "voice": {"enabled": False},
+                            }
+                        )
+                        rejected = ws.receive_json()
+                        # The socket stays usable: retry with null works.
+                        ws.send_json(
+                            {
+                                "type": "user_turn",
+                                "mode": "fitness",
+                                "message": "Start over then.",
+                                "conversation_id": None,
+                                "voice": {"enabled": False},
+                            }
+                        )
+                        after = _read_until(ws, "response_complete")
+
+        self.assertEqual(rejected["type"], "error")
+        self.assertEqual(rejected["code"], ERROR_INVALID_CONVERSATION)
+        self.assertIsNone(
+            rejected["turn_id"],
+            "an error before turn_started must not carry an unknown turn_id",
+        )
+        self.assertEqual(after[0]["type"], "turn_started")
+        self.assertEqual(after[-1]["reply"], "Fresh conversation.")
+
+    def test_another_users_conversation_is_forbidden_before_turn_started(self):
+        other_conversation = "11111111-1111-4111-8111-111111111111"
+        self.store.conversations[other_conversation] = {
+            "id": other_conversation,
+            "user_id": "00000000-0000-4000-8000-0000000000aa",
+            "mode": "fitness",
+            "summary_text": None,
+            "summary_through_seq": None,
+        }
+        with _env():
+            with self._client() as client:
+                with client.websocket_connect("/chat/stream") as ws:
+                    ws.send_json(
+                        {
+                            "type": "user_turn",
+                            "mode": "fitness",
+                            "message": "Read me that conversation.",
+                            "conversation_id": other_conversation,
+                            "voice": {"enabled": False},
+                        }
+                    )
+                    frame = ws.receive_json()
+
+        self.assertEqual(frame["type"], "error")
+        self.assertEqual(frame["code"], ERROR_FORBIDDEN_CONVERSATION)
+        self.assertIsNone(frame["turn_id"])
+        self.assertEqual(
+            self.store.messages, [], "a forbidden turn must write nothing at all"
+        )
+
+    def test_service_unavailable_mid_turn_is_reported_as_internal_error(self):
+        stream = _FakeStream(["never streamed"], _message("end_turn"))
+        with _env():
+            with self._anthropic([stream]), patch(
+                "main.get_profile",
+                new_callable=AsyncMock,
+                side_effect=HTTPException(
+                    status_code=503, detail="Dependency temporarily unavailable."
+                ),
+            ):
+                with self._client() as client:
+                    with client.websocket_connect("/chat/stream") as ws:
+                        ws.send_json(
+                            {
+                                "type": "user_turn",
+                                "mode": "fitness",
+                                "message": "How am I doing?",
+                                "voice": {"enabled": False},
+                            }
+                        )
+                        frames = _read_until(ws, "error")
+
+        self.assertEqual(frames[0]["type"], "turn_started")
+        failure = frames[-1]
+        self.assertEqual(
+            failure["code"],
+            ERROR_INTERNAL,
+            "a dead turn must not be labelled with a non-fatal voice code",
+        )
+        self.assertNotEqual(failure["code"], ERROR_TTS_UNAVAILABLE)
+        self.assertEqual(failure["turn_id"], frames[0]["turn_id"])
+        self.assertNotIn("response_complete", [f["type"] for f in frames])
 
     def test_malformed_frame_error_does_not_close_socket(self):
         stream = _FakeStream(["Fine."], _message("end_turn"))
@@ -1023,6 +1487,149 @@ class StreamingChatRouteTests(unittest.TestCase):
         self.assertEqual(len(partials), 1)
         self.assertTrue(partials[0].startswith("word0"))
 
+    def _tool_pairing(self) -> tuple[set[str], set[str]]:
+        """(tool_use ids, tool_result ids) across everything persisted."""
+        uses: set[str] = set()
+        results: set[str] = set()
+        for message in self.store.messages:
+            content = message["content"]
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if block.get("type") == "tool_use":
+                    uses.add(block["id"])
+                elif block.get("type") == "tool_result":
+                    results.add(block["tool_use_id"])
+        return uses, results
+
+    def _read_until_delta_startswith(self, ws, prefix: str, *, limit: int = 400) -> None:
+        for _ in range(limit):
+            frame = ws.receive_json()
+            if frame["type"] == "text_delta" and frame["delta"].startswith(prefix):
+                return
+        raise AssertionError(f"never saw a text_delta starting with {prefix!r}")
+
+    def test_interrupt_during_a_tool_round_leaves_no_dangling_tool_use(self):
+        rounds = [
+            _FakeStream(
+                ["Checking now. "],
+                _message(
+                    "tool_use",
+                    [
+                        _text_block("Checking now."),
+                        _tool_block("tu_1", "list_calendar_events", {"range": "today"}),
+                    ],
+                ),
+            ),
+            _FakeStream(["You have two meetings."], _message("end_turn")),
+        ]
+        state = {"in_tool": False}
+
+        async def slow_tool(*_args, **_kwargs):
+            state["in_tool"] = True
+            try:
+                await asyncio.sleep(0.6)
+            finally:
+                state["in_tool"] = False
+            return ("2 events today.", None, None, [])
+
+        with _env():
+            with self._anthropic(rounds), patch("main._run_tool", new=slow_tool):
+                with self._client() as client:
+                    with client.websocket_connect("/chat/stream") as ws:
+                        ws.send_json(
+                            {
+                                "type": "user_turn",
+                                "mode": "mail_calendar",
+                                "message": "What's on my calendar?",
+                                "voice": {"enabled": False},
+                            }
+                        )
+                        started = ws.receive_json()
+                        self.assertTrue(
+                            _wait_until(lambda: state["in_tool"]),
+                            "the tool must be in flight before the interrupt",
+                        )
+                        ws.send_json(
+                            {"type": "interrupt", "turn_id": started["turn_id"]}
+                        )
+                        frames = _read_until(ws, "turn_cancelled")
+                        settled = _wait_until(lambda: not state["in_tool"])
+
+        self.assertTrue(settled)
+        self.assertEqual(sum(1 for f in frames if f["type"] == "turn_cancelled"), 1)
+        uses, results = self._tool_pairing()
+        self.assertEqual(
+            uses,
+            {"tu_1"},
+            "the tool round under test must actually have been persisted",
+        )
+        self.assertEqual(
+            uses,
+            results,
+            "an interrupted tool round must never persist a tool_use without "
+            "its tool_result — Anthropic rejects the conversation forever after",
+        )
+        self.assertNotIn(
+            "You have two meetings.",
+            self.store.assistant_texts(),
+            "the cancelled turn must not persist a post-interrupt reply",
+        )
+
+    def test_interrupt_after_a_tool_round_does_not_duplicate_spoken_text(self):
+        rounds = [
+            _FakeStream(
+                ["Let me check that. "],
+                _message(
+                    "tool_use",
+                    [
+                        _text_block("Let me check that."),
+                        _tool_block("tu_1", "list_calendar_events", {"range": "today"}),
+                    ],
+                ),
+            ),
+            self._slow_stream(),
+        ]
+        with _env():
+            with self._anthropic(rounds), patch(
+                "main._run_tool",
+                new_callable=AsyncMock,
+                return_value=("2 events today.", None, None, []),
+            ):
+                with self._client() as client:
+                    with client.websocket_connect("/chat/stream") as ws:
+                        ws.send_json(
+                            {
+                                "type": "user_turn",
+                                "mode": "mail_calendar",
+                                "message": "What's on my calendar?",
+                                "voice": {"enabled": False},
+                            }
+                        )
+                        started = ws.receive_json()
+                        self._read_until_delta_startswith(ws, "word")
+                        ws.send_json(
+                            {"type": "interrupt", "turn_id": started["turn_id"]}
+                        )
+                        _read_until(ws, "turn_cancelled")
+                        persisted = _wait_until(
+                            lambda: any(
+                                "Interrupted" in text
+                                for text in self.store.assistant_texts()
+                            )
+                        )
+
+        self.assertTrue(persisted)
+        partials = [t for t in self.store.assistant_texts() if "Interrupted" in t]
+        self.assertEqual(len(partials), 1)
+        self.assertTrue(partials[0].startswith("word"))
+        self.assertNotIn("Let me check that.", partials[0])
+        self.assertEqual(
+            json.dumps(self.store.messages).count("Let me check that."),
+            1,
+            "text already committed with the tool round must not be stored twice",
+        )
+
     def test_stale_interrupt_id_is_ignored(self):
         stream = _FakeStream(["All good."], _message("end_turn"))
         with _env():
@@ -1090,7 +1697,7 @@ class StreamingChatRouteTests(unittest.TestCase):
         )
         self.assertEqual(after[-1]["reply"], "Second answer.")
 
-    def test_conversation_survives_interruption(self):
+    def test_echoed_conversation_id_resumes_the_interrupted_conversation(self):
         slow = self._slow_stream()
         fast = _FakeStream(["Continuing where we left off."], _message("end_turn"))
         with _env():
@@ -1127,7 +1734,115 @@ class StreamingChatRouteTests(unittest.TestCase):
         self.assertEqual(
             list(self.store.conversations),
             [conversation_id],
-            "interruption must not fork a new conversation",
+            "echoing the id must not fork a new conversation",
+        )
+        # The resumed turn's user message lands in the same conversation as the
+        # interrupted partial, so the model sees one continuous history.
+        self.assertEqual(
+            {m["conversation_id"] for m in self.store.messages}, {conversation_id}
+        )
+
+    def test_barge_in_with_null_conversation_id_starts_a_new_conversation(self):
+        slow = self._slow_stream()
+        fast = _FakeStream(["Clean slate."], _message("end_turn"))
+        with _env():
+            with self._anthropic([slow, fast]):
+                with self._client() as client:
+                    with client.websocket_connect("/chat/stream") as ws:
+                        ws.send_json(
+                            {
+                                "type": "user_turn",
+                                "mode": "fitness",
+                                "message": "Start something long.",
+                                "voice": {"enabled": False},
+                            }
+                        )
+                        started = ws.receive_json()
+                        first_conversation = started["conversation_id"]
+                        self._read_until_delta_startswith(ws, "word")
+                        # Implicit barge-in with no conversation_id at all.
+                        ws.send_json(
+                            {
+                                "type": "user_turn",
+                                "mode": "fitness",
+                                "message": "Forget it, new topic.",
+                                "conversation_id": None,
+                                "voice": {"enabled": False},
+                            }
+                        )
+                        after = _read_until(ws, "response_complete")
+
+        types = [f["type"] for f in after]
+        self.assertIn("turn_cancelled", types)
+        second_conversation = after[-1]["conversation_id"]
+        # Documented in §5.1: resumption is driven by what the client sends, so
+        # a null conversation_id forks a brand-new conversation.
+        self.assertNotEqual(second_conversation, first_conversation)
+        self.assertEqual(
+            sorted(self.store.conversations),
+            sorted([first_conversation, second_conversation]),
+        )
+        self.assertEqual(after[-1]["reply"], "Clean slate.")
+        partials = [
+            m
+            for m in self.store.messages
+            if isinstance(m["content"], str) and "Interrupted" in m["content"]
+        ]
+        self.assertEqual(len(partials), 1)
+        self.assertEqual(
+            partials[0]["conversation_id"],
+            first_conversation,
+            "the interrupted partial stays with the conversation it belonged to",
+        )
+        self.assertNotIn(
+            "Forget it, new topic.",
+            [
+                m["content"]
+                for m in self.store.messages
+                if m["conversation_id"] == first_conversation
+            ],
+        )
+
+    # -- connection limits --------------------------------------------------
+
+    def test_connections_over_the_per_user_cap_are_closed_with_4029(self):
+        stream = _FakeStream(["Still working."], _message("end_turn"))
+        with _env():
+            with self._anthropic([stream]):
+                with self._client() as client:
+                    with ExitStack() as stack:
+                        allowed = [
+                            stack.enter_context(
+                                client.websocket_connect("/chat/stream")
+                            )
+                            for _ in range(MAX_CONNECTIONS_PER_USER)
+                        ]
+                        self.assertEqual(
+                            OPEN_CONNECTIONS_PER_USER.get(DEV_USER),
+                            MAX_CONNECTIONS_PER_USER,
+                        )
+                        with client.websocket_connect("/chat/stream") as extra:
+                            with self.assertRaises(WebSocketDisconnect) as ctx:
+                                extra.receive_json()
+                        self.assertEqual(
+                            ctx.exception.code, WS_CLOSE_TOO_MANY_CONNECTIONS
+                        )
+                        # A connection under the cap is unaffected.
+                        allowed[0].send_json(
+                            {
+                                "type": "user_turn",
+                                "mode": "fitness",
+                                "message": "Are you there?",
+                                "voice": {"enabled": False},
+                            }
+                        )
+                        frames = _read_until(allowed[0], "response_complete")
+                        self.assertEqual(frames[-1]["reply"], "Still working.")
+
+        self.assertEqual(
+            OPEN_CONNECTIONS_PER_USER,
+            {},
+            "closed connections must free their slot",
         )
 
     def test_new_user_turn_barges_in_on_an_active_turn(self):

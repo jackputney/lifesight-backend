@@ -93,6 +93,7 @@ from shared.health.tools import run_get_recent_health_data
 from shared.profile_schema import compact_profile_for_context
 from shared.profile_service import get_profile
 from shared.prompt_overrides import load_active_customization_block
+from shared.tool_rounds import persist_tool_round
 from shared.visual_panels import (
     VisualPanel,
     exercise_visual_panel,
@@ -129,6 +130,36 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Bodies are fully buffered before any route or validator runs, so a per-field
+# cap cannot stop a huge payload from being parsed. This rejects the request
+# before that happens. Comfortably above the largest legitimate body (a
+# max-size /healthkit/sync batch is well under a megabyte).
+MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    """Reject oversized bodies before they are buffered and parsed."""
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > MAX_REQUEST_BODY_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": (
+                            "Request body too large "
+                            f"(limit {MAX_REQUEST_BODY_BYTES} bytes)."
+                        )
+                    },
+                )
+        except ValueError:
+            return JSONResponse(
+                status_code=400, content={"detail": "Invalid Content-Length header"}
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -459,7 +490,6 @@ async def _run_model_turn(
     while message.stop_reason == "tool_use":
         assistant_blocks = [block.model_dump() for block in message.content]
         working.append({"role": "assistant", "content": assistant_blocks})
-        await db.append_message(conversation_id, "assistant", assistant_blocks)
 
         tool_results = []
         for block in message.content:
@@ -487,7 +517,11 @@ async def _run_model_turn(
             )
 
         working.append({"role": "user", "content": tool_results})
-        await db.append_message(conversation_id, "user", tool_results)
+        await persist_tool_round(
+            conversation_id,
+            assistant_blocks=assistant_blocks,
+            tool_results=tool_results,
+        )
         create_kwargs["messages"] = working
         message = await _call_model(create_kwargs)
         # Prefer final-turn usage when present.

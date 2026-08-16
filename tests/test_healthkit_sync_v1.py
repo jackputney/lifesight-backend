@@ -6,6 +6,7 @@ Run:  python -m unittest tests.test_healthkit_sync_v1 -v
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -18,14 +19,19 @@ from shared.health import store as health_store
 from shared.health.service import (
     MAX_HEALTH_CONTEXT_CHARS,
     MAX_SYNC_BATCH,
+    BatchTooLargeError,
+    ingest_healthkit_samples,
+    ingest_terra_metrics,
     normalize_terra_metrics,
     terra_external_id,
 )
 from shared.health.tools import run_get_recent_health_data
+from shared.health.types import ACCEPTED_UNITS, CANONICAL_UNITS, SAMPLE_TYPES
 from shared.local_auth.store import use_memory_store
 
 REPO = Path(__file__).resolve().parents[1]
 MIGRATION_016 = REPO / "migrations" / "016_health_samples.sql"
+CONTRACT_DOC = REPO / "docs" / "HEALTHKIT_SYNC_V1_CONTRACT.md"
 
 
 def _env(**overrides: str):
@@ -57,6 +63,108 @@ class Migration016Tests(unittest.TestCase):
         # health_metrics is deprecated in place, never dropped.
         self.assertIn("COMMENT ON TABLE health_metrics", text)
         self.assertNotIn("DROP TABLE", text)
+
+
+class ContractDocTests(unittest.TestCase):
+    """iOS builds against the doc, so the doc is checked against the models.
+
+    Every claim asserted here is read out of the code, not restated: change a
+    limit, a field name, an enum value or a status code and this fails.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = CONTRACT_DOC.read_text(encoding="utf-8")
+
+    def _row(self, field: str) -> str:
+        for line in self.doc.splitlines():
+            if line.startswith(f"| {field} |"):
+                return line
+        self.fail(f"{field} has no row in the contract doc")
+
+    def test_documented_endpoints_exist_exactly_as_spelled(self):
+        from routers.healthkit import router
+
+        paths = {route.path for route in router.routes}
+        self.assertEqual(paths, {"/healthkit/sync", "/healthkit/status"})
+        for path in paths:
+            self.assertTrue(path in self.doc, f"{path} is not named in the doc")
+
+    def test_doc_documents_every_request_field_and_its_length_limit(self):
+        from routers.healthkit import HealthKitSampleIn
+
+        documented_limits = {}
+        for name, field in HealthKitSampleIn.model_fields.items():
+            row = self._row(name)
+            limit = next(
+                (
+                    meta.max_length
+                    for meta in field.metadata
+                    if getattr(meta, "max_length", None) is not None
+                ),
+                None,
+            )
+            if limit is not None:
+                self.assertIn(
+                    str(limit), row, f"{name} row omits its {limit}-char limit"
+                )
+                documented_limits[name] = limit
+        # A field losing its bound silently is the failure mode that matters.
+        self.assertEqual(
+            documented_limits,
+            {
+                "sample_id": 200,
+                "type": 64,
+                "start_at": 64,
+                "end_at": 64,
+                "unit": 32,
+                "value_text": 120,
+                "source_bundle": 200,
+                "source_name": 200,
+            },
+        )
+
+    def test_doc_documents_every_response_field(self):
+        from routers.healthkit import (
+            HealthKitCategoryStatus,
+            HealthKitStatusResponse,
+            HealthKitSyncResponse,
+        )
+
+        for model in (
+            HealthKitSyncResponse,
+            HealthKitStatusResponse,
+            HealthKitCategoryStatus,
+        ):
+            for name in model.model_fields:
+                self.assertIn(name, self.doc, f"{model.__name__}.{name} undocumented")
+
+    def test_doc_matches_the_closed_vocabulary_and_accepted_units(self):
+        for sample_type in SAMPLE_TYPES:
+            self.assertIn(f"`{sample_type}`", self.doc)
+            row = self._row(sample_type)
+            self.assertIn(CANONICAL_UNITS[sample_type], row)
+            for unit in ACCEPTED_UNITS[sample_type]:
+                self.assertIn(f"`{unit}`", row, f"{sample_type} omits unit {unit}")
+
+    def test_doc_states_the_batch_cap_and_the_status_code_it_returns(self):
+        self.assertIn(f"At most **{MAX_SYNC_BATCH} samples per request**", self.doc)
+        self.assertIn(
+            f"| samples | required array, **{MAX_SYNC_BATCH} items max**", self.doc
+        )
+        # The cap is enforced by the request model now, so it is a 422. The doc
+        # must not still promise a 400 for an oversized batch.
+        self.assertNotIn("| 400 |", self.doc)
+        self.assertIn("**422, not 400**", self.doc)
+
+    def test_doc_states_the_real_terra_id_length(self):
+        digest = terra_external_id(
+            metric_type="steps",
+            recorded_at=datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
+            source_device="oura",
+            value=9100.0,
+        )
+        self.assertIn(f"truncated to {len(digest)} hex characters", self.doc)
 
 
 class HealthKitSyncTests(unittest.TestCase):
@@ -235,19 +343,80 @@ class HealthKitSyncTests(unittest.TestCase):
                 self.assertEqual(body["ignored"], 5)
                 self.assertEqual(len(health_store._memory.samples), 1)
 
-    def test_oversized_batch_rejected_with_400(self):
+    def test_oversized_batch_rejected_without_building_the_samples(self):
+        """422 from the field cap, before pydantic constructs a single sample.
+
+        Every sample here is *also* individually invalid (empty sample_id, which
+        the field's min_length rejects). If the cap were only enforced
+        downstream in the service, the response would carry one per-item error
+        per sample — proof each item was validated and allocated. With the cap
+        on the field the list length is the only error reported.
+        """
+        with _env():
+            with self._client() as client:
+                token, _ = self._two_users(client)
+                h = self._auth(token)
+                samples = [self._sample(sample_id="") for _ in range(MAX_SYNC_BATCH + 1)]
+
+                response = self._sync(client, h, samples)
+
+                self.assertEqual(response.status_code, 422, response.text)
+                errors = response.json()["detail"]
+                self.assertEqual(len(errors), 1, errors[:3])
+                self.assertEqual(errors[0]["type"], "too_long")
+                self.assertEqual(errors[0]["loc"], ["body", "samples"])
+                self.assertEqual(errors[0]["ctx"]["max_length"], MAX_SYNC_BATCH)
+                self.assertEqual(health_store._memory.samples, {})
+
+    def test_rejection_does_not_echo_the_batch_back(self):
+        """The 422 stays small instead of mirroring the oversized body.
+
+        Pydantic attaches the offending input to the error, so an un-stripped
+        handler answers a multi-megabyte batch with a multi-megabyte error.
+        """
         with _env():
             with self._client() as client:
                 token, _ = self._two_users(client)
                 h = self._auth(token)
                 samples = [
-                    self._sample(sample_id=f"bulk-{i}")
+                    self._sample(sample_id=f"bulk-{i}", source_name="X" * 180)
                     for i in range(MAX_SYNC_BATCH + 1)
                 ]
+                request_bytes = len(json.dumps({"samples": samples}))
+
                 response = self._sync(client, h, samples)
-                self.assertEqual(response.status_code, 400, response.text)
-                self.assertIn(str(MAX_SYNC_BATCH), response.json()["detail"])
-                self.assertEqual(health_store._memory.samples, {})
+
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertGreater(request_bytes, 200_000)
+                self.assertLess(len(response.content), 1_000)
+                self.assertNotIn("input", response.json()["detail"][0])
+                self.assertNotIn("bulk-0", response.text)
+
+    def test_batch_of_exactly_the_cap_is_accepted(self):
+        """The cap is inclusive — 1000 samples must still sync."""
+        with _env():
+            with self._client() as client:
+                token, _ = self._two_users(client)
+                h = self._auth(token)
+                samples = [
+                    self._sample(sample_id=f"bulk-{i}") for i in range(MAX_SYNC_BATCH)
+                ]
+                response = self._sync(client, h, samples)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["accepted"], MAX_SYNC_BATCH)
+
+    def test_service_still_guards_the_batch_size_for_non_http_callers(self):
+        """Defence in depth: the cap does not live only in the request model."""
+        oversized = [
+            self._sample(sample_id=f"bulk-{i}") for i in range(MAX_SYNC_BATCH + 1)
+        ]
+        with self.assertRaises(BatchTooLargeError):
+            asyncio.run(
+                ingest_healthkit_samples(
+                    "00000000-0000-4000-8000-000000000001", oversized
+                )
+            )
+        self.assertEqual(health_store._memory.samples, {})
 
     def test_unauthenticated_requests_rejected(self):
         with _env():
@@ -421,6 +590,74 @@ class TerraNormalizationTests(unittest.TestCase):
                 value=64.0,
             ),
         )
+
+    def test_metric_without_a_usable_timestamp_is_dropped(self):
+        """No recorded_at → ignored, never stamped with now().
+
+        The timestamp is hashed into the synthesized external_id, so inventing
+        one gives the same metric a fresh id on every delivery. It would also
+        record a reading at a time it was not taken.
+        """
+        for recorded_at in (None, "", "not-a-date", {}):
+            with self.subTest(recorded_at=recorded_at):
+                samples, ignored = normalize_terra_metrics(
+                    [
+                        {
+                            "metric_type": "steps",
+                            "value": 1200.0,
+                            "source_device": "oura",
+                            "recorded_at": recorded_at,
+                        }
+                    ]
+                )
+                self.assertEqual(samples, [])
+                self.assertEqual(ignored, 1)
+
+
+class TerraIngestIdempotencyTests(unittest.TestCase):
+    def setUp(self):
+        health_store.use_memory_store(True)
+        self.addCleanup(lambda: health_store.use_memory_store(False))
+
+    USER = "00000000-0000-4000-8000-0000000000aa"
+
+    def _payload(self) -> list[dict]:
+        return [
+            {
+                "metric_type": "steps",
+                "value": 9100.0,
+                "source_device": "oura",
+                "recorded_at": "2026-08-15T12:00:00Z",
+            },
+            # Same shape, but Terra sent no timestamp for this one.
+            {
+                "metric_type": "heart_rate_data.avg_hr_bpm",
+                "value": 64.0,
+                "source_device": "oura",
+                "recorded_at": None,
+            },
+        ]
+
+    def test_replayed_webhook_writes_nothing_the_second_time(self):
+        """`written` is 0 on replay — the claim the webhook docstring makes.
+
+        The un-timestamped metric is what used to break this: a now() fallback
+        hashed a new external_id on every delivery, so a replay inserted a
+        second row and reported written=1.
+        """
+        first_written, first_ignored = asyncio.run(
+            ingest_terra_metrics(self.USER, self._payload())
+        )
+        self.assertEqual(first_written, 1)
+        self.assertEqual(first_ignored, 1)
+        self.assertEqual(len(health_store._memory.samples), 1)
+
+        replay_written, replay_ignored = asyncio.run(
+            ingest_terra_metrics(self.USER, self._payload())
+        )
+        self.assertEqual(replay_written, 0)
+        self.assertEqual(replay_ignored, 2)
+        self.assertEqual(len(health_store._memory.samples), 1)
 
 
 if __name__ == "__main__":

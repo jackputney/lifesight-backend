@@ -1227,6 +1227,15 @@ async def insert_health_metric(
     source_device: Optional[str],
     recorded_at: datetime,
 ) -> dict:
+    """DEPRECATED — do not call. Writes the superseded `health_metrics` table.
+
+    Migration 016 replaced it with `health_samples`, which both HealthKit and
+    Terra now write through `shared.health.service`. Rows written here are
+    invisible to `GET /healthkit/status` and to `get_recent_health_data`, so
+    calling this would silently split a user's health history across two
+    tables. Retained only so the legacy table keeps a documented writer of
+    record; delete once `health_metrics` itself is dropped.
+    """
     row = await pool().fetchrow(
         """
         INSERT INTO health_metrics (

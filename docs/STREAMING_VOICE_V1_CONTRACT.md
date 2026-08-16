@@ -17,6 +17,8 @@ over this socket (§9).
 | Subprotocol | none |
 | Message encoding | UTF-8 JSON text frames, one JSON object per frame |
 | Max `message` length | 16000 characters |
+| Max whole-frame length | 64000 bytes — a larger frame is rejected unparsed with `invalid_frame` |
+| Max concurrent sockets per user | 4 — see §1.2 |
 
 The token goes in the HTTP upgrade request's headers. On iOS that means setting
 it on the `URLRequest` before creating the task:
@@ -38,6 +40,23 @@ frame — `URLSessionWebSocketTask` surfaces this as a connection failure with a
 401 response. Refresh the session and reconnect; do not retry with the same
 token. (`AUTH_MODE=dev` on a local backend accepts any/no token and resolves to
 the fixed dev user, matching every other route.)
+
+### 1.2 Connection limit and close codes
+
+Each user may hold **at most 4** concurrent `/chat/stream` sockets. Every socket
+carries its own model stream and TTS session, so the cap is a resource guard,
+not a product rule — one socket per foreground app is the intended usage.
+
+A connection over the cap is accepted and then immediately closed; it never
+receives an `error` frame.
+
+| Close code | Meaning | Client action |
+|------------|---------|---------------|
+| `1000` | Normal close (either side) | Nothing |
+| `4029` | Too many concurrent connections for this user | Close any sockets you are no longer using and reconnect once; do not reconnect in a loop |
+
+Any other abnormal close (e.g. `1006`) is a transport failure: reconnect and
+resume per §8.
 
 ## 2. Client → server frames
 
@@ -82,7 +101,13 @@ Every frame has `type`. Every frame except a connection-level `error` carries
 
 ### 3.1 `turn_started`
 
-Always the first frame of a turn.
+**No frame ever carries a `turn_id` the client has not seen in a
+`turn_started` first.** `turn_started` is the first frame of every turn, and a
+turn that fails before it could be sent — an unsupported `mode`, a
+`conversation_id` that isn't a UUID, a conversation belonging to another user —
+is reported as a connection-level `error` with `turn_id: null` instead. Allocate
+per-turn state on `turn_started` and treat a `turn_id: null` error as "the turn
+never started", with nothing to clean up.
 
 ```json
 {
@@ -148,9 +173,11 @@ turn. There is no `response_complete` for a cancelled turn.
 }
 ```
 
-`turn_id` is `null` for connection-level problems (a malformed frame, an
-unsupported mode). `message` is a short human-readable string safe to log; it
-never contains user speech or model output. See §8 for every `code`.
+`turn_id` is `null` for connection-level problems — a malformed or oversized
+frame, an unsupported mode, and any conversation-resolution failure, because
+those all happen before `turn_started` (§3.1). `message` is a short
+human-readable string safe to log; it never contains user speech or model
+output. See §8 for every `code`.
 
 ### 3.6 `response_complete`
 
@@ -164,11 +191,27 @@ Terminal frame of a successful turn. Same field semantics as the REST
   "conversation_id": "3c2f0a2e-9b41-4b0a-9a1f-7f2c4e1d8b30",
   "reply": "You have two sets left on bench press.",
   "pending_action": null,
-  "visual_panel": { "type": "exercise", "data": { "exercise_name": "Bench Press" } },
+  "visual_panel": {
+    "type": "exercise",
+    "data": {
+      "exercise_id": null,
+      "exercise_name": "Bench Press",
+      "sets": 4,
+      "reps": 8,
+      "rest_seconds": 90,
+      "current_set": 3,
+      "notes": null
+    }
+  },
   "research": null,
   "client_actions": []
 }
 ```
+
+The `exercise` panel's `data` is always all seven fields, exactly as REST
+`/chat` sends it. `exercise_id`, `current_set` and `notes` are nullable;
+`exercise_name`, `sets`, `reps` and `rest_seconds` are always present. Decode
+other `type` values leniently — `data` is an open object per panel type.
 
 | Field | Notes |
 |-------|--------|
@@ -181,7 +224,9 @@ Terminal frame of a successful turn. Same field semantics as the REST
 ## 4. Ordering and sequencing guarantees
 
 1. `turn_started` is the first frame of a turn; `response_complete` or
-   `turn_cancelled` is the last.
+   `turn_cancelled` is the last. A turn that fails before `turn_started` emits
+   no frame carrying its `turn_id` — the failure arrives as an `error` with
+   `turn_id: null` (§3.1), so an unknown `turn_id` never reaches the client.
 2. Exactly one turn is active at a time. Once a turn is superseded or
    cancelled, the server emits nothing further for it — a late chunk from an
    abandoned generation can never appear after a newer turn's `turn_started`.
@@ -220,6 +265,12 @@ the new turn starts.
 
 - The `conversation_id` **does not change**. An interruption never forks a new
   conversation; keep using the id from the original `turn_started`.
+- Resumption is entirely driven by what the client sends. A follow-up
+  `user_turn` carrying the same `conversation_id` continues the interrupted
+  conversation, interrupted partial and all. A follow-up with
+  `conversation_id: null` starts a **brand-new** conversation with its own id —
+  the interrupted history stays where it was and is not carried over. Always
+  echo the id after a barge-in unless the user actually wanted a fresh start.
 - The user's message is persisted as soon as the turn reaches the model, so the
   next turn has full context. Interrupting within the first few milliseconds —
   before generation starts — can cancel the turn before that write, in which
@@ -257,12 +308,12 @@ clip describes the work that is actually starting, chosen from a closed
 server-side allowlist. There is no "almost done" style fake-progress phrase,
 and user or private text is never synthesized.
 
-| Situation | Spoken |
-|-----------|--------|
-| Calendar lookup | "Let me check your calendar." |
-| Health data lookup | "I'm checking your latest health data." |
-| Mail lookup | "Let me look at your mail." |
-| Any other tool | "One moment while I pull that up." |
+| Situation | Spoken | Reachable in V1 |
+|-----------|--------|-----------------|
+| Calendar lookup | "Let me check your calendar." | Yes (`list_calendar_events`) |
+| Health data lookup | "I'm checking your latest health data." | Yes (`get_recent_health_data`) |
+| Mail lookup | "Let me look at your mail." | **No** — the mapping exists for the mail tools of a later slice; no mode currently exposes a mail tool, so this clip is never emitted. Don't build UI for it yet. |
+| Any other tool | "One moment while I pull that up." | Yes (fallback) |
 
 A stall clip is emitted at most once per phrase per turn, and only when the
 model didn't already say what it was doing. Stall audio is interruptible like
@@ -272,19 +323,21 @@ any other audio: on `interrupt`, stop it immediately.
 
 | code | turn_id | Meaning | Client action |
 |------|---------|---------|---------------|
-| `invalid_frame` | `null` | Frame wasn't valid JSON or didn't match a known shape | Fix the frame; the socket stays open |
+| `invalid_frame` | `null` | Frame wasn't valid JSON, was over 64000 bytes, or didn't match a known shape | Fix the frame; the socket stays open |
 | `unsupported_mode` | `null` | `mode` isn't a valid chat mode | Correct the mode; the socket stays open |
-| `invalid_conversation` | set | `conversation_id` isn't a UUID | Retry with `null` to start fresh |
-| `forbidden_conversation` | set | Conversation belongs to another user | Do not retry; start a new conversation |
+| `invalid_conversation` | `null` | `conversation_id` isn't a UUID | Retry with `null` to start fresh; the socket stays open |
+| `forbidden_conversation` | `null` | Conversation belongs to another user | Do not retry; start a new conversation |
 | `model_unavailable` | set | Backend has no model credentials configured | Surface a spoken "I can't reach my brain right now"; retry later |
 | `model_error` | set | Model produced nothing usable | Offer to retry the turn |
 | `tts_unavailable` | set | Voice couldn't start (provider unconfigured/unreachable) | **Non-fatal.** Text continues; fall back to on-device speech if desired |
 | `tts_error` | set | Voice failed mid-turn | **Non-fatal.** Keep whatever audio played; text continues |
 | `internal_error` | set | Unexpected server failure | Offer to retry the turn |
 
-`tts_unavailable` and `tts_error` never kill the text turn — a
-`response_complete` still follows. Every other code with a `turn_id` ends that
-turn without a `response_complete`.
+`tts_unavailable` and `tts_error` are the only non-fatal codes, and they are
+only ever sent after `turn_started` — a `response_complete` still follows.
+Every other code with a `turn_id` set ends that turn without a
+`response_complete`. Codes with `turn_id: null` refer to no turn at all: the
+socket stays usable and nothing needs to be cleaned up client-side.
 
 If the socket drops, reconnect and resume by sending the next `user_turn` with
 the same `conversation_id`. There is no replay of missed frames; the durable

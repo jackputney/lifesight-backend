@@ -56,6 +56,12 @@ ERROR_CODES: frozenset[str] = frozenset(
 # because FastAPI bounds the body; a raw socket needs its own guard.
 MAX_MESSAGE_CHARS = 16_000
 
+# Bound on the whole JSON envelope, checked before it is parsed — the
+# MAX_MESSAGE_CHARS field bound only applies after json.loads has already
+# walked the payload. Generous headroom over MAX_MESSAGE_CHARS because JSON
+# escaping can expand a legitimate message several times over.
+MAX_FRAME_CHARS = 4 * MAX_MESSAGE_CHARS
+
 
 class VoiceOptions(BaseModel):
     """Per-turn voice toggle. Absent object means voice on."""
@@ -96,6 +102,10 @@ def parse_client_frame(raw: str | bytes | None) -> UserTurnFrame | InterruptFram
     """Decode one client frame. Never raises anything but ProtocolError."""
     if raw is None:
         raise ProtocolError("Expected a JSON text frame")
+    if len(raw) > MAX_FRAME_CHARS:
+        # Rejected before decoding or parsing: nothing this large is a valid
+        # frame, and json.loads on it is wasted work on a raw socket.
+        raise ProtocolError(f"Frame exceeds {MAX_FRAME_CHARS} bytes")
     if isinstance(raw, bytes):
         try:
             raw = raw.decode("utf-8")

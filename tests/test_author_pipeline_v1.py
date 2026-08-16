@@ -8,19 +8,74 @@ Run:  python -m unittest tests.test_author_pipeline_v1 -v
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import unittest
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+import asyncpg
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from shared.author_persistence import store as persistence_store
+from shared.author_pipeline import refine as pipeline_refine
+from shared.author_pipeline import service as pipeline_service
 from shared.author_pipeline import store as pipeline_store
 from shared.local_auth.store import use_memory_store
 
 REPO = Path(__file__).resolve().parents[1]
 MIGRATION_017 = REPO / "migrations" / "017_author_capture_pipeline.sql"
+
+# Directories that are not part of the shipped application source.
+NON_SOURCE_DIRS = {"tests", ".venv", "venv", ".git", "__pycache__", "node_modules"}
+
+
+def repo_python_sources() -> list[Path]:
+    """Every shipped .py file in the repo — the scope the invariant actually has."""
+    return [
+        path
+        for path in sorted(REPO.rglob("*.py"))
+        if not NON_SOURCE_DIRS.intersection(path.relative_to(REPO).parts)
+    ]
+
+
+class _NoSqlPool:
+    """Stand-in pool where reaching SQL at all is the failure being tested.
+
+    A malformed path id must be rejected before it is ever bound to `$1::uuid`;
+    real asyncpg answers such a bind with DataError, which surfaces as a 500.
+    """
+
+    def __init__(self):
+        self.queries: list[str] = []
+
+    async def _reject(self, query, *args):
+        self.queries.append(query)
+        raise asyncpg.DataError('invalid input syntax for type uuid: "not-a-uuid"')
+
+    fetch = fetchrow = fetchval = execute = _reject
+
+
+class _SequenceRacePool:
+    """Loses the UNIQUE (session_id, sequence) race `failures` times, then wins."""
+
+    def __init__(self, failures: int, row: dict):
+        self.failures = failures
+        self.row = row
+        self.attempts = 0
+
+    async def fetchrow(self, query, *args):
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise asyncpg.UniqueViolationError(
+                'duplicate key value violates unique constraint '
+                '"author_captures_session_sequence_uidx"'
+            )
+        return dict(self.row)
 
 RAW_ONE = "um, so — the light was, uh, weird… you know?"
 RAW_TWO = "and then she said nothing at all, which was the loudest part"
@@ -104,19 +159,59 @@ class Migration017Tests(unittest.TestCase):
         self.assertIn("BEFORE UPDATE OR DELETE ON author_captures", text)
         self.assertIn("EXECUTE FUNCTION author_captures_reject_mutation()", text)
 
+    def test_immutability_trigger_still_allows_ownership_cascades(self):
+        """Depth guard: direct mutation blocked, cascaded erasure permitted.
+
+        Only the SQL text is asserted here. Whether Postgres actually raises on a
+        direct UPDATE/DELETE and actually lets `DELETE FROM users` through is
+        covered by the live-database suite.
+        """
+        text = MIGRATION_017.read_text(encoding="utf-8")
+        self.assertIn("WHEN (pg_trigger_depth() = 0)", text)
+        self.assertNotIn("DISABLE TRIGGER author_captures_no_update_delete", text)
+
+    def test_composite_owner_keys_are_additive_to_the_existing_foreign_keys(self):
+        text = MIGRATION_017.read_text(encoding="utf-8")
+        self.assertIn("author_sessions_id_user_uidx UNIQUE (id, user_id)", text)
+        for constraint in (
+            "author_captures_session_user_fkey",
+            "author_draft_versions_session_user_fkey",
+            "author_flags_session_user_fkey",
+        ):
+            self.assertIn(constraint, text)
+        self.assertEqual(
+            text.count("REFERENCES author_sessions (id, user_id) ON DELETE CASCADE"), 3
+        )
+        # The single-column FKs the composite keys sit beside are untouched.
+        self.assertEqual(text.count("REFERENCES author_sessions(id) ON DELETE CASCADE"), 3)
+        self.assertEqual(text.count("REFERENCES public.users(id) ON DELETE CASCADE"), 5)
+
     def test_edit_decision_requires_replacement_text_in_schema(self):
         text = MIGRATION_017.read_text(encoding="utf-8")
         self.assertIn("decision <> 'edit' OR replacement_text IS NOT NULL", text)
 
 
 class NoCaptureMutationSourceTests(unittest.TestCase):
-    """Application layer: no UPDATE/DELETE statement targets author_captures."""
+    """Application layer: no UPDATE/DELETE statement targets author_captures.
 
-    def test_store_never_updates_or_deletes_captures(self):
-        text = (REPO / "shared" / "author_pipeline" / "store.py").read_text(encoding="utf-8")
-        lowered = text.lower()
-        self.assertNotIn("update author_captures", lowered)
-        self.assertNotIn("delete from author_captures", lowered)
+    The invariant is repo-wide, so the scan is repo-wide: every shipped .py file,
+    not just the two that happen to own the pipeline today. A capture write added
+    from some future module has to fail here.
+    """
+
+    def test_no_module_anywhere_updates_or_deletes_captures(self):
+        scanned = repo_python_sources()
+        self.assertGreater(len(scanned), 20, "source scan found suspiciously few files")
+        self.assertIn(REPO / "shared" / "author_pipeline" / "store.py", scanned)
+        self.assertIn(REPO / "main.py", scanned)
+
+        offenders: list[str] = []
+        for path in scanned:
+            lowered = path.read_text(encoding="utf-8").lower()
+            for statement in ("update author_captures", "delete from author_captures"):
+                if statement in lowered:
+                    offenders.append(f"{path.relative_to(REPO)}: {statement}")
+        self.assertEqual(offenders, [])
 
     def test_router_exposes_no_capture_mutation_route(self):
         text = (REPO / "routers" / "author_pipeline.py").read_text(encoding="utf-8")
@@ -582,6 +677,159 @@ class AuthorPipelineTests(unittest.TestCase):
                     409,
                 )
 
+    # -- size limits ---------------------------------------------------------
+
+    def test_capture_over_the_character_cap_is_rejected(self):
+        with _env():
+            with self._client() as client:
+                token, _ = self._two_users(client)
+                h = self._auth(token)
+                sid = self._session_with_captures(client, h)
+                path = f"/author/sessions/{sid}/captures"
+
+                too_long = client.post(
+                    path,
+                    headers=h,
+                    json={
+                        "source": "voice",
+                        "raw_text": "a" * (pipeline_store.MAX_CAPTURE_CHARS + 1),
+                    },
+                )
+                self.assertEqual(too_long.status_code, 422, too_long.text[:300])
+
+                at_the_cap = client.post(
+                    path,
+                    headers=h,
+                    json={
+                        "source": "voice",
+                        "raw_text": "a" * pipeline_store.MAX_CAPTURE_CHARS,
+                    },
+                )
+                self.assertEqual(at_the_cap.status_code, 200, at_the_cap.text[:300])
+
+                stored = client.get(path, headers=h).json()
+                self.assertEqual(stored["total"], 3)
+                self.assertEqual(
+                    len(stored["items"][2]["raw_text"]), pipeline_store.MAX_CAPTURE_CHARS
+                )
+
+    def test_service_caps_capture_length_even_when_the_router_is_bypassed(self):
+        with _env():
+            with self._client() as client:
+                token, _ = self._two_users(client)
+                h = self._auth(token)
+                sid = self._session_with_captures(client, h)
+                user_id = pipeline_store._memory.sessions[sid]["user_id"]
+
+                with self.assertRaises(HTTPException) as caught:
+                    asyncio.run(
+                        pipeline_service.append_capture(
+                            sid,
+                            user_id,
+                            source="voice",
+                            raw_text="a" * (pipeline_store.MAX_CAPTURE_CHARS + 1),
+                        )
+                    )
+                self.assertEqual(caught.exception.status_code, 413)
+
+    def test_refine_range_over_the_prompt_budget_is_413_and_costs_nothing(self):
+        with _env():
+            with self._client() as client:
+                token, _ = self._two_users(client)
+                h = self._auth(token)
+                sid = client.post("/author/sessions", headers=h, json={}).json()["id"]
+
+                chunk = "b" * pipeline_store.MAX_CAPTURE_CHARS
+                chunks = (
+                    pipeline_refine.MAX_REFINE_PROMPT_CHARS
+                    // pipeline_store.MAX_CAPTURE_CHARS
+                ) + 1
+                for _ in range(chunks):
+                    created = client.post(
+                        f"/author/sessions/{sid}/captures",
+                        headers=h,
+                        json={"source": "voice", "raw_text": chunk},
+                    )
+                    self.assertEqual(created.status_code, 200, created.text[:300])
+
+                whole_session = self._refine(client, h, sid)
+                self.assertEqual(whole_session.status_code, 413, whole_session.text[:300])
+                self.model.assert_not_called()
+
+                narrower = self._refine(client, h, sid, {"capture_from": 0, "capture_to": 0})
+                self.assertEqual(narrower.status_code, 200, narrower.text[:300])
+
+                detail = client.get(f"/author/sessions/{sid}", headers=h).json()
+                self.assertEqual(len(detail["draft_versions"]), 1)
+
+    # -- concurrency ---------------------------------------------------------
+
+    def test_unwinnable_capture_sequence_contention_is_a_retryable_503(self):
+        with _env():
+            with self._client() as client:
+                token, _ = self._two_users(client)
+                h = self._auth(token)
+                sid = client.post("/author/sessions", headers=h, json={}).json()["id"]
+
+                with patch(
+                    "shared.author_pipeline.store.append_capture",
+                    new=AsyncMock(
+                        side_effect=pipeline_store.CaptureSequenceContention("lost")
+                    ),
+                ):
+                    response = client.post(
+                        f"/author/sessions/{sid}/captures",
+                        headers=h,
+                        json={"source": "voice", "raw_text": RAW_ONE},
+                    )
+                self.assertEqual(response.status_code, 503, response.text[:300])
+                self.assertIn("send this chunk again", response.json()["detail"])
+
+    # -- soft references -----------------------------------------------------
+
+    def test_session_creation_requires_owning_the_conversation_and_manuscript(self):
+        with _env():
+            with self._client() as client:
+                token_a, token_b = self._two_users(client)
+                ha, hb = self._auth(token_a), self._auth(token_b)
+                bookkeeping_a = client.post("/author/sessions", headers=ha, json={}).json()["id"]
+                bookkeeping_b = client.post("/author/sessions", headers=hb, json={}).json()["id"]
+                user_a = pipeline_store._memory.sessions[bookkeeping_a]["user_id"]
+                user_b = pipeline_store._memory.sessions[bookkeeping_b]["user_id"]
+
+                convo_a = pipeline_store.memory_seed_conversation(user_a)
+                convo_b = pipeline_store.memory_seed_conversation(user_b)
+                manuscript_a = pipeline_store.memory_seed_manuscript(user_a)
+                manuscript_b = pipeline_store.memory_seed_manuscript(user_b)
+
+                owned = client.post(
+                    "/author/sessions",
+                    headers=ha,
+                    json={"conversation_id": convo_a, "manuscript_id": manuscript_a},
+                )
+                self.assertEqual(owned.status_code, 200, owned.text[:300])
+                self.assertEqual(owned.json()["conversation_id"], convo_a)
+                self.assertEqual(owned.json()["manuscript_id"], manuscript_a)
+
+                for body in (
+                    {"conversation_id": convo_b},
+                    {"conversation_id": str(uuid.uuid4())},
+                    {"manuscript_id": manuscript_b},
+                    {"manuscript_id": str(uuid.uuid4())},
+                ):
+                    blocked = client.post("/author/sessions", headers=ha, json=body)
+                    self.assertEqual(blocked.status_code, 404, f"{body}: {blocked.text[:200]}")
+
+                for body in (
+                    {"conversation_id": "not-a-uuid"},
+                    {"manuscript_id": "not-a-uuid"},
+                ):
+                    malformed = client.post("/author/sessions", headers=ha, json=body)
+                    self.assertEqual(malformed.status_code, 400, malformed.text[:200])
+
+                # Only the bookkeeping session and the validated one were stored.
+                self.assertEqual(client.get("/author/sessions", headers=ha).json()["total"], 2)
+
     # -- session lifecycle ---------------------------------------------------
 
     def test_end_session_blocks_further_captures(self):
@@ -722,6 +970,198 @@ class AuthorPipelineTests(unittest.TestCase):
                 self.assertEqual(created.status_code, 200, created.text)
                 stored = pipeline_store._memory.sessions[created.json()["id"]]
                 self.assertNotEqual(stored["user_id"], other_user)
+
+
+class MalformedIdPathTests(unittest.TestCase):
+    """A malformed path id takes the ordinary 404 path and never reaches SQL.
+
+    Both author surfaces are covered: the capture pipeline and the older
+    author_persistence routes, which carried the identical bug. They are asserted
+    from this module because it is the test file this slice owns.
+
+    The memory stores are switched OFF on purpose. That puts both stores on their
+    Postgres branch against a pool where any query raises DataError, exactly as
+    asyncpg does for a bad `$1::uuid` bind — so reaching SQL at all fails the test.
+    """
+
+    def setUp(self):
+        use_memory_store(True)
+        pipeline_store.use_memory_store(False)
+        persistence_store.use_memory_store(False)
+        self.pool = _NoSqlPool()
+        for target in ("shared.db.init_pool", "shared.db.close_pool"):
+            patcher = patch(target, new_callable=AsyncMock)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        pool_patch = patch("shared.db.pool", return_value=self.pool)
+        pool_patch.start()
+        self.addCleanup(pool_patch.stop)
+        self.addCleanup(lambda: use_memory_store(False))
+
+    def _client(self):
+        from main import app
+
+        from routers.author_pipeline import router as pipeline_router
+
+        if not any(getattr(r, "path", "") == "/author/sessions" for r in app.routes):
+            app.include_router(pipeline_router)
+        return TestClient(app)
+
+    def _headers(self, client, username: str) -> dict:
+        registered = client.post(
+            "/auth/register",
+            json={"username": username, "password": "password123"},  # pragma: allowlist secret
+        )
+        self.assertEqual(registered.status_code, 200, registered.text[:300])
+        return {"Authorization": f"Bearer {registered.json()['access_token']}"}
+
+    def _assert_all_404(self, client, headers, calls):
+        for method, path, body in calls:
+            request = getattr(client, method)
+            response = request(path, headers=headers) if body is None else request(
+                path, headers=headers, json=body
+            )
+            self.assertEqual(
+                response.status_code, 404, f"{method.upper()} {path}: {response.text[:300]}"
+            )
+        self.assertEqual(self.pool.queries, [])
+
+    def test_malformed_ids_on_every_pipeline_route_are_404(self):
+        bad = "not-a-uuid"
+        with _env():
+            with self._client() as client:
+                headers = self._headers(client, "malformed_pipeline")
+                self._assert_all_404(
+                    client,
+                    headers,
+                    [
+                        ("get", f"/author/sessions/{bad}", None),
+                        ("post", f"/author/sessions/{bad}/end", None),
+                        ("get", f"/author/sessions/{bad}/captures", None),
+                        (
+                            "post",
+                            f"/author/sessions/{bad}/captures",
+                            {"source": "voice", "raw_text": RAW_ONE},
+                        ),
+                        ("post", f"/author/sessions/{bad}/refine", {}),
+                        (
+                            "post",
+                            f"/author/flags/{bad}/decision",
+                            {"decision": "reject"},
+                        ),
+                    ],
+                )
+
+    def test_malformed_ids_on_every_author_persistence_route_are_404(self):
+        bad = "not-a-uuid"
+        with _env():
+            with self._client() as client:
+                headers = self._headers(client, "malformed_persistence")
+                self._assert_all_404(
+                    client,
+                    headers,
+                    [
+                        ("get", f"/author/projects/{bad}", None),
+                        ("patch", f"/author/projects/{bad}", {"title": "renamed"}),
+                        ("delete", f"/author/projects/{bad}", None),
+                        ("get", f"/author/projects/{bad}/documents", None),
+                        (
+                            "post",
+                            f"/author/projects/{bad}/documents",
+                            {"title": "chapter"},
+                        ),
+                        ("get", f"/author/documents/{bad}", None),
+                        (
+                            "patch",
+                            f"/author/documents/{bad}",
+                            {"expected_revision": 1, "title": "renamed"},
+                        ),
+                        ("delete", f"/author/documents/{bad}", None),
+                        ("post", f"/author/documents/{bad}/versions", None),
+                        ("get", f"/author/documents/{bad}/versions", None),
+                        ("get", f"/author/documents/{bad}/versions/{bad}", None),
+                    ],
+                )
+
+
+class CaptureSequenceRetryTests(unittest.TestCase):
+    """Concurrent appends lose the sequence race; that is retried, not a 500."""
+
+    SESSION_ID = "6f1c2a0e-6a1d-4a2f-9a5e-2f3b7c8d9e01"
+    USER_ID = "11111111-1111-4111-8111-111111111111"
+
+    def setUp(self):
+        pipeline_store.use_memory_store(False)
+        now = datetime(2026, 8, 16, 18, 4, 19, tzinfo=timezone.utc)
+        self.session = {"id": self.SESSION_ID, "user_id": self.USER_ID, "status": "active"}
+        self.row = {
+            "id": "b21f4c33-1d5e-4a77-8c90-9e2a1b3c4d55",
+            "session_id": self.SESSION_ID,
+            "user_id": self.USER_ID,
+            "sequence": 7,
+            "source": "voice",
+            "raw_text": RAW_ONE,
+            "captured_at": now,
+            "created_at": now,
+        }
+
+    def _append(self, pool):
+        with patch("shared.db.pool", return_value=pool):
+            with patch(
+                "shared.author_pipeline.store.get_session",
+                new=AsyncMock(return_value=self.session),
+            ):
+                return asyncio.run(
+                    pipeline_store.append_capture(
+                        self.SESSION_ID, self.USER_ID, source="voice", raw_text=RAW_ONE
+                    )
+                )
+
+    def test_a_lost_sequence_race_is_retried_until_it_wins(self):
+        pool = _SequenceRacePool(failures=2, row=self.row)
+        row = self._append(pool)
+        self.assertEqual(pool.attempts, 3)
+        self.assertEqual(row["sequence"], 7)
+        self.assertEqual(row["raw_text"], RAW_ONE)
+
+    def test_exhausted_retries_raise_the_typed_error_not_a_unique_violation(self):
+        pool = _SequenceRacePool(failures=pipeline_store.CAPTURE_SEQUENCE_ATTEMPTS, row=self.row)
+        with self.assertRaises(pipeline_store.CaptureSequenceContention):
+            self._append(pool)
+        self.assertEqual(pool.attempts, pipeline_store.CAPTURE_SEQUENCE_ATTEMPTS)
+
+
+class RefinePromptBudgetTests(unittest.TestCase):
+    """One /refine call has a hard ceiling on how much it can send upstream."""
+
+    def _captures(self, count: int, chars: int) -> list[dict]:
+        return [
+            {"sequence": index, "source": "voice", "raw_text": "c" * chars}
+            for index in range(count)
+        ]
+
+    def test_too_many_captures_is_413(self):
+        captures = self._captures(pipeline_refine.MAX_REFINE_CAPTURES + 1, 1)
+        prompt = pipeline_refine.build_user_prompt(captures)
+        with self.assertRaises(HTTPException) as caught:
+            pipeline_refine.assert_within_prompt_budget(captures, prompt)
+        self.assertEqual(caught.exception.status_code, 413)
+        self.assertIn(str(pipeline_refine.MAX_REFINE_CAPTURES), caught.exception.detail)
+
+    def test_a_range_inside_both_ceilings_is_allowed(self):
+        captures = self._captures(pipeline_refine.MAX_REFINE_CAPTURES, 10)
+        prompt = pipeline_refine.build_user_prompt(captures)
+        self.assertLess(len(prompt), pipeline_refine.MAX_REFINE_PROMPT_CHARS)
+        pipeline_refine.assert_within_prompt_budget(captures, prompt)
+
+    def test_an_oversized_prompt_never_reaches_the_model(self):
+        captures = self._captures(2, pipeline_refine.MAX_REFINE_PROMPT_CHARS)
+        model = Mock(return_value=_model_reply())
+        with patch("shared.author_pipeline.refine.call_model", model):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(pipeline_refine.refine_captures(captures, "preserve_voice"))
+        self.assertEqual(caught.exception.status_code, 413)
+        model.assert_not_called()
 
 
 if __name__ == "__main__":

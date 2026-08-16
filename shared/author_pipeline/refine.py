@@ -27,6 +27,14 @@ from shared.author_pipeline.store import (
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 MAX_OUTPUT_TOKENS = 8192
 
+# Cost ceiling for one /refine call. A session accumulates captures forever, so
+# without a bound on the ASSEMBLED prompt a single account can drive unbounded
+# Anthropic spend by refining a huge range — and the model could not return a
+# refinement that long anyway (MAX_OUTPUT_TOKENS above). Exceeding either bound
+# is a 413 with the actual numbers, never a silent upstream call.
+MAX_REFINE_CAPTURES = 500
+MAX_REFINE_PROMPT_CHARS = 120_000
+
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
 VOICE_CONTRACT = """You are refining a writer's own dictated words for LifeSight.
@@ -134,6 +142,29 @@ def build_user_prompt(captures: list[dict]) -> str:
         lines.append(str(capture["raw_text"]))
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def assert_within_prompt_budget(captures: list[dict], user_prompt: str) -> None:
+    """Reject an oversized refine range before any of it reaches Anthropic."""
+    if len(captures) > MAX_REFINE_CAPTURES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"That range covers {len(captures)} captures; one refine call "
+                f"takes at most {MAX_REFINE_CAPTURES}. Refine a narrower "
+                "capture_from/capture_to range."
+            ),
+        )
+    if len(user_prompt) > MAX_REFINE_PROMPT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"That range assembles {len(user_prompt)} characters of "
+                f"dictation; one refine call takes at most "
+                f"{MAX_REFINE_PROMPT_CHARS}. Refine a narrower "
+                "capture_from/capture_to range."
+            ),
+        )
 
 
 def call_model(system_prompt: str, user_prompt: str) -> str:
@@ -265,6 +296,7 @@ async def refine_captures(captures: list[dict], refinement_level: str) -> dict:
 
     system_prompt = build_system_prompt(refinement_level)
     user_prompt = build_user_prompt(captures)
+    assert_within_prompt_budget(captures, user_prompt)
     raw = await asyncio.to_thread(call_model, system_prompt, user_prompt)
     result = parse_refinement(raw)
     result["model_identifier"] = MODEL

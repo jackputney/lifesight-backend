@@ -1,8 +1,9 @@
 """Author capture → refine → flag → review — REST contract (backend-first).
 
 Identity always via Depends(get_current_user_id). Ownership is never accepted
-from the request body. Cross-user or missing resources → 404 (anti-oracle,
-consistent with author_persistence). Deciding an already-resolved flag → 409.
+from the request body. Cross-user, missing, AND malformed path ids all → 404
+(anti-oracle, consistent with author_persistence). Deciding an already-resolved
+flag → 409. Oversized capture text or refine range → 413.
 
 Raw captures are append-only: this router deliberately exposes no route that
 edits or deletes a capture, and migration 017 blocks it at the database too.
@@ -26,13 +27,18 @@ router = APIRouter(tags=["author-pipeline"])
 
 class SessionCreate(BaseModel):
     title: Optional[str] = Field(default=None, max_length=200)
+    # Soft references (no FK). Ownership of both is verified at creation in
+    # shared/author_pipeline/service.create_session, because a session could
+    # otherwise be filed against another user's conversation or manuscript.
+    # The referenced row can still change hands or be deleted afterwards, so
+    # anything that later DEREFERENCES either id must re-check ownership then.
     conversation_id: Optional[str] = None
     manuscript_id: Optional[str] = None
 
 
 class CaptureCreate(BaseModel):
     source: Literal["voice", "typed"]
-    raw_text: str = Field(..., min_length=1)
+    raw_text: str = Field(..., min_length=1, max_length=store.MAX_CAPTURE_CHARS)
 
 
 class RefineRequest(BaseModel):
@@ -63,13 +69,12 @@ async def create_session(
 ):
     """Every field is optional, so a bodyless start-dictating call is valid."""
     payload = body or SessionCreate()
-    row = await store.create_session(
+    return await service.create_session(
         user_id,
         title=payload.title,
         conversation_id=payload.conversation_id,
         manuscript_id=payload.manuscript_id,
     )
-    return store.serialize_session(row)
 
 
 @router.get("/author/sessions")

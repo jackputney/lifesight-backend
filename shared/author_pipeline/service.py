@@ -22,6 +22,45 @@ NOT_LOCALIZED = (
     "Flag is not localized to a span, so no text change can be applied. "
     "Reject or defer it, or refine again."
 )
+SEQUENCE_CONTENTION = (
+    "Too many captures are being appended to this session at once. "
+    "Nothing was stored — send this chunk again."
+)
+
+
+async def create_session(
+    user_id: str,
+    *,
+    title: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    manuscript_id: Optional[str] = None,
+) -> dict:
+    """Start a capture session, validating both soft references first.
+
+    `conversation_id` and `manuscript_id` carry no foreign key, so without this
+    check a caller could file a session against another user's conversation or
+    manuscript and hand the first feature that dereferences either column a
+    ready-made IDOR.
+    """
+    if conversation_id is not None:
+        if store.normalized_uuid(conversation_id) is None:
+            raise HTTPException(status_code=400, detail="conversation_id must be a UUID")
+        if not await store.conversation_is_owned(conversation_id, user_id):
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if manuscript_id is not None:
+        if store.normalized_uuid(manuscript_id) is None:
+            raise HTTPException(status_code=400, detail="manuscript_id must be a UUID")
+        if not await store.manuscript_is_owned(manuscript_id, user_id):
+            raise HTTPException(status_code=404, detail="Manuscript not found")
+
+    row = await store.create_session(
+        user_id,
+        title=title,
+        conversation_id=conversation_id,
+        manuscript_id=manuscript_id,
+    )
+    return store.serialize_session(row)
 
 
 async def session_detail(session_id: str, user_id: str) -> dict:
@@ -65,10 +104,21 @@ async def append_capture(
         raise HTTPException(status_code=400, detail="Unsupported capture source")
     if not raw_text.strip():
         raise HTTPException(status_code=400, detail="raw_text cannot be empty")
+    if len(raw_text) > store.MAX_CAPTURE_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"raw_text is limited to {store.MAX_CAPTURE_CHARS} characters. "
+                "Send dictation in chunks."
+            ),
+        )
 
-    row = await store.append_capture(
-        session_id, user_id, source=source, raw_text=raw_text
-    )
+    try:
+        row = await store.append_capture(
+            session_id, user_id, source=source, raw_text=raw_text
+        )
+    except store.CaptureSequenceContention as exc:
+        raise HTTPException(status_code=503, detail=SEQUENCE_CONTENTION) from exc
     if row is None:
         raise HTTPException(status_code=404, detail=SESSION_NOT_FOUND)
     return store.serialize_capture(row)

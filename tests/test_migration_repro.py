@@ -184,6 +184,11 @@ MODE_CONSTRAINTS = (
     ("conversations", "mode", "conversations_mode_check"),
     ("action_log", "mode", "action_log_mode_check"),
     ("pending_actions", "source_mode", "pending_actions_source_mode_check"),
+    # Nullable allowlists (NULL = global/unscoped). A stale allowlist here
+    # silently blocks a newly registered mode: admin cannot apply an override
+    # for it, and personalization cannot file a proposal against it.
+    ("user_prompt_overrides", "mode", "user_prompt_overrides_mode_chk"),
+    ("prompt_change_proposals", "mode", "prompt_change_proposals_mode_chk"),
 )
 
 # Registry frozen at migration 009 (pre-checkin).
@@ -223,10 +228,16 @@ def mode_registry_keys() -> set[str]:
 
 
 def modes_from_check_sql(sql: str, constraint_name: str) -> set[str]:
-    """Extract IN (...) string literals for a named CHECK constraint ADD."""
+    """Extract IN (...) string literals for a named mode CHECK constraint.
+
+    Handles both shapes in use: the `ALTER TABLE ... ADD CONSTRAINT` form and
+    the inline `CONSTRAINT ... CHECK (mode IS NULL OR mode IN (...))` form
+    used by the nullable allowlists in migrations 014 and 018.
+    """
     pattern = re.compile(
-        rf"ADD CONSTRAINT {re.escape(constraint_name)}\s+"
-        rf"CHECK \((?:mode|source_mode) IN \((.*?)\)\)",
+        rf"(?:ADD )?CONSTRAINT {re.escape(constraint_name)}\s+CHECK\s*\(\s*"
+        rf"(?:(?:mode|source_mode)\s+IS\s+NULL\s+OR\s+)?"
+        rf"(?:mode|source_mode)\s+IN\s*\((.*?)\)",
         re.IGNORECASE | re.DOTALL,
     )
     match = pattern.search(sql)

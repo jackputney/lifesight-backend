@@ -31,7 +31,7 @@ in the accepted list for its type is ignored.
 | distance_walking_running | canonical `m`; accepted `m`, `km`, `mi`, `ft` |
 | body_mass | canonical `kg`; accepted `kg`, `g`, `lb` |
 | sleep | canonical `min`; accepted `min`, `minute`, `s`, `sec`, `hr`, `h`. Categorical: may instead send `value_text` (e.g. a sleep stage) with `value` and `unit` omitted |
-| workout | canonical `min`; same accepted units as `sleep`. Categorical: may instead send `value_text` (e.g. the activity name) with `value` and `unit` omitted |
+| workout | canonical `min`; accepted `min`, `minute`, `s`, `sec`, `hr`, `h`. Categorical: may instead send `value_text` (e.g. the activity name) with `value` and `unit` omitted |
 
 Only `sleep` and `workout` may be stored without a unit, and only when they
 carry `value_text`. Every sample must have at least one of `value` or
@@ -41,6 +41,12 @@ carry `value_text`. Every sample must have at least one of `value` or
 
 Requires `Authorization: Bearer <access JWT>`. The body never carries a
 `user_id` — ownership is the token's user.
+
+At most **1000 samples per request** (`MAX_SYNC_BATCH`). The limit is enforced on
+the `samples` field itself, so an oversized batch is rejected as a **422** as
+soon as the server passes the cap, without walking the rest of the list — split
+larger uploads client-side and send them sequentially. Nothing from a rejected
+batch is written.
 
 Request:
 
@@ -74,15 +80,19 @@ Request:
 
 | Field | Notes |
 |-------|--------|
-| sample_id | required, 1–200 chars. The HealthKit sample UUID. This is the dedupe key |
-| type | required, one of the closed allowlist above |
-| start_at | required ISO 8601; `Z` accepted. Naive timestamps are read as UTC |
-| end_at | required ISO 8601, must be `>= start_at` |
-| value | optional number. Required unless the type is categorical and `value_text` is set |
-| unit | optional string, `<=32`. Required whenever `value` is set |
-| value_text | optional string, `<=120` — categorical payload for `sleep` / `workout` |
-| source_bundle | optional string, `<=200` |
-| source_name | optional string, `<=200` |
+| samples | required array, **1000 items max**. Over that the whole request is a 422 |
+| sample_id | required string, 1–200 chars. The HealthKit sample UUID. This is the dedupe key. `""` is a 422; a whitespace-only string is per-sample `ignored` |
+| type | required string, 1–64 chars, and one of the closed allowlist above. Over 64 chars is a 422; any other unrecognized value is per-sample `ignored` |
+| start_at | required string, 1–64 chars, ISO 8601; `Z` accepted. Naive timestamps are read as UTC |
+| end_at | required string, 1–64 chars, ISO 8601, must be `>= start_at` |
+| value | optional number, `null` allowed. Required unless the type is categorical and `value_text` is set. A numeric string is coerced; a non-numeric string is a 422; a non-finite number (`NaN` / `Infinity`) is per-sample `ignored` |
+| unit | optional string, `<=32` chars. Required whenever `value` is set |
+| value_text | optional string, `<=120` chars. Stored for any type when sent; it is the only accepted payload for `sleep` / `workout` sent without a `value` |
+| source_bundle | optional string, `<=200` chars. Trimmed; empty or whitespace-only is stored as `null` |
+| source_name | optional string, `<=200` chars. Trimmed; empty or whitespace-only is stored as `null` |
+
+No other keys are read. Unknown extra keys in a sample object are ignored, not
+rejected.
 
 Response:
 
@@ -91,16 +101,24 @@ Response:
   "accepted": 2,
   "updated": 0,
   "ignored": 0,
-  "server_time": "2026-08-15T14:05:12.481Z"
+  "server_time": "2026-08-15T14:05:12.481239Z"
 }
 ```
 
 | Field | Notes |
 |-------|--------|
-| accepted | rows newly inserted this request |
-| updated | rows that already existed under this `sample_id` and whose stored content changed |
-| ignored | everything else: samples rejected by validation, duplicate `sample_id`s inside the same batch, and re-sent samples identical to what is already stored |
-| server_time | when this sync completed, server clock. Same value written to `last_synced_at` |
+| accepted | integer — rows newly inserted this request |
+| updated | integer — rows that already existed under this `sample_id` and whose stored content changed |
+| ignored | integer — everything else: samples rejected by per-sample validation, duplicate `sample_id`s inside the same batch, and re-sent samples identical to what is already stored |
+| server_time | string, never null — when this sync completed, server clock. Same value written to `last_synced_at` |
+
+All four fields are always present and never `null`.
+
+Every timestamp this API returns (`server_time`, `last_synced_at`,
+`latest_sample_at`) is UTC ISO 8601 with a literal `Z` suffix and **fractional
+seconds up to 6 digits**, omitted only when they are exactly zero — decode with
+a formatter that tolerates both (e.g. `.withFractionalSeconds` with a plain
+ISO-8601 fallback), not a fixed-millisecond one.
 
 `accepted + updated + ignored` always equals the number of samples in the
 request.
@@ -120,24 +138,77 @@ Rows are upserted on `(user_id, 'healthkit', sample_id)`.
 
 ### Validation
 
-One malformed sample never fails the batch. Each of these is counted in
-`ignored` and the rest of the batch still lands:
+Validation happens in two layers, and they fail differently. Read both before
+building the upload path.
+
+**Per-sample (`ignored`) — one malformed sample never fails the batch.** Each of
+these is counted in `ignored` and the rest of the batch still lands:
 
 - `type` not in the allowlist
 - `unit` missing on a numeric sample, or not accepted for that `type`
 - `end_at` earlier than `start_at`
 - `start_at` or `end_at` not parseable as ISO 8601
 - neither `value` nor `value_text` present, or `value` not a finite number
-- blank `sample_id`
+  (`NaN` / `Infinity`)
+- `sample_id` that is empty after trimming (e.g. `"   "`)
+
+**Whole-batch (422) — nothing is written and every sample is rejected**, even
+if only one is at fault:
+
+- more than 1000 samples in the request
+- a required field missing or the wrong JSON type (`samples` absent, `type`
+  absent, `value` a non-numeric string, …)
+- `sample_id` sent as `""`
+- **any string field over its length limit**: `sample_id` > 200, `type` > 64,
+  `start_at` / `end_at` > 64, `unit` > 32, `value_text` > 120,
+  `source_bundle` / `source_name` > 200
+
+That last one is the trap: an over-long `unit` or `source_name` is the same
+*class* of problem as an unrecognized `unit` (bad field content), but it fails
+the entire upload with a 422 instead of being counted in `ignored`. **The client
+must truncate `unit`, `value_text`, `source_bundle`, `source_name`, `type` and
+`sample_id` to the limits above before sending** — HealthKit source names and
+categorical labels are device-supplied and can be arbitrarily long. Truncating
+loses nothing: `sample_id`, `value_text`, `source_bundle` and `source_name` are
+trimmed and clipped to exactly these lengths server-side anyway once they pass.
+
+A 422 identifies the offending field in `detail[].loc`, e.g.
+`["body", "samples", 7, "unit"]` for the eighth sample's `unit`. The rejected
+payload is **not** echoed back in the error.
 
 ### Errors
 
 | Status | When |
 |--------|--------|
-| 400 | more than 1000 samples in one request. Nothing is written; split the batch |
-| 401 | missing, malformed, or expired bearer token |
-| 422 | body is not shaped like the request above (e.g. `samples` missing, a field over its length limit) |
-| 503 | database temporarily unavailable (standard backend-wide shape) |
+| 401 | missing, malformed, or expired bearer token. `{"detail": "Missing bearer token"}` or `{"detail": "Invalid or expired token"}` |
+| 422 | any whole-batch failure from the list above — including **more than 1000 samples**. Nothing is written; split the batch |
+| 503 | database temporarily unavailable: `{"detail": "Database temporarily unavailable"}` (backend-wide handler) |
+
+> **Changed from the first draft of this contract:** an oversized batch now
+> returns **422, not 400**. The cap moved onto the `samples` field so a huge
+> body is rejected before the server allocates one object per sample (a 72 MB
+> body previously drove peak RSS past 800 MB before answering 400, enough to
+> OOM the container). A client that special-cases 400 for "batch too large"
+> must be updated to treat 422 with `detail[0].type == "too_long"` the same
+> way. No other status code changed.
+
+The 422 body is FastAPI's standard validation shape, minus the echoed input:
+
+```json
+{
+  "detail": [
+    {
+      "type": "too_long",
+      "loc": ["body", "samples"],
+      "msg": "List should have at most 1000 items after validation, not 1001",
+      "ctx": { "field_type": "List", "max_length": 1000, "actual_length": 1001 }
+    }
+  ]
+}
+```
+
+`ctx` is present only for errors that carry one. The rejected samples are never
+included, so a 422 response stays small no matter how large the request was.
 
 ## 3. `GET /healthkit/status`
 
@@ -146,7 +217,7 @@ returns a sample, a `sample_id`, or any other user's data.
 
 ```json
 {
-  "last_synced_at": "2026-08-15T14:05:12.481Z",
+  "last_synced_at": "2026-08-15T14:05:12.481239Z",
   "categories": {
     "steps": { "latest_sample_at": "2026-08-15T13:58:00Z", "count_last_30d": 412 },
     "heart_rate": { "latest_sample_at": "2026-08-15T14:03:00Z", "count_last_30d": 8841 },
@@ -162,10 +233,10 @@ returns a sample, a `sample_id`, or any other user's data.
 
 | Field | Notes |
 |-------|--------|
-| last_synced_at | ISO 8601 or `null` — when `POST /healthkit/sync` last completed for this user. Read from `health_sync_state`, not derived from samples, so a sync that uploaded only known samples still counts |
-| categories | always contains **all eight** allowlisted types, in the allowlist order, so the client decodes a fixed shape |
-| categories[type].latest_sample_at | ISO 8601 or `null` — `MAX(start_at)` over all of this user's samples of that type, any provider |
-| categories[type].count_last_30d | integer, `0` when there is nothing. Counts samples with `start_at` within the last 30 days |
+| last_synced_at | ISO 8601 string or `null` — when `POST /healthkit/sync` last completed for this user. Read from `health_sync_state`, not derived from samples, so a sync that uploaded only known samples still counts. `null` until the first sync |
+| categories | object, always present — contains **all eight** allowlisted types, in the allowlist order, so the client decodes a fixed shape. Both keys inside each entry are always present |
+| categories[type].latest_sample_at | ISO 8601 string or `null` — `MAX(start_at)` over all of this user's samples of that type, any provider, with no time window. Echoes the precision the device sent, so it may have no fractional seconds |
+| categories[type].count_last_30d | integer, never null, `0` when there is nothing. Counts this user's samples of that type, any provider, whose `start_at` is within the last 30 days |
 
 Terra-sourced samples are included in these aggregates: the status endpoint
 answers "what health data does the server hold for me", not "what did the
@@ -182,6 +253,10 @@ phone upload".
 - `health_samples.user_id` is `REFERENCES users(id) ON DELETE CASCADE` — deleting
   a user removes their samples and sync state.
 - Health values are never written to logs.
+- The 401s above are what a deployed backend returns (`AUTH_MODE=self`, which
+  staging and production require). A local backend left on the default
+  `AUTH_MODE=dev` resolves every request — including one with no token — to a
+  fixed dev user, so a client cannot infer auth correctness from a local run.
 
 ## 5. Terra reconciliation — why `health_metrics` is deprecated
 
@@ -208,8 +283,21 @@ Terra payloads have no stable per-sample id, so ingest synthesizes a
 deterministic one: `sha256(metric_type|recorded_at|source_device|value)`
 truncated to 40 hex characters. A replayed webhook therefore upserts the same
 rows instead of duplicating them. Terra summary metrics are point-in-time, so
-`start_at == end_at == recorded_at`. Terra metric keys outside the mapping are
-dropped and counted rather than inventing a `sample_type`.
+`start_at == end_at == recorded_at`.
+
+Because `recorded_at` is part of that hash, the idempotency guarantee only
+holds for metrics Terra actually timestamps. A metric with a missing or
+unparseable `recorded_at` is therefore **dropped and counted in `ignored`**, not
+stamped with the server clock: substituting `now()` would hash a different id on
+every delivery — reintroducing exactly the duplicate rows this design removes —
+and would also record a health reading at a time it was not taken.
+
+A Terra metric is dropped and counted in `ignored` when it has:
+
+- no entry in the metric mapping (a new Terra field never invents a `sample_type`)
+- no numeric `value` (e.g. the raw nested-object rows)
+- no parseable `recorded_at`
+- a duplicate synthesized id inside the same payload
 
 The webhook response keeps its shape and adds one counter:
 
@@ -217,8 +305,10 @@ The webhook response keeps its shape and adds one counter:
 { "ok": true, "written": 6, "ignored": 3 }
 ```
 
-`written` is inserted + updated rows; `ignored` is unmapped Terra metrics plus
-replayed rows that changed nothing (so a replay returns `written: 0`).
+`written` is inserted + updated rows; `ignored` is the dropped metrics above
+plus replayed rows that changed nothing — so replaying a delivery returns
+`written: 0`. A payload with no resolvable user acks as
+`{"ok": true, "written": 0, "ignored": 0}`, and a bad signature is a 401.
 `POST /wearables/connect` is unchanged.
 
 ## 6. Chat tool `get_recent_health_data` — bounded context
@@ -242,12 +332,17 @@ The tool returns plain text aggregates — per type: number of days and samples
 in the window, the daily average (a daily total for `steps`, `active_energy`,
 `distance_walking_running`, `sleep`, `workout`; a daily mean for `heart_rate`,
 `resting_heart_rate`, `body_mass`), the range across days, and the latest
-reading with its timestamp:
+reading with its timestamp.
 
-```json
-{
-  "tool_result": "Health summary, last 14 day(s), aggregates only:\n- resting_heart_rate: 14 day(s), 14 sample(s); avg 54 bpm; range 51 bpm–58 bpm; latest 52 bpm at 2026-08-15T06:40:00Z.\n- sleep: 14 day(s), 61 sample(s); avg/day 7.1 h; range 5.4 h–8.3 h; latest 1.4 h at 2026-08-15T06:35:00Z.\nTrends only — describe patterns, never diagnose a disease or condition; defer clinical questions to a clinician."
-}
+This text is server-internal: it goes back to Claude as a `tool_result` inside
+the turn and never appears in an iOS response field. Nothing in `/chat` or
+`/healthkit/*` returns it. Shown here only so the behavior is reviewable:
+
+```text
+Health summary, last 14 day(s), aggregates only:
+- resting_heart_rate: 14 day(s), 14 sample(s); avg 54 bpm; range 51 bpm–58 bpm; latest 52 bpm at 2026-08-15T06:40:00Z.
+- sleep: 14 day(s), 61 sample(s); avg/day 7.1 h; range 5.4 h–8.3 h; latest 1.4 h at 2026-08-15T06:35:00Z.
+Trends only — describe patterns, never diagnose a disease or condition; defer clinical questions to a clinician.
 ```
 
 Guarantees:

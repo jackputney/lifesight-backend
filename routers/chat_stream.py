@@ -53,6 +53,7 @@ from shared.streaming.protocol import (
     turn_started_frame,
 )
 from shared.streaming.turn import StreamTurn, TurnCancelled, TurnSender
+from shared.tool_rounds import TOOL_PERSIST_GRACE_SECONDS, persist_tool_round
 
 router = APIRouter(tags=["chat"])
 
@@ -68,6 +69,23 @@ TTS_FINISH_TIMEOUT_SECONDS = 30.0
 # Appended to partial assistant text persisted for an interrupted turn so the
 # stored history never reads as a complete reply.
 INTERRUPTED_SUFFIX = "[Interrupted by the user before this reply finished.]"
+
+# How long a cancelled turn waits for an in-flight tool-round write to land.
+# The two writes of a tool round are a pair; splitting them would persist a
+# tool_use with no tool_result.
+# Re-exported from shared.tool_rounds; kept as a name for readability here.
+_TOOL_PERSIST_GRACE_SECONDS = TOOL_PERSIST_GRACE_SECONDS
+
+# Live /chat/stream sockets per user, so one client cannot open an unbounded
+# number of Anthropic + ElevenLabs streams. In-memory and per-process by
+# design: a single-process deployment with a single event loop, so no lock is
+# needed and the count resets on restart.
+MAX_CONNECTIONS_PER_USER = 4
+OPEN_CONNECTIONS_PER_USER: dict[str, int] = {}
+
+# Private-use close code (RFC 6455 §7.4.2) for a rejected connection over the
+# per-user cap. Documented in docs/STREAMING_VOICE_V1_CONTRACT.md §1.2.
+WS_CLOSE_TOO_MANY_CONNECTIONS = 4029
 
 
 def _new_tts_session() -> ElevenLabsStreamSession:
@@ -88,11 +106,23 @@ async def chat_stream(
     """Streamed chat turns. Auth is the Bearer handshake header — never a query
     parameter — and a bad/missing token is denied with HTTP 401."""
     await websocket.accept()
+    if not _register_connection(user_id):
+        with suppress(RuntimeError, WebSocketDisconnect, OSError):
+            await websocket.close(
+                code=WS_CLOSE_TOO_MANY_CONNECTIONS,
+                reason="Too many concurrent streaming connections",
+            )
+        return
     connection = _Connection(websocket, user_id)
     try:
         await connection.run()
     finally:
-        await connection.shutdown()
+        # The slot is freed only once this socket's turn is torn down, so a
+        # reconnecting client can never briefly exceed the cap.
+        try:
+            await connection.shutdown()
+        finally:
+            _release_connection(user_id)
 
 
 class _Connection:
@@ -252,9 +282,22 @@ class _Connection:
         user_id = self._user_id
         transcript = frame.message
 
-        conversation_id, mode = await main._ensure_conversation(
-            frame.conversation_id, user_id=user_id, mode=request_mode
-        )
+        try:
+            conversation_id, mode = await main._ensure_conversation(
+                frame.conversation_id, user_id=user_id, mode=request_mode
+            )
+        except HTTPException as exc:
+            # turn_started has not been sent, so the client has no state for
+            # this turn_id yet. Report it connection-level (turn_id: null) —
+            # an error frame must never introduce an unknown turn_id.
+            await self._sender.send(
+                error_frame(
+                    turn_id=None,
+                    code=_http_error_code(exc.status_code),
+                    message=str(exc.detail),
+                )
+            )
+            return
         turn.conversation_id = conversation_id
         turn.raise_if_cancelled()
         await self._sender.send(
@@ -465,6 +508,9 @@ class _Connection:
             create_kwargs["tools"] = tools
 
         spoken_parts: list[str] = []
+        # Rounds already committed to history inside their assistant blocks —
+        # re-persisting them on interrupt would duplicate the spoken text.
+        persisted_through = 0
         pending_action = None
         visual_panel = None
         client_actions: list = []
@@ -523,17 +569,26 @@ class _Connection:
                         }
                     )
 
-                # Persist the assistant tool_use blocks and their results back to
-                # back so an interrupted turn can never leave a dangling tool_use
-                # that would invalidate the next model call.
+                # The assistant tool_use blocks and their tool_result blocks are
+                # a pair: history containing one without the other is rejected
+                # by Anthropic for the whole conversation from then on. The
+                # write is shielded so a hard cancel cannot split it; a failed
+                # write is repaired on read by shared.context_budget.
                 assistant_blocks = [block.model_dump() for block in message.content]
-                await db.append_message(conversation_id, "assistant", assistant_blocks)
-                await db.append_message(conversation_id, "user", tool_results)
+                await _persist_tool_round(
+                    conversation_id,
+                    assistant_blocks=assistant_blocks,
+                    tool_results=tool_results,
+                )
+                # This round's text is now in history inside assistant_blocks.
+                persisted_through = len(spoken_parts)
                 working.append({"role": "assistant", "content": assistant_blocks})
                 working.append({"role": "user", "content": tool_results})
                 create_kwargs["messages"] = working
         except TurnCancelled:
-            await self._persist_interrupted(conversation_id, spoken_parts)
+            await self._persist_interrupted(
+                conversation_id, spoken_parts[persisted_through:]
+            )
             raise
         finally:
             with suppress(Exception):
@@ -694,19 +749,38 @@ class _TurnVoice:
             return
         self._started = True
         session = _new_tts_session()
+        # Registered before open() so every teardown path — cooperative abort,
+        # this turn's aclose(), or a hard cancel delivered inside open()'s init
+        # send — can still reach a socket that already connected upstream.
+        self._session = session
+        self._turn.attach_tts(session)
         try:
             await session.open()
         except HTTPException as exc:
-            await session.close()
+            await self._discard(session)
             await self._report(ERROR_TTS_UNAVAILABLE, str(exc.detail))
             return
         except ElevenLabsStreamError:
-            await session.close()
+            await self._discard(session)
             await self._report(ERROR_TTS_UNAVAILABLE, "Voice streaming is unavailable.")
             return
-        self._session = session
-        self._turn.attach_tts(session)
+        except asyncio.CancelledError:
+            # A hard cancel here would otherwise leak a connected upstream
+            # websocket that nothing holds a reference to any more.
+            await self._discard(session)
+            raise
+        except BaseException:
+            await self._discard(session)
+            raise
         self._consumer = asyncio.create_task(self._consume())
+
+    async def _discard(self, session: ElevenLabsStreamSession) -> None:
+        """Forget a session that never became usable, closing it upstream."""
+        if self._session is session:
+            self._session = None
+        self._turn.attach_tts(None)
+        with suppress(BaseException):
+            await session.close()
 
     async def speak(self, delta: str) -> None:
         session = self._session
@@ -815,13 +889,46 @@ class _TurnVoice:
 # ---------------------------------------------------------------------------
 
 def _http_error_code(status_code: int) -> str:
+    """Map an HTTPException from the shared turn machinery to a wire code.
+
+    503 is deliberately not `tts_unavailable`: TTS failures are handled inside
+    _TurnVoice and never reach here, so a 503 arriving at this point is a dead
+    turn. Labelling it `tts_unavailable` would tell the client the turn is still
+    coming (a response_complete always follows that code) and hang it forever.
+    """
     if status_code == 400:
         return ERROR_INVALID_CONVERSATION
     if status_code == 403:
         return ERROR_FORBIDDEN_CONVERSATION
-    if status_code == 503:
-        return ERROR_TTS_UNAVAILABLE
     return ERROR_INTERNAL
+
+
+def _register_connection(user_id: str) -> bool:
+    """Claim one of this user's connection slots. False means over the cap."""
+    live = OPEN_CONNECTIONS_PER_USER.get(user_id, 0)
+    if live >= MAX_CONNECTIONS_PER_USER:
+        return False
+    OPEN_CONNECTIONS_PER_USER[user_id] = live + 1
+    return True
+
+
+def _release_connection(user_id: str) -> None:
+    live = OPEN_CONNECTIONS_PER_USER.get(user_id, 0) - 1
+    if live > 0:
+        OPEN_CONNECTIONS_PER_USER[user_id] = live
+    else:
+        OPEN_CONNECTIONS_PER_USER.pop(user_id, None)
+
+
+async def _persist_tool_round(
+    conversation_id: str, *, assistant_blocks: list, tool_results: list
+) -> None:
+    """Thin alias so the streaming turn and `main` share one implementation."""
+    await persist_tool_round(
+        conversation_id,
+        assistant_blocks=assistant_blocks,
+        tool_results=tool_results,
+    )
 
 
 def _as_wire(action: Any) -> dict:

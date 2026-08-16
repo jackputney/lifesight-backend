@@ -160,8 +160,11 @@ def normalize_terra_metrics(
 ) -> tuple[list[NormalizedSample], int]:
     """Map Terra's flattened metrics onto the closed vocabulary.
 
-    Returns (samples, ignored). Terra metrics with no mapping are dropped and
-    counted — a new Terra field never invents a sample_type.
+    Returns (samples, ignored). Dropped and counted, never invented: metrics
+    with no mapping, no value, or no parseable recorded_at. The timestamp is
+    part of the synthesized external_id, so substituting now() for a missing
+    one would give the same metric a new id on every replay — duplicate rows,
+    and a fabricated time on a health reading.
     """
     samples: list[NormalizedSample] = []
     ignored = 0
@@ -173,7 +176,10 @@ def normalize_terra_metrics(
             ignored += 1
             continue
         sample_type, source_unit = mapped
-        recorded_at = parse_timestamp(metric.get("recorded_at")) or _now()
+        recorded_at = parse_timestamp(metric.get("recorded_at"))
+        if recorded_at is None:
+            ignored += 1
+            continue
         source_device = metric.get("source_device")
         sample, _reason = normalize_sample(
             external_id=terra_external_id(
@@ -202,7 +208,13 @@ async def ingest_terra_metrics(
     user_id: str,
     metrics: list[dict[str, Any]],
 ) -> tuple[int, int]:
-    """Upsert mapped Terra metrics. Returns (written, ignored)."""
+    """Upsert mapped Terra metrics. Returns (written, ignored).
+
+    written = inserted + updated. ignored = unmappable metrics (no mapping, no
+    value, no parseable recorded_at) + duplicates inside one payload + replayed
+    rows whose stored content did not change, so replaying a webhook returns
+    written 0.
+    """
     samples, ignored = normalize_terra_metrics(metrics)
     deduped, in_batch_dupes = _dedupe_last_wins(samples)
     ignored += in_batch_dupes
