@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from shared import db, terra
 from shared.auth import get_current_user_id
+from shared.health.service import ingest_terra_metrics
 
 router = APIRouter()
 
@@ -706,6 +707,15 @@ async def wearables_terra_webhook(
     request: Request,
     terra_signature: Optional[str] = Header(None, alias="terra-signature"),
 ):
+    """Normalize Terra metrics into health_samples (provider='terra').
+
+    Terra has no stable per-sample id, so ingest synthesizes a deterministic
+    one (see shared/health/service.terra_external_id) and a replayed webhook
+    upserts instead of duplicating: `written` is 0 on replay. Terra metrics
+    outside the closed sample_type allowlist are dropped and counted in
+    `ignored` rather than inventing a type. Legacy health_metrics is no longer
+    written (migration 016 deprecates it).
+    """
     body_bytes = await request.body()
     if not terra.verify_webhook_signature(body_bytes, terra_signature):
         raise HTTPException(status_code=401, detail="Invalid Terra webhook signature")
@@ -720,7 +730,7 @@ async def wearables_terra_webhook(
     user_id = user.get("reference_id") or payload.get("reference_id")
     if not user_id:
         # Ack without write — some Terra pings are non-user events.
-        return {"ok": True, "written": 0}
+        return {"ok": True, "written": 0, "ignored": 0}
 
     provider = user.get("provider") or "terra"
     await db.upsert_wearable_connection(
@@ -729,23 +739,7 @@ async def wearables_terra_webhook(
         aggregator_token_ref=str(user.get("user_id") or "") or None,
     )
 
-    written = 0
-    for metric in terra.extract_metrics(payload):
-        recorded_raw = metric.get("recorded_at")
-        if recorded_raw:
-            try:
-                recorded_at = datetime.fromisoformat(str(recorded_raw).replace("Z", "+00:00"))
-            except ValueError:
-                recorded_at = datetime.now(timezone.utc)
-        else:
-            recorded_at = datetime.now(timezone.utc)
-        await db.insert_health_metric(
-            str(user_id),
-            metric_type=metric["metric_type"],
-            value=metric.get("value"),
-            value_json=metric.get("value_json"),
-            source_device=metric.get("source_device"),
-            recorded_at=recorded_at,
-        )
-        written += 1
-    return {"ok": True, "written": written}
+    written, ignored = await ingest_terra_metrics(
+        str(user_id), terra.extract_metrics(payload)
+    )
+    return {"ok": True, "written": written, "ignored": ignored}

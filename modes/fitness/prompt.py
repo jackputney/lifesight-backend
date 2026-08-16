@@ -1,6 +1,7 @@
 """Fitness Mode — workout sessions, voice set logging, personal records."""
 
 from shared.epistemic import compose_system_prompt
+from shared.health.tools import GET_RECENT_HEALTH_DATA_TOOL
 
 MODE_NAME = "fitness"
 
@@ -34,7 +35,17 @@ physiological effects from weak evidence.
 
 Available backend endpoints the app uses alongside chat: \
 POST /workouts/session/start, POST /workouts/voice-log, \
-GET /workouts/session/{id}/state."""
+GET /workouts/session/{id}/state.
+
+Recent health data (Apple Health / wearable):
+- Call get_recent_health_data ONLY when recent steps, workouts, sleep, heart \
+rate, energy burned, distance, or body weight would actually change your \
+answer (e.g. programming today's session, judging recovery, explaining a \
+performance drop). Ask for the fewest types and days you need.
+- It returns aggregates only. Never claim a reading it did not return, and \
+never assume data exists — an empty window means the user has not synced.
+- Never diagnose a disease or medical condition from this data. Describe \
+trends only and defer clinical questions to a clinician."""
 
 SYSTEM_PROMPT = compose_system_prompt(INSTRUCTIONS)
 
@@ -71,5 +82,6 @@ TOOLS: list[dict] = [
             },
             "required": ["exercise_name", "sets", "reps", "rest_seconds"],
         },
-    }
+    },
+    GET_RECENT_HEALTH_DATA_TOOL,
 ]
