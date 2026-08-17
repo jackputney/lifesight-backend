@@ -49,6 +49,12 @@ EXPECTED_TABLES = (
     "author_flag_decisions",
     "personalization_summaries",
     "prompt_change_proposals",
+    "workout_plans",
+    "workout_days",
+    "planned_exercises",
+    "workout_sessions",
+    "set_logs",
+    "personal_records",
 )
 
 # Looked up by (table, column, ref_table, ref_column); name is diagnostic only.
