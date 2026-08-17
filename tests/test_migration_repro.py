@@ -178,6 +178,9 @@ EXPECTED_FOREIGN_KEYS = (
         "users",
         "id",
     ),
+    ("workout_days_user_id_fkey", "workout_days", "user_id", "users", "id"),
+    ("planned_exercises_user_id_fkey", "planned_exercises", "user_id", "users", "id"),
+    ("set_logs_user_id_fkey", "set_logs", "user_id", "users", "id"),
 )
 
 MODE_CONSTRAINTS = (

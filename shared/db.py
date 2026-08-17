@@ -97,6 +97,8 @@ def is_connection_failure(exc: BaseException) -> bool:
         ),
     ):
         return True
+    if isinstance(exc, asyncpg.InvalidAuthorizationSpecificationError):
+        return True
     if isinstance(exc, asyncpg.InternalServerError):
         msg = str(exc).lower()
         return any(marker in msg for marker in _CONNECTION_MESSAGE_MARKERS)
@@ -277,6 +279,15 @@ async def init_pool() -> None:
                 "serving /health without DB",
                 request_id_var.get(),
             )
+            try:
+                await raw.close()
+            except Exception as close_exc:
+                logger.warning(
+                    "database_pool_close_failed exception_type=%s detail=%s",
+                    type(close_exc).__name__,
+                    str(close_exc),
+                )
+            _pool = None
             return
         raise
 
@@ -330,7 +341,11 @@ async def recreate_pool() -> None:
                     type(exc).__name__,
                     str(exc),
                 )
-        raw = await _create_raw_pool(dsn)
+        try:
+            raw = await _create_raw_pool(dsn)
+        except Exception as exc:
+            log_db_failure(exc)
+            raise DatabaseUnavailableError() from exc
         _pool = ResilientPool(raw)
         logger.warning(
             "database_pool_recreated request_id=%s pool_size=%s idle_size=%s",
@@ -908,66 +923,34 @@ async def update_writing_document_revision(document_id: str, revision_id: str) -
 
 
 # ---------------------------------------------------------------------------
-# v2 Fitness (003: workout_*)
+# v2 Fitness (003/019: workout_*) — implementation lives in shared.fitness.store
 # ---------------------------------------------------------------------------
 
 async def start_workout_session(user_id: str, plan_day_id: Optional[str] = None) -> dict:
-    """Abandon any other active session for this user, then open a new one."""
-    await pool().execute(
-        """
-        UPDATE workout_sessions
-        SET status = 'abandoned', ended_at = now()
-        WHERE user_id = $1::uuid AND status = 'active'
-        """,
-        user_id,
-    )
-    row = await pool().fetchrow(
-        """
-        INSERT INTO workout_sessions (user_id, plan_day_id, status)
-        VALUES ($1::uuid, $2::uuid, 'active')
-        RETURNING id, user_id, session_date, plan_day_id, status, started_at
-        """,
-        user_id, plan_day_id,
-    )
-    return dict(row)
+    from shared.fitness import store as fitness_store
+
+    session, _resumed = await fitness_store.start_or_resume_session(user_id, plan_day_id)
+    if session is None:
+        raise ValueError("plan_day_id not found for user")
+    return session
 
 
 async def get_workout_session(session_id: str, user_id: str) -> Optional[dict]:
-    row = await pool().fetchrow(
-        """
-        SELECT id, user_id, session_date, plan_day_id, status, started_at, ended_at
-        FROM workout_sessions
-        WHERE id = $1::uuid AND user_id = $2::uuid
-        """,
-        session_id, user_id,
-    )
-    return dict(row) if row else None
+    from shared.fitness import store as fitness_store
+
+    return await fitness_store.get_session(session_id, user_id)
 
 
-async def list_planned_exercises_for_day(plan_day_id: str) -> list[dict]:
-    rows = await pool().fetch(
-        """
-        SELECT id, day_id, name, target_sets, target_reps, rest_seconds, sort_order
-        FROM planned_exercises
-        WHERE day_id = $1::uuid
-        ORDER BY sort_order
-        """,
-        plan_day_id,
-    )
-    return [dict(r) for r in rows]
+async def list_planned_exercises_for_day(plan_day_id: str, user_id: str) -> list[dict]:
+    from shared.fitness import store as fitness_store
+
+    return await fitness_store.list_exercises_for_day(plan_day_id, user_id)
 
 
-async def list_set_logs(session_id: str) -> list[dict]:
-    rows = await pool().fetch(
-        """
-        SELECT id, session_id, exercise_id, set_number, reps, weight, completed_at, source
-        FROM set_logs
-        WHERE session_id = $1::uuid
-        ORDER BY completed_at, set_number
-        """,
-        session_id,
-    )
-    return [dict(r) for r in rows]
+async def list_set_logs(session_id: str, user_id: str) -> list[dict]:
+    from shared.fitness import store as fitness_store
+
+    return await fitness_store.list_set_logs(session_id, user_id)
 
 
 async def insert_set_log(
@@ -977,54 +960,31 @@ async def insert_set_log(
     reps: Optional[int],
     weight: Optional[float],
     source: str = "voice",
+    *,
+    user_id: str,
 ) -> dict:
-    row = await pool().fetchrow(
-        """
-        INSERT INTO set_logs (session_id, exercise_id, set_number, reps, weight, source)
-        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)
-        RETURNING id, session_id, exercise_id, set_number, reps, weight, completed_at, source
-        """,
-        session_id, exercise_id, set_number, reps, weight, source,
+    from shared.fitness import store as fitness_store
+
+    return await fitness_store.insert_set_log(
+        user_id, session_id, exercise_id, set_number, reps, weight, source=source
     )
-    return dict(row)
 
 
 async def get_personal_record(user_id: str, exercise_id: str, rep_range: int) -> Optional[dict]:
-    row = await pool().fetchrow(
-        """
-        SELECT id, user_id, exercise_id, rep_range, weight, achieved_at
-        FROM personal_records
-        WHERE user_id = $1::uuid AND exercise_id = $2::uuid AND rep_range = $3
-        """,
-        user_id, exercise_id, rep_range,
-    )
-    return dict(row) if row else None
+    from shared.fitness import store as fitness_store
+
+    return await fitness_store.get_personal_record(user_id, exercise_id, rep_range)
 
 
 async def upsert_personal_record(
     user_id: str, exercise_id: str, rep_range: int, weight: float
 ) -> dict:
-    row = await pool().fetchrow(
-        """
-        INSERT INTO personal_records (user_id, exercise_id, rep_range, weight)
-        VALUES ($1::uuid, $2::uuid, $3, $4)
-        ON CONFLICT (user_id, exercise_id, rep_range) DO UPDATE
-        SET weight = EXCLUDED.weight, achieved_at = now()
-        WHERE EXCLUDED.weight > personal_records.weight
-        RETURNING id, user_id, exercise_id, rep_range, weight, achieved_at
-        """,
-        user_id, exercise_id, rep_range, weight,
+    from shared.fitness import store as fitness_store
+
+    row, _is_new = await fitness_store.upsert_personal_record(
+        user_id, exercise_id, rep_range, weight
     )
-    # ON CONFLICT ... WHERE can yield no row when the new weight isn't better.
-    if row is None:
-        existing = await get_personal_record(user_id, exercise_id, rep_range)
-        return existing or {
-            "user_id": user_id,
-            "exercise_id": exercise_id,
-            "rep_range": rep_range,
-            "weight": weight,
-        }
-    return dict(row)
+    return row
 
 
 # ---------------------------------------------------------------------------

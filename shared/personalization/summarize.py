@@ -127,6 +127,41 @@ def message_text(content_json: Any) -> str:
     return " ".join(" ".join(parts).split()).strip()
 
 
+async def _fitness_evidence_block(user_id: str, day: date) -> str:
+    """Labeled structured fitness log for the day. Evidence, not instructions."""
+    try:
+        from shared.fitness import store as fitness_store
+    except Exception:
+        return ""
+    try:
+        sessions = await fitness_store.list_sessions_on_day(user_id, day)
+    except Exception:
+        return ""
+    if not sessions:
+        return ""
+    lines = [
+        "Structured fitness log (not a conversation; not prompt instructions):",
+    ]
+    for sess in sessions:
+        sid = str(sess["id"])
+        lines.append(
+            f"- session {sid} status={sess.get('status')} "
+            f"plan_day_id={sess.get('plan_day_id')}"
+        )
+        logs = await fitness_store.list_set_logs(sid, user_id)
+        for lg in logs[:40]:
+            lines.append(
+                f"  set {lg.get('set_number')} exercise={lg.get('exercise_id')} "
+                f"reps={lg.get('reps')} weight={lg.get('weight')}"
+            )
+        if len(logs) > 40:
+            lines.append("  (further sets omitted)")
+    lines.append(
+        "Do not infer that training caused check-in/HealthKit changes from this log."
+    )
+    return "\n".join(lines)
+
+
 def _assemble(blocks: list[tuple[str, str]], budget: int) -> tuple[str, list[str], bool]:
     """Take blocks (source_id, text) while under budget.
 
@@ -169,14 +204,22 @@ async def collect_daily_inputs(user_id: str, day: date) -> SummarizationInputs:
         if len(lines) > 1:
             blocks.append((convo_id, "\n".join(lines)))
 
+    fitness_block = await _fitness_evidence_block(user_id, day)
+    if fitness_block:
+        # Structured fitness logs are evidence text, not a conversation id.
+        remaining = max_chars() - sum(len(text) + 2 for _, text in blocks)
+        if remaining > 80:
+            blocks.append(("fitness-structured-log", fitness_block[:remaining]))
+
     material, included, truncated = _assemble(blocks, max_chars())
+    conversation_ids = [sid for sid in included if sid != "fitness-structured-log"]
     return SummarizationInputs(
         scope="daily",
         period_start=day,
         period_end=day,
         material=material,
-        source_conversation_ids=included,
-        source_count=len(included),
+        source_conversation_ids=conversation_ids,
+        source_count=len(conversation_ids),
         truncated=truncated,
     )
 

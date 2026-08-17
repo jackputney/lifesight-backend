@@ -52,6 +52,7 @@ from routers.daily_checkin import router as daily_checkin_router
 from routers.healthkit import router as healthkit_router
 from routers.integrations_google import router as integrations_google_router
 from routers.profile import router as profile_router
+from routers.fitness import router as fitness_router
 from routers.v2 import router as v2_router
 from routers.voice import router as voice_router
 from shared.mail_calendar.tools import (
@@ -90,6 +91,8 @@ from shared.personal_context import (
     UPDATE_PERSONAL_CONTEXT_TOOL,
     apply_personal_context_update,
 )
+from shared.fitness.service import overlay_exercise_panel
+from shared.fitness.tools import FITNESS_DOMAIN_TOOLS, run_fitness_tool
 from shared.health.tools import run_get_recent_health_data
 from shared.profile_schema import compact_profile_for_context
 from shared.profile_service import get_profile
@@ -166,6 +169,7 @@ app.include_router(auth_router)
 app.include_router(profile_router)
 app.include_router(daily_checkin_router)
 app.include_router(conversations_router)
+app.include_router(fitness_router)
 app.include_router(v2_router)
 app.include_router(author_persistence_router)
 app.include_router(author_pipeline_router)
@@ -364,6 +368,7 @@ async def _run_tool(
             data = parse_exercise_panel_tool_input(
                 tool_input if isinstance(tool_input, dict) else {}
             )
+            data = await overlay_exercise_panel(user_id, data)
         except Exception as exc:
             return f"Error: invalid exercise panel ({exc}).", None, None, []
         panel = exercise_visual_panel(data)
@@ -427,6 +432,34 @@ async def _run_tool(
             )
         result_text = await run_get_recent_health_data(user_id, tool_input)
         return result_text, None, None, []
+
+    fitness_names = {
+        spec["name"]
+        for spec in FITNESS_DOMAIN_TOOLS
+        if spec["name"] != "get_recent_health_data"
+    }
+    if name in fitness_names:
+        if mode != "fitness":
+            return (
+                f"Error: {name} is only available in fitness mode.",
+                None,
+                None,
+                [],
+            )
+        result_text = await run_fitness_tool(name, user_id, tool_input)
+        panel = None
+        if name == "log_workout_set" and not result_text.startswith("Error"):
+            from shared.fitness import progress as fitness_progress
+            from shared.fitness import service as fitness_service
+            from shared.fitness import store as fitness_store
+
+            active = await fitness_store.get_active_session(user_id)
+            if active is not None:
+                prog = await fitness_progress.session_progress(active, user_id)
+                payload = fitness_service.exercise_panel_from_progress(prog)
+                if payload:
+                    panel = VisualPanel.model_validate(payload)
+        return result_text, None, panel, []
 
     return f"Error: unknown tool '{name}'.", None, None, []
 

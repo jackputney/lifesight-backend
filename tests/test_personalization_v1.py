@@ -17,7 +17,7 @@ import json
 import os
 import re
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +30,7 @@ from shared.epistemic import (
     compose_system_prompt,
 )
 from shared.identity import IDENTITY
+from shared.fitness import store as fitness_store
 from shared.personalization import proposals, store, summarize
 
 REPO = Path(__file__).resolve().parents[1]
@@ -188,7 +189,9 @@ class PersonalizationStoreTestCase(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         store.use_memory_store(True)
+        fitness_store.use_memory_store(True)
         self.addCleanup(lambda: store.use_memory_store(False))
+        self.addCleanup(lambda: fitness_store.use_memory_store(False))
         self.pool = patch("shared.db.pool", MagicMock(side_effect=AssertionError(
             "personalization tests must not touch Postgres"
         )))
@@ -226,6 +229,50 @@ class SummaryEvidenceTests(PersonalizationStoreTestCase):
         self.assertEqual(row["source_conversation_ids"], [convo_id])
         self.assertEqual(row["source_summary_ids"], [])
         self.assertEqual(row["model_identifier"], summarize.summary_model())
+        self.pool_mock.assert_not_called()
+
+    async def test_daily_summary_includes_structured_fitness_evidence(self):
+        self.seed_day(USER_A, DAY_ONE, texts=["Logged a training session."])
+        plan = await fitness_store.create_plan(
+            USER_A,
+            title="Alpha",
+            notes=None,
+            days=[
+                {
+                    "title": "Day A",
+                    "sort_order": 0,
+                    "exercises": [
+                        {
+                            "name": "Bench Press",
+                            "target_sets": 3,
+                            "target_reps": 5,
+                            "rest_seconds": 90,
+                            "sort_order": 0,
+                        }
+                    ],
+                }
+            ],
+        )
+        assembled = await fitness_store.assemble_plan(str(plan["id"]), USER_A)
+        day_id = assembled["days"][0]["id"]
+        ex_id = assembled["days"][0]["exercises"][0]["id"]
+        fixed_start = datetime(
+            DAY_ONE.year, DAY_ONE.month, DAY_ONE.day, 12, 0, tzinfo=timezone.utc
+        )
+        with patch.object(fitness_store, "_now", return_value=fixed_start):
+            session, _ = await fitness_store.start_or_resume_session(USER_A, day_id)
+            await fitness_store.insert_set_log(
+                USER_A, str(session["id"]), ex_id, 1, 5, 185.0, source="manual"
+            )
+
+        inputs = await summarize.collect_inputs(
+            USER_A, scope="daily", period_start=DAY_ONE, period_end=DAY_ONE
+        )
+        self.assertIn("Structured fitness log (not a conversation", inputs.material)
+        self.assertNotIn("fitness-structured-log", inputs.source_conversation_ids)
+
+        row = await self.build_daily(USER_A, DAY_ONE, marker=DAILY_MARKER)
+        self.assertIsNotNone(row)
         self.pool_mock.assert_not_called()
 
     async def test_dropped_conversation_is_not_recorded_as_evidence(self):

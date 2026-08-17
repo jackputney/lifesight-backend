@@ -234,7 +234,7 @@ class DegradedStartupTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"DATABASE_URL": "postgresql://u:p@localhost:5432/db"}, clear=False):  # pragma: allowlist secret
             with patch.object(db, "_create_raw_pool", side_effect=fake_create):
                 await db.init_pool()
-        self.assertIsNotNone(db._pool)
+        self.assertIsNone(db._pool)
         with self.assertRaises(db.DatabaseUnavailableError):
             await db.check_db()
 

@@ -549,5 +549,10 @@ Present in this slice: migration `018`, the summary/proposal writer package
 (`--user-id`, `--scope {daily,multi_day,weekly}`, `--date` /
 `--period-start` / `--period-end`, `--mode`, `--propose`, `--dry-run`).
 
+Daily summaries may also include a labeled structured fitness log for that
+UTC day (sessions/sets). That text is evidence only — see
+`docs/FITNESS_WORKOUT_V1_CONTRACT.md`. It is not a conversation id, is never
+injected into a chat system prompt, and never writes `user_prompt_overrides`.
+
 Not present: any HTTP endpoint for summaries or proposals, any scheduler, any
 chat-time read of summaries, and any backend write to `user_prompt_overrides`.
