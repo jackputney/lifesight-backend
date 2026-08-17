@@ -105,7 +105,7 @@ def parse_client_frame(raw: str | bytes | None) -> UserTurnFrame | InterruptFram
     if len(raw) > MAX_FRAME_CHARS:
         # Rejected before decoding or parsing: nothing this large is a valid
         # frame, and json.loads on it is wasted work on a raw socket.
-        raise ProtocolError(f"Frame exceeds {MAX_FRAME_CHARS} bytes")
+        raise ProtocolError(f"Frame exceeds {MAX_FRAME_CHARS} characters")
     if isinstance(raw, bytes):
         try:
             raw = raw.decode("utf-8")

@@ -35,6 +35,14 @@ one-pending-proposal partial unique index (sections 4–6).
 Hierarchical summaries: raw conversations → `daily` → `multi_day` → `weekly`.
 Each level reads only the level below it and records what it actually read.
 
+A note on timestamps before the tables: every `TIMESTAMPTZ` serialized by the
+Python helpers (`created_at`, `reviewed_at`) becomes UTC ISO 8601 with a
+literal `Z` suffix and **fractional seconds up to 6 digits**, omitted only when
+they are exactly zero. The JSON examples below are trimmed for readability and
+do not show them, so parse with a formatter that tolerates both rather than a
+fixed-millisecond one. `period_start` / `period_end` are plain `DATE` values
+(`YYYY-MM-DD`, no time component).
+
 | Column | Type | Notes |
 |--------|------|--------|
 | `id` | UUID PRIMARY KEY DEFAULT `gen_random_uuid()` | |

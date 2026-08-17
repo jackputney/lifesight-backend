@@ -53,7 +53,7 @@ from shared.streaming.protocol import (
     turn_started_frame,
 )
 from shared.streaming.turn import StreamTurn, TurnCancelled, TurnSender
-from shared.tool_rounds import TOOL_PERSIST_GRACE_SECONDS, persist_tool_round
+from shared.tool_rounds import persist_tool_round
 
 router = APIRouter(tags=["chat"])
 
@@ -73,8 +73,6 @@ INTERRUPTED_SUFFIX = "[Interrupted by the user before this reply finished.]"
 # How long a cancelled turn waits for an in-flight tool-round write to land.
 # The two writes of a tool round are a pair; splitting them would persist a
 # tool_use with no tool_result.
-# Re-exported from shared.tool_rounds; kept as a name for readability here.
-_TOOL_PERSIST_GRACE_SECONDS = TOOL_PERSIST_GRACE_SECONDS
 
 # Live /chat/stream sockets per user, so one client cannot open an unbounded
 # number of Anthropic + ElevenLabs streams. In-memory and per-process by
@@ -286,16 +284,20 @@ class _Connection:
             conversation_id, mode = await main._ensure_conversation(
                 frame.conversation_id, user_id=user_id, mode=request_mode
             )
-        except HTTPException as exc:
+        except (HTTPException, db.DatabaseUnavailableError) as exc:
             # turn_started has not been sent, so the client has no state for
             # this turn_id yet. Report it connection-level (turn_id: null) —
-            # an error frame must never introduce an unknown turn_id.
+            # an error frame must never introduce an unknown turn_id. A
+            # Postgres blip here is routine, not exotic, so it takes the same
+            # path as a rejected conversation id.
+            if isinstance(exc, HTTPException):
+                code = _http_error_code(exc.status_code)
+                message = str(exc.detail)
+            else:
+                code = ERROR_INTERNAL
+                message = "Database temporarily unavailable."
             await self._sender.send(
-                error_frame(
-                    turn_id=None,
-                    code=_http_error_code(exc.status_code),
-                    message=str(exc.detail),
-                )
+                error_frame(turn_id=None, code=code, message=message)
             )
             return
         turn.conversation_id = conversation_id

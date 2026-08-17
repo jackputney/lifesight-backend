@@ -17,7 +17,7 @@ over this socket (§9).
 | Subprotocol | none |
 | Message encoding | UTF-8 JSON text frames, one JSON object per frame |
 | Max `message` length | 16000 characters |
-| Max whole-frame length | 64000 bytes — a larger frame is rejected unparsed with `invalid_frame` |
+| Max whole-frame length | 64000 characters (not bytes — the check is on decoded length, so multi-byte UTF-8 uses more bytes than that) — a larger frame is rejected unparsed with `invalid_frame` |
 | Max concurrent sockets per user | 4 — see §1.2 |
 
 The token goes in the HTTP upgrade request's headers. On iOS that means setting
@@ -323,7 +323,7 @@ any other audio: on `interrupt`, stop it immediately.
 
 | code | turn_id | Meaning | Client action |
 |------|---------|---------|---------------|
-| `invalid_frame` | `null` | Frame wasn't valid JSON, was over 64000 bytes, or didn't match a known shape | Fix the frame; the socket stays open |
+| `invalid_frame` | `null` | Frame wasn't valid JSON, was over 64000 characters, or didn't match a known shape | Fix the frame; the socket stays open |
 | `unsupported_mode` | `null` | `mode` isn't a valid chat mode | Correct the mode; the socket stays open |
 | `invalid_conversation` | `null` | `conversation_id` isn't a UUID | Retry with `null` to start fresh; the socket stays open |
 | `forbidden_conversation` | `null` | Conversation belongs to another user | Do not retry; start a new conversation |
@@ -331,7 +331,7 @@ any other audio: on `interrupt`, stop it immediately.
 | `model_error` | set | Model produced nothing usable | Offer to retry the turn |
 | `tts_unavailable` | set | Voice couldn't start (provider unconfigured/unreachable) | **Non-fatal.** Text continues; fall back to on-device speech if desired |
 | `tts_error` | set | Voice failed mid-turn | **Non-fatal.** Keep whatever audio played; text continues |
-| `internal_error` | set | Unexpected server failure | Offer to retry the turn |
+| `internal_error` | set **or** `null` | Unexpected server failure. `null` when it happened during conversation setup, before `turn_started` — a database blip is the routine case | Offer to retry the turn |
 
 `tts_unavailable` and `tts_error` are the only non-fatal codes, and they are
 only ever sent after `turn_started` — a `response_complete` still follows.

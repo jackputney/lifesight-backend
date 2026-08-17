@@ -110,6 +110,14 @@ the version it was raised against — it inserts the next version with
 Every route depends on `Depends(get_current_user_id)`. Ownership comes from the
 JWT only; a `user_id` in a request body is ignored, never stored.
 
+Every timestamp this API returns (`created_at`, `captured_at`, `updated_at`,
+`ended_at`, `decided_at`) is UTC ISO 8601 with a literal `Z` suffix and
+**fractional seconds up to 6 digits**, omitted only when they are exactly zero.
+The JSON examples below are trimmed for readability and do not show them.
+Decode with a formatter that tolerates both — on iOS, `.withFractionalSeconds`
+with a plain ISO-8601 fallback — not a fixed-millisecond one, which returns
+`nil` on every value here.
+
 | Status | When |
 |--------|------|
 | 401 | Missing or invalid bearer token. |

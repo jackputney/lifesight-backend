@@ -33,6 +33,7 @@ from routers.chat_stream import (
     _persist_tool_round,
     _TurnVoice,
 )
+from shared import db
 from shared.context_budget import build_model_messages, repair_tool_call_pairs
 from shared.elevenlabs_stream import ElevenLabsStreamError, ElevenLabsStreamSession
 from shared.local_auth.store import use_memory_store
@@ -1230,6 +1231,36 @@ class StreamingChatRouteTests(unittest.TestCase):
         self.assertIsNone(frame["turn_id"])
         self.assertEqual(
             self.store.messages, [], "a forbidden turn must write nothing at all"
+        )
+
+    def test_database_blip_during_setup_errors_with_a_null_turn_id(self):
+        # A Postgres hiccup on conversation creation is the routine failure
+        # here. It must not hand the client a turn_id it never saw announced.
+        with _env():
+            with patch(
+                "shared.db.create_conversation",
+                new_callable=AsyncMock,
+                side_effect=db.DatabaseUnavailableError(
+                    "Database temporarily unavailable."
+                ),
+            ):
+                with self._client() as client:
+                    with client.websocket_connect("/chat/stream") as ws:
+                        ws.send_json(
+                            {
+                                "type": "user_turn",
+                                "mode": "fitness",
+                                "message": "How am I doing?",
+                                "voice": {"enabled": False},
+                            }
+                        )
+                        frame = ws.receive_json()
+
+        self.assertEqual(frame["type"], "error")
+        self.assertEqual(frame["code"], ERROR_INTERNAL)
+        self.assertIsNone(
+            frame["turn_id"],
+            "an error before turn_started must not introduce an unknown turn_id",
         )
 
     def test_service_unavailable_mid_turn_is_reported_as_internal_error(self):
