@@ -172,6 +172,35 @@ BEGIN
 END;
 $$;
 
+-- Dedupe before unique indexes (safe on empty dev DBs; required on legacy 003 data).
+WITH ranked_active_sessions AS (
+    SELECT id,
+           ROW_NUMBER() OVER (
+               PARTITION BY user_id ORDER BY started_at DESC, id DESC
+           ) AS rn
+    FROM workout_sessions
+    WHERE status = 'active'
+)
+UPDATE workout_sessions ws
+SET status = 'abandoned',
+    ended_at = COALESCE(ws.ended_at, now())
+FROM ranked_active_sessions r
+WHERE ws.id = r.id
+  AND r.rn > 1;
+
+WITH ranked_duplicate_sets AS (
+    SELECT id,
+           ROW_NUMBER() OVER (
+               PARTITION BY session_id, exercise_id, set_number
+               ORDER BY completed_at DESC NULLS LAST, id DESC
+           ) AS rn
+    FROM set_logs
+)
+DELETE FROM set_logs sl
+USING ranked_duplicate_sets r
+WHERE sl.id = r.id
+  AND r.rn > 1;
+
 -- At most one active workout session per user (003 index was not unique).
 CREATE UNIQUE INDEX IF NOT EXISTS workout_sessions_one_active_per_user
     ON workout_sessions (user_id)

@@ -555,6 +555,46 @@ async def get_active_session(user_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+async def get_last_completed_plan_day_id(
+    user_id: str, *, plan_day_ids: list[str]
+) -> Optional[str]:
+    """Most recently finished session on one of the given plan days, if any."""
+    if not plan_day_ids:
+        return None
+    allowed = {normalized_uuid(day_id) for day_id in plan_day_ids}
+    allowed.discard(None)
+    if not allowed:
+        return None
+    if _mem() is not None:
+        candidates = [
+            s
+            for s in _mem().sessions.values()
+            if s["user_id"] == user_id
+            and s["status"] == "completed"
+            and s.get("plan_day_id") in allowed
+        ]
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda r: r.get("ended_at") or r["started_at"], reverse=True
+        )
+        return str(candidates[0]["plan_day_id"])
+    row = await db.pool().fetchrow(
+        """
+        SELECT plan_day_id
+        FROM workout_sessions
+        WHERE user_id = $1::uuid
+          AND status = 'completed'
+          AND plan_day_id = ANY($2::uuid[])
+        ORDER BY COALESCE(ended_at, started_at) DESC
+        LIMIT 1
+        """,
+        user_id,
+        list(allowed),
+    )
+    return str(row["plan_day_id"]) if row else None
+
+
 async def start_or_resume_session(
     user_id: str,
     plan_day_id: Optional[str] = None,
@@ -593,17 +633,26 @@ async def start_or_resume_session(
     if _mem() is not None:
         _mem().sessions[session_id] = row
         return deepcopy(row), False
-    inserted = await db.pool().fetchrow(
-        """
-        INSERT INTO workout_sessions (id, user_id, plan_day_id, status)
-        VALUES ($1::uuid, $2::uuid, $3::uuid, 'active')
-        RETURNING id, user_id, session_date, plan_day_id, status, started_at, ended_at
-        """,
-        session_id,
-        user_id,
-        plan_day_id,
-    )
-    return dict(inserted), False
+    try:
+        inserted = await db.pool().fetchrow(
+            """
+            INSERT INTO workout_sessions (id, user_id, plan_day_id, status)
+            VALUES ($1::uuid, $2::uuid, $3::uuid, 'active')
+            RETURNING id, user_id, session_date, plan_day_id, status, started_at, ended_at
+            """,
+            session_id,
+            user_id,
+            plan_day_id,
+        )
+        return dict(inserted), False
+    except asyncpg.UniqueViolationError:
+        raced = await get_active_session(user_id)
+        if raced is None:
+            raise
+        raced_day = str(raced["plan_day_id"]) if raced.get("plan_day_id") else None
+        if plan_day_id is None or plan_day_id == raced_day:
+            return raced, True
+        raise ActiveSessionConflict()
 
 
 async def complete_session(session_id: str, user_id: str) -> Optional[dict]:
@@ -639,7 +688,10 @@ async def _set_session_status(
         user_id,
         status,
     )
-    return dict(row) if row else session
+    if row:
+        return dict(row)
+    refreshed = await get_session(session_id, user_id)
+    return refreshed
 
 
 async def list_sessions(

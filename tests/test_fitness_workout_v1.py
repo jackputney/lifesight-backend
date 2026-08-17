@@ -164,6 +164,28 @@ class FitnessClientTests(unittest.TestCase):
                 )
                 self.assertEqual(conflict.status_code, 409)
 
+    def test_omitted_start_resumes_active_session(self):
+        with _env():
+            with self._client() as client:
+                plan = self._create_plan(client)
+                day_a = plan["days"][0]["id"]
+                first = client.post(
+                    "/workouts/session/start",
+                    headers=_headers(),
+                    json={"plan_day_id": day_a},
+                )
+                self.assertEqual(first.status_code, 200, first.text)
+                omitted = client.post(
+                    "/workouts/session/start",
+                    headers=_headers(),
+                    json={},
+                )
+                self.assertEqual(omitted.status_code, 200, omitted.text)
+                self.assertTrue(omitted.json()["resumed"])
+                self.assertEqual(
+                    omitted.json()["session_id"], first.json()["session_id"]
+                )
+
     def test_set_logging_order_complete_abandon_and_pr(self):
         with _env():
             with self._client() as client:
@@ -401,6 +423,65 @@ class FitnessClientTests(unittest.TestCase):
         with _env():
             __import__("asyncio").run(go())
 
+    def test_panel_overlays_named_exercise_on_plan(self):
+        async def go():
+            plan = await store.create_plan(
+                DEV_FAKE_USER_ID,
+                title="Two lift",
+                notes=None,
+                days=[
+                    {
+                        "title": "A",
+                        "sort_order": 0,
+                        "exercises": [
+                            {
+                                "name": "Bench Press",
+                                "target_sets": 3,
+                                "target_reps": 5,
+                                "rest_seconds": 90,
+                                "sort_order": 0,
+                            },
+                            {
+                                "name": "Row",
+                                "target_sets": 3,
+                                "target_reps": 8,
+                                "rest_seconds": 60,
+                                "sort_order": 1,
+                            },
+                        ],
+                    }
+                ],
+            )
+            assembled = await store.assemble_plan(str(plan["id"]), DEV_FAKE_USER_ID)
+            day_id = assembled["days"][0]["id"]
+            bench_id = assembled["days"][0]["exercises"][0]["id"]
+            session, _ = await store.start_or_resume_session(DEV_FAKE_USER_ID, day_id)
+            await service.log_set(
+                DEV_FAKE_USER_ID,
+                str(session["id"]),
+                exercise_id=bench_id,
+                reps=5,
+                weight=135,
+            )
+            data = parse_exercise_panel_tool_input(
+                {
+                    "exercise_name": "Row",
+                    "sets": 99,
+                    "reps": 99,
+                    "rest_seconds": 1,
+                    "current_set": 9,
+                }
+            )
+            overlaid = await service.overlay_exercise_panel(DEV_FAKE_USER_ID, data)
+            self.assertEqual(overlaid.exercise_name, "Row")
+            self.assertEqual(overlaid.sets, 3)
+            self.assertEqual(overlaid.reps, 8)
+            self.assertEqual(overlaid.rest_seconds, 60)
+            self.assertEqual(overlaid.current_set, 1)
+
+        with _env():
+            __import__("asyncio").run(go())
+
     def test_prompt_tools_do_not_write_overrides(self):
         from modes.fitness.prompt import TOOLS
 
@@ -423,6 +504,8 @@ class Migration019Tests(unittest.TestCase):
         self.assertIn("personal_records_exercise_user_fkey", sql)
         self.assertNotIn("DROP TABLE", sql)
         self.assertNotIn("TRUNCATE", sql)
+        self.assertIn("ranked_active_sessions", sql)
+        self.assertIn("ranked_duplicate_sets", sql)
 
 
 class ContractDocTests(unittest.TestCase):

@@ -32,31 +32,41 @@ def _require_uuid(value: Optional[str], detail: str) -> str:
 
 
 async def next_plan_day_id(user_id: str) -> Optional[str]:
-    """Next unused day on the active plan, wrapping to the first day."""
+    """Next day on the active plan after the most recently completed day."""
     plan = await store.get_active_plan(user_id)
     if plan is None:
         return None
     days = await store.list_days_for_plan(str(plan["id"]), user_id)
     if not days:
         return None
-    sessions = await store.list_sessions(user_id, limit=store.MAX_HISTORY_LIMIT)
-    completed_days: list[str] = []
-    for sess in sessions:
-        if sess["status"] != "completed" or not sess.get("plan_day_id"):
-            continue
-        completed_days.append(str(sess["plan_day_id"]))
     order = [str(d["id"]) for d in days]
-    if not completed_days:
+    last_day = await store.get_last_completed_plan_day_id(user_id, plan_day_ids=order)
+    if last_day is None or last_day not in order:
         return order[0]
-    last = None
-    for day_id in completed_days:
-        if day_id in order:
-            last = day_id
-            break
-    if last is None:
-        return order[0]
-    idx = order.index(last)
+    idx = order.index(last_day)
     return order[(idx + 1) % len(order)]
+
+
+def _panel_from_planned_exercise(
+    data: ExercisePanelData, prog: dict[str, Any], exercise: dict
+) -> ExercisePanelData:
+    ex_id = str(exercise["id"])
+    done = len(prog["logs_by_exercise"].get(ex_id, []))
+    return data.model_copy(
+        update={
+            "exercise_id": ex_id,
+            "exercise_name": exercise["name"],
+            "sets": int(exercise["target_sets"] or data.sets),
+            "reps": int(exercise["target_reps"] or data.reps),
+            "rest_seconds": int(
+                exercise["rest_seconds"]
+                if exercise.get("rest_seconds") is not None
+                else data.rest_seconds
+            ),
+            "current_set": done + 1,
+            "notes": exercise.get("notes") if exercise.get("notes") else data.notes,
+        }
+    )
 
 
 def serialize_state(session: dict, prog: dict[str, Any]) -> dict:
@@ -116,35 +126,23 @@ async def overlay_exercise_panel(
         return data
     current_id = str(current["id"])
     if data.exercise_id and data.exercise_id != current_id:
-        named = None
-        for ex in prog["exercises"]:
-            if str(ex["id"]) == data.exercise_id:
-                named = ex
-                break
+        named = progress.exercise_in_session(prog, data.exercise_id)
         if named is None:
             return data
-        done = len(prog["logs_by_exercise"].get(str(named["id"]), []))
-        return data.model_copy(
-            update={
-                "exercise_id": str(named["id"]),
-                "exercise_name": named["name"],
-                "sets": int(named["target_sets"] or data.sets),
-                "reps": int(named["target_reps"] or data.reps),
-                "rest_seconds": int(
-                    named["rest_seconds"]
-                    if named.get("rest_seconds") is not None
-                    else data.rest_seconds
-                ),
-                "current_set": done + 1,
-                "notes": named.get("notes") if named.get("notes") else data.notes,
-            }
-        )
+        return _panel_from_planned_exercise(data, prog, named)
     if data.exercise_id is None:
         name = (data.exercise_name or "").strip().lower()
-        if name and name == str(current.get("name") or "").strip().lower():
+        if name:
+            if name != str(current.get("name") or "").strip().lower():
+                matches = [
+                    ex
+                    for ex in prog["exercises"]
+                    if str(ex["name"]).strip().lower() == name
+                ]
+                if len(matches) != 1:
+                    return data
+                return _panel_from_planned_exercise(data, prog, matches[0])
             data = data.model_copy(update={"exercise_id": current_id})
-        elif data.exercise_id is None and name:
-            return data
     return data.model_copy(
         update={
             "exercise_id": current_id,
@@ -260,10 +258,18 @@ async def start_workout(user_id: str, plan_day_id: Optional[str] = None) -> dict
         requested = _require_uuid(requested, NOT_FOUND_DAY)
         if await store.get_day(requested, user_id) is None:
             raise HTTPException(status_code=404, detail=NOT_FOUND_DAY)
-    elif requested is None:
-        requested = await next_plan_day_id(user_id)
     try:
-        session, resumed = await store.start_or_resume_session(user_id, requested)
+        if requested is None:
+            active = await store.get_active_session(user_id)
+            if active is not None:
+                session, resumed = await store.start_or_resume_session(user_id, None)
+            else:
+                next_day = await next_plan_day_id(user_id)
+                if next_day is None:
+                    raise HTTPException(status_code=404, detail=NOT_FOUND_PLAN)
+                session, resumed = await store.start_or_resume_session(user_id, next_day)
+        else:
+            session, resumed = await store.start_or_resume_session(user_id, requested)
     except store.ActiveSessionConflict:
         raise HTTPException(status_code=409, detail=ACTIVE_CONFLICT)
     if session is None:
