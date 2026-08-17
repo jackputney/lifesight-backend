@@ -1216,7 +1216,8 @@ async def insert_health_metric(
 # ---------------------------------------------------------------------------
 
 _USER_COLS = (
-    "id, username, email, password_hash, display_name, is_active, created_at, updated_at"
+    "id, username, email, password_hash, display_name, timezone, "
+    "is_active, created_at, updated_at"
 )
 _SESSION_COLS = (
     "id, user_id, refresh_token_hash, expires_at, revoked_at, "
@@ -1275,6 +1276,8 @@ async def update_local_user(
     display_name: Optional[str] = None,
     email: Optional[str] = None,
     clear_email: bool = False,
+    timezone: Optional[str] = None,
+    clear_timezone: bool = False,
     password_hash: Optional[str] = None,
 ) -> Optional[dict]:
     # Build a dynamic UPDATE that only touches provided fields.
@@ -1290,6 +1293,12 @@ async def update_local_user(
     elif email is not None:
         sets.append(f"email = ${idx}")
         args.append(email)
+        idx += 1
+    if clear_timezone:
+        sets.append("timezone = NULL")
+    elif timezone is not None:
+        sets.append(f"timezone = ${idx}")
+        args.append(timezone)
         idx += 1
     if password_hash is not None:
         sets.append(f"password_hash = ${idx}")

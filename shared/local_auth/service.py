@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from shared.local_auth import passwords, tokens
 from shared.local_auth.rate_limit import LOGIN_RATE_LIMITER, LoginRateLimiter
@@ -14,6 +15,8 @@ from shared.local_auth.store import (
     UsernameTakenError,
     get_store,
 )
+
+_IANA_TIMEZONES = available_timezones()
 
 _USERNAME_RE = re.compile(r"^[a-z0-9_]{3,32}$")
 GENERIC_INVALID = "Invalid credentials"
@@ -61,6 +64,20 @@ def validate_email(email: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def validate_timezone(tz: Optional[str]) -> Optional[str]:
+    """Accept a non-empty IANA timezone id; reject offsets and unknown names."""
+    if tz is None:
+        return None
+    value = tz.strip()
+    if not value or value not in _IANA_TIMEZONES:
+        raise AuthError("Timezone must be a valid IANA identifier")
+    try:
+        ZoneInfo(value)
+    except ZoneInfoNotFoundError as exc:
+        raise AuthError("Timezone must be a valid IANA identifier") from exc
+    return value
+
+
 class AuthService:
     def __init__(
         self,
@@ -76,6 +93,7 @@ class AuthService:
             "username": user["username"],
             "email": user.get("email"),
             "display_name": user.get("display_name"),
+            "timezone": user.get("timezone"),
             "is_active": bool(user.get("is_active", True)),
             "created_at": user.get("created_at"),
             "updated_at": user.get("updated_at"),
@@ -231,17 +249,29 @@ class AuthService:
         display_name: Optional[str] = None,
         email: Optional[str] = None,
         clear_email: bool = False,
+        timezone: Optional[str] = None,
+        clear_timezone: bool = False,
+        update_timezone: bool = False,
     ) -> dict:
-        if display_name is None and email is None and not clear_email:
+        if (
+            display_name is None
+            and email is None
+            and not clear_email
+            and not update_timezone
+            and not clear_timezone
+        ):
             raise AuthError("No fields to update")
         display = None if display_name is None else (display_name.strip() or None)
         email_n = None if email is None else validate_email(email)
+        tz_n = validate_timezone(timezone) if update_timezone else None
         try:
             user = await self.store.update_user(
                 user_id,
                 display_name=display if display_name is not None else None,
                 email=email_n,
                 clear_email=clear_email,
+                timezone=tz_n,
+                clear_timezone=clear_timezone,
             )
         except EmailTakenError as exc:
             raise AuthError("Email is already taken", status_code=409) from exc

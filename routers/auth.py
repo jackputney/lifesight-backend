@@ -38,6 +38,7 @@ class LogoutIn(BaseModel):
 class PatchMeIn(BaseModel):
     display_name: Optional[str] = None
     email: Optional[str] = None
+    timezone: Optional[str] = None
     clear_email: bool = False
 
 
@@ -46,6 +47,7 @@ class UserOut(BaseModel):
     username: str
     email: Optional[str] = None
     display_name: Optional[str] = None
+    timezone: Optional[str] = None
     is_active: bool = True
     created_at: Any = None
     updated_at: Any = None
@@ -148,12 +150,16 @@ async def me(user_id: str = Depends(get_current_user_id)):
 
 @router.patch("/me", response_model=UserOut)
 async def patch_me(body: PatchMeIn, user_id: str = Depends(get_current_user_id)):
+    update_timezone = "timezone" in body.model_fields_set
     try:
         return await AuthService().patch_me(
             user_id,
             display_name=body.display_name,
             email=body.email,
             clear_email=body.clear_email,
+            timezone=body.timezone,
+            clear_timezone=update_timezone and body.timezone is None,
+            update_timezone=update_timezone and body.timezone is not None,
         )
     except AuthError as exc:
         _raise(exc)

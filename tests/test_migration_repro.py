@@ -394,7 +394,10 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
                 user_id,
             )
 
-            for sql_file in sorted(MIGRATIONS.glob("009_*.sql")):
+            # 009 remaps health → fitness; 010+ must still apply on the same DB.
+            for sql_file in sorted(MIGRATIONS.glob("*.sql")):
+                if sql_file.name < "009_":
+                    continue
                 print(f"APPLY {sql_file.name}", flush=True)
                 await conn.execute(sql_file.read_text(encoding="utf-8"))
 
@@ -423,6 +426,24 @@ class LiveMigrationReproTests(unittest.IsolatedAsyncioTestCase):
                     table,
                 )
                 self.assertTrue(exists, msg=f"missing table: {table}")
+
+            timezone_col = await conn.fetchrow(
+                """
+                SELECT data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'users'
+                  AND column_name = 'timezone'
+                """
+            )
+            self.assertIsNotNone(timezone_col, msg="users.timezone missing after 010")
+            self.assertEqual(timezone_col["data_type"], "text")
+            self.assertEqual(timezone_col["is_nullable"], "YES")
+            null_tz = await conn.fetchval(
+                "SELECT timezone FROM users WHERE id = $1::uuid",
+                user_id,
+            )
+            self.assertIsNone(null_tz)
 
             for cname, table, column, ref_table, ref_column in EXPECTED_FOREIGN_KEYS:
                 row = await conn.fetchrow(

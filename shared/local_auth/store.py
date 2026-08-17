@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import uuid
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime
+from datetime import timezone as utc_tz
 from typing import Any, Optional, Protocol
 
 from shared import db
@@ -33,6 +34,8 @@ class AuthStore(Protocol):
         display_name: Optional[str] = None,
         email: Optional[str] = None,
         clear_email: bool = False,
+        timezone: Optional[str] = None,
+        clear_timezone: bool = False,
         password_hash: Optional[str] = None,
     ) -> Optional[dict]: ...
 
@@ -100,7 +103,7 @@ class MemoryAuthStore:
             raise UsernameTakenError()
         if email and email in self._email:
             raise EmailTakenError()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(utc_tz.utc)
         user_id = str(uuid.uuid4())
         row = {
             "id": user_id,
@@ -108,6 +111,7 @@ class MemoryAuthStore:
             "email": email,
             "password_hash": password_hash,
             "display_name": display_name,
+            "timezone": None,
             "is_active": True,
             "created_at": now,
             "updated_at": now,
@@ -137,6 +141,8 @@ class MemoryAuthStore:
         display_name: Optional[str] = None,
         email: Optional[str] = None,
         clear_email: bool = False,
+        timezone: Optional[str] = None,
+        clear_timezone: bool = False,
         password_hash: Optional[str] = None,
     ) -> Optional[dict]:
         row = self.users.get(user_id)
@@ -157,9 +163,13 @@ class MemoryAuthStore:
             self._email[email] = user_id
         if display_name is not None:
             row["display_name"] = display_name
+        if clear_timezone:
+            row["timezone"] = None
+        elif timezone is not None:
+            row["timezone"] = timezone
         if password_hash is not None:
             row["password_hash"] = password_hash
-        row["updated_at"] = datetime.now(timezone.utc)
+        row["updated_at"] = datetime.now(utc_tz.utc)
         return deepcopy(row)
 
     async def create_session(
@@ -170,7 +180,7 @@ class MemoryAuthStore:
         expires_at: datetime,
         device_name: Optional[str],
     ) -> dict:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(utc_tz.utc)
         sid = str(uuid.uuid4())
         row = {
             "id": sid,
@@ -272,6 +282,8 @@ class PostgresAuthStore:
         display_name: Optional[str] = None,
         email: Optional[str] = None,
         clear_email: bool = False,
+        timezone: Optional[str] = None,
+        clear_timezone: bool = False,
         password_hash: Optional[str] = None,
     ) -> Optional[dict]:
         import asyncpg
@@ -282,6 +294,8 @@ class PostgresAuthStore:
                 display_name=display_name,
                 email=email,
                 clear_email=clear_email,
+                timezone=timezone,
+                clear_timezone=clear_timezone,
                 password_hash=password_hash,
             )
         except asyncpg.UniqueViolationError as exc:
