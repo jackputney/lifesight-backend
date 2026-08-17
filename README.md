@@ -237,19 +237,41 @@ requirements.txt
 requirements-dev.txt         # + pre-commit, detect-secrets
 ```
 
+## Cross-repo contracts
+
+The frozen wire contracts iOS and the admin project build against live in
+`docs/`. Read these before changing a shape — each one is shared with another
+repository:
+
+| Doc | Covers |
+|---|---|
+| `docs/USER_CONTEXT_HISTORY_V1_CONTRACT.md` | `/profile`, history, daily check-in, Fitness `visual_panel` |
+| `docs/V2_BRAINSTORM_MAIL_CALENDAR_CONTRACT.md` | Brainstorm research + Mail & Calendar |
+| `docs/GOOGLE_INTEGRATIONS_SETUP.md` | Per-user Google OAuth setup + capabilities |
+| `docs/STREAMING_VOICE_V1_CONTRACT.md` | `WS /chat/stream` frames, barge-in, stall audio |
+| `docs/HEALTHKIT_SYNC_V1_CONTRACT.md` | `POST /healthkit/sync`, `GET /healthkit/status` |
+| `docs/AUTHOR_PIPELINE_V1_CONTRACT.md` | Author capture → refine → flag → review |
+| `docs/PERSONALIZATION_PROPOSALS_V1_CONTRACT.md` | Summaries + prompt-change proposals (admin-gated) |
+| `docs/OLIVER_ADMIN_DATABASE_CONTRACT.md` | What the admin project may read/write directly |
+
 ## What's NOT here yet (by design)
 
-- No Google Docs reading/writing for Author Mode
-- No tool-calling in any mode, so `pending_action` is always `null` — the
-  Confirm Gate's shapes exist end-to-end (including its `pending_actions`
-  table), but nothing creates rows yet
-- No Calendar/Gmail for Jarvis Mode (Oliver's area)
-- `AUTH_MODE=real` (actual Supabase JWT verification) is implemented in
-  `shared/auth.py` but untested against a live Supabase project; no iOS Sign
-  in with Apple flow yet either
-- No auth/security beyond the Bearer-token check itself (fine for local
-  testing only — rate limiting, HTTPS, etc. come before deploying anywhere
-  public)
+- No Google Docs reading/writing for Author Mode — manuscripts are
+  Postgres-native and Docs was abandoned on this branch
+- Gmail **read** is deliberately refused (`insufficient_scope`) until the
+  `gmail_read` capability is actually granted — the backend never invents
+  inbox data
+- `TOKEN_ENCRYPTION_KEY` rotation is incomplete: there is no key-version
+  column on `google_connections` / `google_oauth_transactions`, so rotating
+  without re-encrypting makes stored refresh tokens unrecoverable
+- Personalization is proposal-only. The backend writes
+  `prompt_change_proposals` but **never** writes `user_prompt_overrides` —
+  approval is a human step in the separate admin project
+- Streaming voice uses one ElevenLabs `stream-input` session per assistant
+  turn; barge-in closes that socket. Multi-context reuse is a possible later
+  optimization, not implemented here
+- HealthKit ingestion is a sync target only — the backend never queries
+  HealthKit, and never diagnoses medical conditions from the data
 
 ## If something goes wrong
 

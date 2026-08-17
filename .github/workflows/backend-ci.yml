@@ -123,6 +123,15 @@ jobs:
       - name: Verify schema, FKs, MODE_REGISTRY modes, unknown-mode rejection
         run: python -m unittest tests.test_migration_repro -v
 
+      # Executes the guarantees the offline suite can only assert as file text:
+      # append-only author captures, human-gated prompt proposals, health
+      # dedupe. Uses its own scratch database so it cannot disturb the step
+      # above, which requires an empty schema.
+      - name: Enforce database-level safety invariants
+        env:
+          RUN_LIVE_DB_INVARIANTS: "1"
+        run: python -m unittest tests.test_live_db_invariants tests.test_sql_store_isolation tests.test_fitness_live_db_v1 -v
+
       - name: Dump schema diagnostics on failure
         if: failure()
         env:

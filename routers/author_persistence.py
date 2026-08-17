@@ -1,8 +1,8 @@
 """Author projects / documents / versions — REST contract (backend-first).
 
 Identity always via Depends(get_current_user_id). Ownership is never accepted
-from the request body. Cross-user or missing resources → 404 (anti-oracle,
-consistent with manuscripts). Stale autosave → 409.
+from the request body. Cross-user, missing, AND malformed path ids all → 404
+(anti-oracle, consistent with manuscripts). Stale autosave → 409.
 """
 from __future__ import annotations
 

@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from shared import db, terra
 from shared.auth import get_current_user_id
+from shared.health.service import ingest_terra_metrics
 
 router = APIRouter()
 
@@ -35,190 +36,9 @@ def _anthropic() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=key)
 
 
-# ---------------------------------------------------------------------------
-# Fitness
-# ---------------------------------------------------------------------------
-
-class StartSessionRequest(BaseModel):
-    plan_day_id: Optional[str] = None
-
-
-class VoiceLogRequest(BaseModel):
-    session_id: str
-    transcript: str = Field(..., min_length=1)
-
-
-@router.post("/workouts/session/start")
-async def workouts_session_start(
-    body: StartSessionRequest,
-    user_id: str = Depends(get_current_user_id),
-):
-    session = await db.start_workout_session(user_id, body.plan_day_id)
-    return {
-        "session_id": str(session["id"]),
-        "status": session["status"],
-        "session_date": str(session["session_date"]),
-        "plan_day_id": str(session["plan_day_id"]) if session["plan_day_id"] else None,
-        "started_at": session["started_at"].isoformat(),
-    }
-
-
-@router.get("/workouts/session/{session_id}/state")
-async def workouts_session_state(
-    session_id: str,
-    user_id: str = Depends(get_current_user_id),
-):
-    session = await db.get_workout_session(session_id, user_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Workout session not found")
-
-    exercises: list[dict] = []
-    if session["plan_day_id"]:
-        exercises = await db.list_planned_exercises_for_day(str(session["plan_day_id"]))
-
-    logs = await db.list_set_logs(session_id)
-    # Current exercise = first planned exercise that still has remaining sets,
-    # else last logged exercise, else first planned.
-    current_exercise = None
-    current_set_number = 1
-    rest_seconds = None
-    if exercises:
-        logs_by_ex: dict[str, list[dict]] = {}
-        for lg in logs:
-            logs_by_ex.setdefault(str(lg["exercise_id"]), []).append(lg)
-        for ex in exercises:
-            eid = str(ex["id"])
-            done = len(logs_by_ex.get(eid, []))
-            target = ex["target_sets"] or 0
-            if done < target or target == 0 and done == 0:
-                current_exercise = ex
-                current_set_number = done + 1
-                rest_seconds = ex["rest_seconds"]
-                break
-        if current_exercise is None:
-            current_exercise = exercises[-1]
-            current_set_number = len(logs_by_ex.get(str(current_exercise["id"]), [])) + 1
-            rest_seconds = current_exercise["rest_seconds"]
-
-    return {
-        "session_id": str(session["id"]),
-        "status": session["status"],
-        "current_exercise": (
-            {
-                "id": str(current_exercise["id"]),
-                "name": current_exercise["name"],
-                "target_sets": current_exercise["target_sets"],
-                "target_reps": current_exercise["target_reps"],
-                "rest_seconds": current_exercise["rest_seconds"],
-            }
-            if current_exercise
-            else None
-        ),
-        "current_set_number": current_set_number,
-        "rest_seconds": rest_seconds,
-        "sets_logged": len(logs),
-    }
-
-
-@router.post("/workouts/voice-log")
-async def workouts_voice_log(
-    body: VoiceLogRequest,
-    user_id: str = Depends(get_current_user_id),
-):
-    session = await db.get_workout_session(body.session_id, user_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Workout session not found")
-    if session["status"] != "active":
-        raise HTTPException(status_code=409, detail="Workout session is not active")
-    if not session["plan_day_id"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Session has no plan day — cannot match exercises for voice logging",
-        )
-
-    exercises = await db.list_planned_exercises_for_day(str(session["plan_day_id"]))
-    if not exercises:
-        raise HTTPException(status_code=400, detail="No planned exercises for this day")
-
-    catalog = [
-        {
-            "id": str(ex["id"]),
-            "name": ex["name"],
-            "target_sets": ex["target_sets"],
-            "target_reps": ex["target_reps"],
-        }
-        for ex in exercises
-    ]
-    parsed = await _parse_voice_sets(body.transcript, catalog)
-    if not parsed:
-        raise HTTPException(
-            status_code=422,
-            detail="Could not parse any sets from that utterance. Try saying reps and weight.",
-        )
-
-    existing = await db.list_set_logs(body.session_id)
-    next_set_by_ex: dict[str, int] = {}
-    for lg in existing:
-        eid = str(lg["exercise_id"])
-        next_set_by_ex[eid] = max(next_set_by_ex.get(eid, 0), int(lg["set_number"])) + 0
-    for eid in list(next_set_by_ex):
-        next_set_by_ex[eid] = next_set_by_ex[eid]  # already max set number
-    # Recompute properly as max+1
-    counts: dict[str, int] = {}
-    for lg in existing:
-        eid = str(lg["exercise_id"])
-        counts[eid] = max(counts.get(eid, 0), int(lg["set_number"]))
-
-    logged: list[dict] = []
-    pr_announcements: list[str] = []
-    name_by_id = {str(ex["id"]): ex["name"] for ex in exercises}
-
-    for item in parsed:
-        eid = item["exercise_id"]
-        if eid not in name_by_id:
-            continue
-        set_number = int(item.get("set_number") or (counts.get(eid, 0) + 1))
-        reps = item.get("reps")
-        weight = item.get("weight")
-        row = await db.insert_set_log(
-            body.session_id, eid, set_number, reps, weight, source="voice"
-        )
-        counts[eid] = max(counts.get(eid, 0), set_number)
-        logged.append(
-            {
-                "id": str(row["id"]),
-                "exercise_id": eid,
-                "exercise_name": name_by_id[eid],
-                "set_number": set_number,
-                "reps": reps,
-                "weight": weight,
-            }
-        )
-        if reps is not None and weight is not None:
-            prev = await db.get_personal_record(user_id, eid, int(reps))
-            if prev is None or float(weight) > float(prev["weight"]):
-                await db.upsert_personal_record(user_id, eid, int(reps), float(weight))
-                pr_announcements.append(
-                    f"New personal record: {name_by_id[eid]}, {reps} reps at {weight}."
-                )
-
-    visual_panel = None
-    if logged:
-        visual_panel = {
-            "type": "workout_sets",
-            "data": {"session_id": body.session_id, "sets": logged},
-        }
-
-    return {
-        "sets": logged,
-        "pr_announcements": pr_announcements,
-        "reply": (
-            (" ".join(pr_announcements) + " " if pr_announcements else "")
-            + f"Logged {len(logged)} set{'s' if len(logged) != 1 else ''}."
-        ).strip(),
-        "visual_panel": visual_panel,
-        "pending_action": None,
-    }
+# Fitness HTTP routes live in routers/fitness.py (same /workouts/* paths).
+# Voice-utterance parsing stays here so /workouts/voice-log can reuse it
+# without a second Claude client.
 
 
 async def _parse_voice_sets(transcript: str, catalog: list[dict]) -> list[dict]:
@@ -706,6 +526,19 @@ async def wearables_terra_webhook(
     request: Request,
     terra_signature: Optional[str] = Header(None, alias="terra-signature"),
 ):
+    """Normalize Terra metrics into health_samples (provider='terra').
+
+    Terra has no stable per-sample id, so ingest synthesizes a deterministic
+    one from metric_type + recorded_at + source + value (see
+    shared/health/service.terra_external_id); a replayed webhook therefore
+    upserts instead of duplicating and `written` is 0 on replay. That holds
+    only for metrics Terra timestamps, so a metric with no parseable
+    recorded_at is dropped and counted in `ignored` rather than stamped with
+    now() — which would both fabricate a reading time and break the replay
+    guarantee. Metrics outside the closed sample_type allowlist, and metrics
+    with no numeric value, are dropped and counted the same way. Legacy
+    health_metrics is no longer written (migration 016 deprecates it).
+    """
     body_bytes = await request.body()
     if not terra.verify_webhook_signature(body_bytes, terra_signature):
         raise HTTPException(status_code=401, detail="Invalid Terra webhook signature")
@@ -720,7 +553,7 @@ async def wearables_terra_webhook(
     user_id = user.get("reference_id") or payload.get("reference_id")
     if not user_id:
         # Ack without write — some Terra pings are non-user events.
-        return {"ok": True, "written": 0}
+        return {"ok": True, "written": 0, "ignored": 0}
 
     provider = user.get("provider") or "terra"
     await db.upsert_wearable_connection(
@@ -729,23 +562,7 @@ async def wearables_terra_webhook(
         aggregator_token_ref=str(user.get("user_id") or "") or None,
     )
 
-    written = 0
-    for metric in terra.extract_metrics(payload):
-        recorded_raw = metric.get("recorded_at")
-        if recorded_raw:
-            try:
-                recorded_at = datetime.fromisoformat(str(recorded_raw).replace("Z", "+00:00"))
-            except ValueError:
-                recorded_at = datetime.now(timezone.utc)
-        else:
-            recorded_at = datetime.now(timezone.utc)
-        await db.insert_health_metric(
-            str(user_id),
-            metric_type=metric["metric_type"],
-            value=metric.get("value"),
-            value_json=metric.get("value_json"),
-            source_device=metric.get("source_device"),
-            recorded_at=recorded_at,
-        )
-        written += 1
-    return {"ok": True, "written": written}
+    written, ignored = await ingest_terra_metrics(
+        str(user_id), terra.extract_metrics(payload)
+    )
+    return {"ok": True, "written": written, "ignored": ignored}

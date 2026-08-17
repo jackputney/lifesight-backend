@@ -45,10 +45,14 @@ from modes.mail_calendar.prompt import SYSTEM_PROMPT as MAIL_CALENDAR_PROMPT
 from modes.mail_calendar.prompt import TOOLS as MAIL_CALENDAR_TOOLS
 from routers.auth import router as auth_router
 from routers.author_persistence import router as author_persistence_router
+from routers.author_pipeline import router as author_pipeline_router
+from routers.chat_stream import router as chat_stream_router
 from routers.conversations import router as conversations_router
 from routers.daily_checkin import router as daily_checkin_router
+from routers.healthkit import router as healthkit_router
 from routers.integrations_google import router as integrations_google_router
 from routers.profile import router as profile_router
+from routers.fitness import router as fitness_router
 from routers.v2 import router as v2_router
 from routers.voice import router as voice_router
 from shared.mail_calendar.tools import (
@@ -57,6 +61,7 @@ from shared.mail_calendar.tools import (
 )
 from shared import db
 from shared.auth import assert_auth_mode_allowed, cors_allow_origins, get_current_user_id
+from shared.request_limits import HealthKitSyncBodyLimitMiddleware
 from shared.client_actions import (
     ClientAction,
     blocked_navigate_reply,
@@ -86,9 +91,13 @@ from shared.personal_context import (
     UPDATE_PERSONAL_CONTEXT_TOOL,
     apply_personal_context_update,
 )
+from shared.fitness.service import overlay_exercise_panel
+from shared.fitness.tools import FITNESS_DOMAIN_TOOLS, run_fitness_tool
+from shared.health.tools import run_get_recent_health_data
 from shared.profile_schema import compact_profile_for_context
 from shared.profile_service import get_profile
 from shared.prompt_overrides import load_active_customization_block
+from shared.tool_rounds import persist_tool_round
 from shared.visual_panels import (
     VisualPanel,
     exercise_visual_panel,
@@ -140,6 +149,13 @@ async def attach_request_id(request: Request, call_next):
         db.request_id_var.reset(token)
 
 
+# Last add_middleware is outermost. Must sit outside BaseHTTPMiddleware
+# (attach_request_id) so a chunked /healthkit/sync body is counted and
+# rejected before Starlette buffers it. Path-scoped: POST /food/photo
+# sends base64 images and must not inherit this ceiling.
+app.add_middleware(HealthKitSyncBodyLimitMiddleware)
+
+
 @app.exception_handler(db.DatabaseUnavailableError)
 async def database_unavailable_handler(request: Request, exc: db.DatabaseUnavailableError):
     return JSONResponse(
@@ -153,9 +169,13 @@ app.include_router(auth_router)
 app.include_router(profile_router)
 app.include_router(daily_checkin_router)
 app.include_router(conversations_router)
+app.include_router(fitness_router)
 app.include_router(v2_router)
 app.include_router(author_persistence_router)
+app.include_router(author_pipeline_router)
+app.include_router(healthkit_router)
 app.include_router(voice_router)
+app.include_router(chat_stream_router)
 app.include_router(integrations_google_router)
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
@@ -348,6 +368,7 @@ async def _run_tool(
             data = parse_exercise_panel_tool_input(
                 tool_input if isinstance(tool_input, dict) else {}
             )
+            data = await overlay_exercise_panel(user_id, data)
         except Exception as exc:
             return f"Error: invalid exercise panel ({exc}).", None, None, []
         panel = exercise_visual_panel(data)
@@ -400,6 +421,46 @@ async def _run_tool(
             )
         return result_text, None, None, []
 
+    if name == "get_recent_health_data":
+        if mode not in ("fitness", "diet"):
+            return (
+                "Error: get_recent_health_data is only available in fitness and "
+                "diet modes.",
+                None,
+                None,
+                [],
+            )
+        result_text = await run_get_recent_health_data(user_id, tool_input)
+        return result_text, None, None, []
+
+    fitness_names = {
+        spec["name"]
+        for spec in FITNESS_DOMAIN_TOOLS
+        if spec["name"] != "get_recent_health_data"
+    }
+    if name in fitness_names:
+        if mode != "fitness":
+            return (
+                f"Error: {name} is only available in fitness mode.",
+                None,
+                None,
+                [],
+            )
+        result_text = await run_fitness_tool(name, user_id, tool_input)
+        panel = None
+        if name == "log_workout_set" and not result_text.startswith("Error"):
+            from shared.fitness import progress as fitness_progress
+            from shared.fitness import service as fitness_service
+            from shared.fitness import store as fitness_store
+
+            active = await fitness_store.get_active_session(user_id)
+            if active is not None:
+                prog = await fitness_progress.session_progress(active, user_id)
+                payload = fitness_service.exercise_panel_from_progress(prog)
+                if payload:
+                    panel = VisualPanel.model_validate(payload)
+        return result_text, None, panel, []
+
     return f"Error: unknown tool '{name}'.", None, None, []
 
 
@@ -440,7 +501,6 @@ async def _run_model_turn(
     while message.stop_reason == "tool_use":
         assistant_blocks = [block.model_dump() for block in message.content]
         working.append({"role": "assistant", "content": assistant_blocks})
-        await db.append_message(conversation_id, "assistant", assistant_blocks)
 
         tool_results = []
         for block in message.content:
@@ -468,7 +528,11 @@ async def _run_model_turn(
             )
 
         working.append({"role": "user", "content": tool_results})
-        await db.append_message(conversation_id, "user", tool_results)
+        await persist_tool_round(
+            conversation_id,
+            assistant_blocks=assistant_blocks,
+            tool_results=tool_results,
+        )
         create_kwargs["messages"] = working
         message = await _call_model(create_kwargs)
         # Prefer final-turn usage when present.

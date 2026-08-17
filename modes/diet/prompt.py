@@ -1,6 +1,7 @@
 """Diet Mode — photo/barcode/voice drafts; Confirm Gate on final save."""
 
 from shared.epistemic import compose_system_prompt
+from shared.health.tools import GET_RECENT_HEALTH_DATA_TOOL
 
 MODE_NAME = "diet"
 
@@ -26,8 +27,18 @@ anecdotes. Do not turn normal body sensations or short-term fluctuations into \
 unsupported medical explanations.
 
 Available backend endpoints: POST /food/photo, /food/barcode, /food/voice \
-(drafts), POST /food/entries (Confirm-Gate-backed save)."""
+(drafts), POST /food/entries (Confirm-Gate-backed save).
+
+Recent health data (Apple Health / wearable):
+- Call get_recent_health_data ONLY when recent energy burned, steps, body \
+weight, or sleep would actually change your nutrition answer (e.g. explaining \
+a weight trend, sanity-checking intake against activity). Ask for the fewest \
+types and days you need.
+- It returns aggregates only. Never claim a reading it did not return, and \
+never assume data exists — an empty window means the user has not synced.
+- Never diagnose a disease or medical condition from this data. Describe \
+trends only and defer clinical questions to a clinician."""
 
 SYSTEM_PROMPT = compose_system_prompt(INSTRUCTIONS)
 
-TOOLS: list[dict] = []
+TOOLS: list[dict] = [GET_RECENT_HEALTH_DATA_TOOL]

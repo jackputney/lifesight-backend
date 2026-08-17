@@ -3,6 +3,7 @@ uvicorn[standard]==0.34.0
 anthropic==0.42.0
 python-dotenv==1.0.1
 httpx==0.28.1
+websockets==17.0.1         # ElevenLabs stream-input client (shared/elevenlabs_stream.py)
 pydantic==2.10.4
 pyjwt==2.10.1              # self-hosted access JWT mint/verify (shared/local_auth)
 argon2-cffi==25.1.0        # Argon2id password hashing (shared/local_auth/passwords.py)

@@ -37,6 +37,73 @@ def message_token_estimate(message: dict) -> int:
     return estimate_tokens(_content_as_text(message.get("content")))
 
 
+def _blocks(content: Any) -> Optional[list]:
+    """Structured block list, or None for plain-text content."""
+    return content if isinstance(content, list) else None
+
+
+def _block_field(block: Any, field: str) -> Any:
+    if isinstance(block, dict):
+        return block.get(field)
+    return getattr(block, field, None)
+
+
+def repair_tool_call_pairs(messages: list[dict]) -> list[dict]:
+    """Drop `tool_use` blocks with no `tool_result`, and orphan results.
+
+    Anthropic rejects an entire conversation when a persisted assistant
+    `tool_use` has no matching `tool_result` ("tool_use ids were found without
+    tool_result blocks"), which would make the conversation permanently
+    unusable. Two things produce that state: a turn that dies between the two
+    history writes of a tool round, and trimming the recent window down to a
+    `tool_result` whose `tool_use` fell off the oldest end. Both are repaired
+    here, on read, so the stored transcript is never rewritten.
+
+    An assistant message left with no blocks at all is dropped entirely.
+    """
+    result_ids: set[str] = set()
+    use_ids: set[str] = set()
+    for message in messages:
+        blocks = _blocks(message.get("content"))
+        if blocks is None:
+            continue
+        for block in blocks:
+            kind = _block_field(block, "type")
+            if kind == "tool_use":
+                use_ids.add(str(_block_field(block, "id")))
+            elif kind == "tool_result":
+                result_ids.add(str(_block_field(block, "tool_use_id")))
+
+    if not (use_ids - result_ids) and not (result_ids - use_ids):
+        return list(messages)
+
+    repaired: list[dict] = []
+    for message in messages:
+        blocks = _blocks(message.get("content"))
+        if blocks is None:
+            repaired.append(message)
+            continue
+        kept = [
+            block
+            for block in blocks
+            if not (
+                _block_field(block, "type") == "tool_use"
+                and str(_block_field(block, "id")) not in result_ids
+            )
+            and not (
+                _block_field(block, "type") == "tool_result"
+                and str(_block_field(block, "tool_use_id")) not in use_ids
+            )
+        ]
+        if not kept:
+            continue
+        if len(kept) == len(blocks):
+            repaired.append(message)
+        else:
+            repaired.append({**message, "content": kept})
+    return repaired
+
+
 @dataclass(frozen=True)
 class BuiltContext:
     messages: list[dict]
@@ -74,10 +141,12 @@ def build_model_messages(
     remaining = max(0, budget - reserved)
 
     # Take at most `cap` most-recent prior messages, then trim from the oldest
-    # end until the estimate fits.
-    window = list(recent_messages[-cap:]) if cap else []
+    # end until the estimate fits. Repaired before and after trimming: an
+    # unmatched tool_use/tool_result would make the model call fail outright.
+    window = repair_tool_call_pairs(recent_messages[-cap:]) if cap else []
     while window and sum(message_token_estimate(m) for m in window) > remaining:
         window.pop(0)
+    window = repair_tool_call_pairs(window)
 
     # Prefix a synthetic user note with the rolling summary when present.
     assembled: list[dict] = []

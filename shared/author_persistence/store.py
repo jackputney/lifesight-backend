@@ -2,6 +2,10 @@
 
 Ownership: every query scopes by user_id derived from the JWT at the router.
 Request bodies never supply ownership fields.
+
+Every id that reaches SQL passes normalized_uuid() first, so a malformed path
+parameter returns the ordinary "not found" answer instead of raising DataError
+out of a `$1::uuid` bind.
 """
 from __future__ import annotations
 
@@ -12,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from shared import db
+from shared.ids import normalized_uuid
 
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 100
@@ -140,6 +145,10 @@ async def create_project(user_id: str, title: str, description: Optional[str] = 
 
 
 async def get_project(project_id: str, user_id: str) -> Optional[dict]:
+    project_id = normalized_uuid(project_id)
+    if project_id is None:
+        return None
+
     if _mem() is not None:
         row = _mem().projects.get(project_id)
         if row is None or row["user_id"] != user_id:
@@ -190,6 +199,9 @@ async def update_project(
 ) -> Optional[dict]:
     if title is None and description is None:
         return await get_project(project_id, user_id)
+    project_id = normalized_uuid(project_id)
+    if project_id is None:
+        return None
 
     if _mem() is not None:
         row = _mem().projects.get(project_id)
@@ -223,6 +235,10 @@ async def update_project(
 
 async def delete_project(project_id: str, user_id: str) -> bool:
     """Delete project; documents and versions CASCADE (DB) or are removed in memory."""
+    project_id = normalized_uuid(project_id)
+    if project_id is None:
+        return False
+
     if _mem() is not None:
         row = _mem().projects.get(project_id)
         if row is None or row["user_id"] != user_id:
@@ -293,6 +309,7 @@ async def create_document(
     project = await get_project(project_id, user_id)
     if project is None:
         return None
+    project_id = str(project["id"])
     title = title.strip()
     content = content if content is not None else ""
 
@@ -333,6 +350,10 @@ async def create_document(
 
 
 async def get_document(document_id: str, user_id: str) -> Optional[dict]:
+    document_id = normalized_uuid(document_id)
+    if document_id is None:
+        return None
+
     if _mem() is not None:
         row = _mem().documents.get(document_id)
         if row is None or row["user_id"] != user_id:
@@ -357,8 +378,10 @@ async def list_documents(
     offset: int = 0,
 ) -> Optional[tuple[list[dict], int]]:
     """None if project not owned; else (page, total)."""
-    if await get_project(project_id, user_id) is None:
+    project = await get_project(project_id, user_id)
+    if project is None:
         return None
+    project_id = str(project["id"])
     limit, offset = clamp_pagination(limit, offset)
 
     if _mem() is not None:
@@ -401,6 +424,7 @@ async def update_document(
     current = await get_document(document_id, user_id)
     if current is None:
         return None
+    document_id = str(current["id"])
     if int(current["revision"]) != int(expected_revision):
         raise ConflictError(current)
 
@@ -452,6 +476,10 @@ async def update_document(
 
 
 async def delete_document(document_id: str, user_id: str) -> bool:
+    document_id = normalized_uuid(document_id)
+    if document_id is None:
+        return False
+
     if _mem() is not None:
         row = _mem().documents.get(document_id)
         if row is None or row["user_id"] != user_id:
@@ -477,6 +505,7 @@ async def create_version_snapshot(document_id: str, user_id: str) -> Optional[di
     current = await get_document(document_id, user_id)
     if current is None:
         return None
+    document_id = str(current["id"])
     expected = int(current["revision"])
     new_revision = expected + 1
 
@@ -521,8 +550,10 @@ async def list_versions(
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = 0,
 ) -> Optional[tuple[list[dict], int]]:
-    if await get_document(document_id, user_id) is None:
+    document = await get_document(document_id, user_id)
+    if document is None:
         return None
+    document_id = str(document["id"])
     limit, offset = clamp_pagination(limit, offset)
 
     if _mem() is not None:
@@ -554,6 +585,11 @@ async def list_versions(
 
 
 async def get_version(document_id: str, version_id: str, user_id: str) -> Optional[dict]:
+    document_id = normalized_uuid(document_id)
+    version_id = normalized_uuid(version_id)
+    if document_id is None or version_id is None:
+        return None
+
     if _mem() is not None:
         row = _mem().versions.get(version_id)
         if (

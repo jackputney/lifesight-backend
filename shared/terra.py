@@ -85,10 +85,14 @@ def verify_webhook_signature(body: bytes, signature_header: str | None) -> bool:
 
 
 def extract_metrics(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Flatten a Terra webhook body into rows for health_metrics.
+    """Flatten a Terra webhook body into intermediate metric rows.
 
     Returns list of dicts: metric_type, value, value_json, source_device, recorded_at (iso str).
-    Keeps metric_type as free text so new Terra fields need no migration.
+    metric_type stays free text here so a new Terra field needs no migration;
+    the closed vocabulary is applied downstream by
+    shared.health.service.ingest_terra_metrics, which is what writes
+    health_samples (provider='terra') and drops anything it cannot map. The
+    deprecated health_metrics table is no longer written (migration 016).
     """
     rows: list[dict[str, Any]] = []
     user = payload.get("user") or {}

@@ -27,6 +27,9 @@ Migrations: `010_user_profiles.sql`, `011_conversation_context.sql`,
 - Emitted from Fitness `/chat` only when Claude calls tool `present_exercise_panel`
   after a concrete exercise prescription is established.
 - `exercise_id` is a UUID or `null` — never invented.
+- When an active workout session exists and the panel names that session's
+  exercise, `current_set` / sets / reps / rest come from the same progress
+  engine as `GET /workouts/session/{id}/state` (`docs/FITNESS_WORKOUT_V1_CONTRACT.md`).
 - Ordinary fitness chat → `visual_panel: null`.
 - `/workouts/voice-log` continues to use `workout_sets` (unchanged this sprint).
 
