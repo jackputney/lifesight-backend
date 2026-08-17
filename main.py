@@ -60,6 +60,7 @@ from shared.mail_calendar.tools import (
 )
 from shared import db
 from shared.auth import assert_auth_mode_allowed, cors_allow_origins, get_current_user_id
+from shared.request_limits import HealthKitSyncBodyLimitMiddleware
 from shared.client_actions import (
     ClientAction,
     blocked_navigate_reply,
@@ -132,36 +133,6 @@ app.add_middleware(
 )
 
 
-# Bodies are fully buffered before any route or validator runs, so a per-field
-# cap cannot stop a huge payload from being parsed. This rejects the request
-# before that happens. Comfortably above the largest legitimate body (a
-# max-size /healthkit/sync batch is well under a megabyte).
-MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
-
-
-@app.middleware("http")
-async def limit_request_body(request: Request, call_next):
-    """Reject oversized bodies before they are buffered and parsed."""
-    declared = request.headers.get("content-length")
-    if declared is not None:
-        try:
-            if int(declared) > MAX_REQUEST_BODY_BYTES:
-                return JSONResponse(
-                    status_code=413,
-                    content={
-                        "detail": (
-                            "Request body too large "
-                            f"(limit {MAX_REQUEST_BODY_BYTES} bytes)."
-                        )
-                    },
-                )
-        except ValueError:
-            return JSONResponse(
-                status_code=400, content={"detail": "Invalid Content-Length header"}
-            )
-    return await call_next(request)
-
-
 @app.middleware("http")
 async def attach_request_id(request: Request, call_next):
     """Propagate/generate X-Request-ID for DB failure diagnostics."""
@@ -173,6 +144,13 @@ async def attach_request_id(request: Request, call_next):
         return response
     finally:
         db.request_id_var.reset(token)
+
+
+# Last add_middleware is outermost. Must sit outside BaseHTTPMiddleware
+# (attach_request_id) so a chunked /healthkit/sync body is counted and
+# rejected before Starlette buffers it. Path-scoped: POST /food/photo
+# sends base64 images and must not inherit this ceiling.
+app.add_middleware(HealthKitSyncBodyLimitMiddleware)
 
 
 @app.exception_handler(db.DatabaseUnavailableError)

@@ -98,8 +98,14 @@ owner. Alongside the single-column foreign keys, `author_sessions` carries
 `UNIQUE (id, user_id)` and `author_captures`, `author_draft_versions`, and
 `author_flags` each carry a composite
 `FOREIGN KEY (session_id, user_id) REFERENCES author_sessions (id, user_id)
-ON DELETE CASCADE`. No route can produce a mismatched pair, and now neither can
-a hand-written `INSERT`.
+ON DELETE CASCADE`. `author_flags` also carries `UNIQUE (id, user_id)`, and
+`author_flag_decisions` carries
+`FOREIGN KEY (flag_id, user_id) REFERENCES author_flags (id, user_id)
+ON DELETE CASCADE`, so a decision cannot claim a different owner than its flag.
+`derived_from_version_id` / `resulting_draft_version_id` stay single-column
+`SET NULL` pointers — they are same-user version chains, not owner keys.
+No route can produce a mismatched pair, and now neither can a hand-written
+`INSERT`. There is no delete-capture endpoint.
 
 Draft versions are append-only too. Accepting or editing a flag never rewrites
 the version it was raised against — it inserts the next version with

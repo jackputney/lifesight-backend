@@ -48,6 +48,17 @@ soon as the server passes the cap, without walking the rest of the list — spli
 larger uploads client-side and send them sequentially. Nothing from a rejected
 batch is written.
 
+Independently, `POST /healthkit/sync` has a **2 MiB** request-body ceiling
+(`HEALTHKIT_SYNC_MAX_BODY_BYTES` = 2097152). A realistic 1000-sample batch is
+well under 1 MB; 2 MiB is headroom for a max legal batch and far below a
+multi-megabyte / hundreds-of-thousands-of-samples attack. An oversized
+`Content-Length` is rejected as **413** without reading the body. A missing or
+chunked `Content-Length` is counted as bytes arrive and aborted as **413** as
+soon as the ceiling is exceeded — the route, Pydantic, and `json` parser never
+run. An invalid `Content-Length` is **400**. 413/400 responses do not echo the
+request body. This guard is path-scoped to `POST /healthkit/sync` only
+(`POST /food/photo` sends base64 images and is not under this ceiling).
+
 Request:
 
 ```json
@@ -180,7 +191,9 @@ payload is **not** echoed back in the error.
 
 | Status | When |
 |--------|--------|
+| 400 | Invalid `Content-Length` header on `POST /healthkit/sync` |
 | 401 | missing, malformed, or expired bearer token. `{"detail": "Missing bearer token"}` or `{"detail": "Invalid or expired token"}` |
+| 413 | Request body over **2 MiB** (`HEALTHKIT_SYNC_MAX_BODY_BYTES` = 2097152), whether declared in `Content-Length` or streamed without one. The route is not invoked |
 | 422 | any whole-batch failure from the list above — including **more than 1000 samples**. Nothing is written; split the batch |
 | 503 | database temporarily unavailable: `{"detail": "Database temporarily unavailable"}` (backend-wide handler) |
 

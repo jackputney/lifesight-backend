@@ -77,9 +77,28 @@ INTERRUPTED_SUFFIX = "[Interrupted by the user before this reply finished.]"
 # Live /chat/stream sockets per user, so one client cannot open an unbounded
 # number of Anthropic + ElevenLabs streams. In-memory and per-process by
 # design: a single-process deployment with a single event loop, so no lock is
-# needed and the count resets on restart.
-MAX_CONNECTIONS_PER_USER = 4
+# needed and the count resets on restart. This is NOT a distributed cap
+# across Railway replicas — each process has its own dict.
+_DEFAULT_MAX_CONNECTIONS_PER_USER = 4
+_MAX_CONNECTIONS_CLAMP = (1, 16)
 OPEN_CONNECTIONS_PER_USER: dict[str, int] = {}
+
+
+def _max_connections_per_user() -> int:
+    raw = os.environ.get("CHAT_STREAM_MAX_CONNECTIONS_PER_USER")
+    if raw is None or raw.strip() == "":
+        return _DEFAULT_MAX_CONNECTIONS_PER_USER
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_MAX_CONNECTIONS_PER_USER
+    lo, hi = _MAX_CONNECTIONS_CLAMP
+    return max(lo, min(hi, value))
+
+
+# Documented iOS contract default. Live cap may be raised/lowered via
+# CHAT_STREAM_MAX_CONNECTIONS_PER_USER (clamped 1–16); default stays 4.
+MAX_CONNECTIONS_PER_USER = _max_connections_per_user()
 
 # Private-use close code (RFC 6455 §7.4.2) for a rejected connection over the
 # per-user cap. Documented in docs/STREAMING_VOICE_V1_CONTRACT.md §1.2.
@@ -111,14 +130,18 @@ async def chat_stream(
                 reason="Too many concurrent streaming connections",
             )
         return
-    connection = _Connection(websocket, user_id)
+    # Register first, then construct+run inside the same finally so a
+    # _Connection() constructor failure cannot leak a slot.
+    connection = None
     try:
+        connection = _Connection(websocket, user_id)
         await connection.run()
     finally:
         # The slot is freed only once this socket's turn is torn down, so a
         # reconnecting client can never briefly exceed the cap.
         try:
-            await connection.shutdown()
+            if connection is not None:
+                await connection.shutdown()
         finally:
             _release_connection(user_id)
 
@@ -906,9 +929,14 @@ def _http_error_code(status_code: int) -> str:
 
 
 def _register_connection(user_id: str) -> bool:
-    """Claim one of this user's connection slots. False means over the cap."""
+    """Claim one of this user's connection slots. False means over the cap.
+
+    get-then-set is safe inside one process: there is no await between them,
+    so a single event loop cannot interleave two increments. Not a
+    distributed lock — do not introduce Redis for V1.
+    """
     live = OPEN_CONNECTIONS_PER_USER.get(user_id, 0)
-    if live >= MAX_CONNECTIONS_PER_USER:
+    if live >= _max_connections_per_user():
         return False
     OPEN_CONNECTIONS_PER_USER[user_id] = live + 1
     return True

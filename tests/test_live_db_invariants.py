@@ -141,6 +141,36 @@ class LiveDatabaseInvariantTests(unittest.TestCase):
             )
         )
 
+    async def _new_draft(self, session_id: str, user_id: str = USER_A) -> str:
+        return str(
+            await self.conn.fetchval(
+                """
+                INSERT INTO author_draft_versions
+                    (session_id, user_id, version, refinement_level, content,
+                     source_capture_from, source_capture_to)
+                VALUES ($1::uuid, $2::uuid, 1, 'preserve_voice', 'cleaned up', 0, 0)
+                RETURNING id
+                """,
+                session_id,
+                user_id,
+            )
+        )
+
+    async def _new_flag(self, session_id: str, draft_id: str, user_id: str = USER_A) -> str:
+        return str(
+            await self.conn.fetchval(
+                """
+                INSERT INTO author_flags
+                    (session_id, draft_version_id, user_id, category, explanation)
+                VALUES ($1::uuid, $2::uuid, $3::uuid, 'typo', 'a possible typo')
+                RETURNING id
+                """,
+                session_id,
+                draft_id,
+                user_id,
+            )
+        )
+
     # -- author captures are append-only ---------------------------------
 
     def test_direct_update_of_a_raw_capture_is_rejected(self):
@@ -190,13 +220,80 @@ class LiveDatabaseInvariantTests(unittest.TestCase):
                 )
             )
             await self._new_capture(session_id, doomed)
+            draft_id = await self._new_draft(session_id, doomed)
+            await self._new_flag(session_id, draft_id, doomed)
+
+            b_session = await self._new_session(USER_B)
+            b_capture = await self._new_capture(b_session, USER_B)
+            b_draft = await self._new_draft(b_session, USER_B)
+            b_flag = await self._new_flag(b_session, b_draft, USER_B)
 
             await self.conn.execute("DELETE FROM users WHERE id = $1::uuid", doomed)
 
-            remaining = await self.conn.fetchval(
-                "SELECT COUNT(*) FROM author_captures WHERE user_id = $1::uuid", doomed
+            for table in (
+                "author_captures",
+                "author_draft_versions",
+                "author_flags",
+                "author_sessions",
+            ):
+                remaining = await self.conn.fetchval(
+                    f"SELECT COUNT(*) FROM {table} WHERE user_id = $1::uuid", doomed
+                )
+                self.assertEqual(int(remaining), 0, f"{table} still has doomed-user rows")
+
+            self.assertEqual(
+                int(
+                    await self.conn.fetchval(
+                        "SELECT COUNT(*) FROM author_sessions WHERE id = $1::uuid",
+                        b_session,
+                    )
+                ),
+                1,
             )
-            self.assertEqual(int(remaining), 0)
+            self.assertEqual(
+                int(
+                    await self.conn.fetchval(
+                        "SELECT COUNT(*) FROM author_captures WHERE id = $1::uuid",
+                        b_capture,
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(
+                int(
+                    await self.conn.fetchval(
+                        "SELECT COUNT(*) FROM author_draft_versions WHERE id = $1::uuid",
+                        b_draft,
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(
+                int(
+                    await self.conn.fetchval(
+                        "SELECT COUNT(*) FROM author_flags WHERE id = $1::uuid",
+                        b_flag,
+                    )
+                ),
+                1,
+            )
+
+        self.run_async(go())
+
+    def test_a_flag_decision_cannot_claim_a_different_owner_than_its_flag(self):
+        async def go():
+            session_id = await self._new_session(USER_A)
+            draft_id = await self._new_draft(session_id, USER_A)
+            flag_id = await self._new_flag(session_id, draft_id, USER_A)
+            with self.assertRaises(self.asyncpg.exceptions.ForeignKeyViolationError):
+                await self.conn.execute(
+                    """
+                    INSERT INTO author_flag_decisions (flag_id, user_id, decision)
+                    VALUES ($1::uuid, $2::uuid, 'reject')
+                    """,
+                    flag_id,
+                    USER_B,
+                )
 
         self.run_async(go())
 

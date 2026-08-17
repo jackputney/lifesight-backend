@@ -31,6 +31,8 @@ from routers.chat_stream import (
     WS_CLOSE_TOO_MANY_CONNECTIONS,
     _http_error_code,
     _persist_tool_round,
+    _register_connection,
+    _release_connection,
     _TurnVoice,
 )
 from shared import db
@@ -1875,6 +1877,42 @@ class StreamingChatRouteTests(unittest.TestCase):
             {},
             "closed connections must free their slot",
         )
+
+    def test_an_exception_in_connection_run_still_releases_the_slot(self):
+        with _env():
+            with patch(
+                "routers.chat_stream._Connection.run",
+                new=AsyncMock(side_effect=RuntimeError("forced stream failure")),
+            ):
+                with self._client() as client:
+                    try:
+                        with client.websocket_connect("/chat/stream"):
+                            pass
+                    except Exception:
+                        pass
+        self.assertEqual(OPEN_CONNECTIONS_PER_USER, {})
+
+    def test_user_a_cap_does_not_consume_user_b_quota(self):
+        user_a = "aaaaaaaa-0000-4000-8000-0000000000aa"
+        user_b = "bbbbbbbb-0000-4000-8000-0000000000bb"
+        OPEN_CONNECTIONS_PER_USER.clear()
+        try:
+            for _ in range(MAX_CONNECTIONS_PER_USER):
+                self.assertTrue(_register_connection(user_a))
+            self.assertFalse(_register_connection(user_a))
+            self.assertTrue(
+                _register_connection(user_b),
+                "user B must still have a free slot when A is at the cap",
+            )
+            self.assertEqual(
+                OPEN_CONNECTIONS_PER_USER.get(user_a), MAX_CONNECTIONS_PER_USER
+            )
+            self.assertEqual(OPEN_CONNECTIONS_PER_USER.get(user_b), 1)
+        finally:
+            _release_connection(user_b)
+            for _ in range(MAX_CONNECTIONS_PER_USER):
+                _release_connection(user_a)
+            OPEN_CONNECTIONS_PER_USER.clear()
 
     def test_new_user_turn_barges_in_on_an_active_turn(self):
         slow = self._slow_stream()

@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from shared.health import store as health_store
 from shared.health.service import (
+    HEALTHKIT_SYNC_MAX_BODY_BYTES,
     MAX_HEALTH_CONTEXT_CHARS,
     MAX_SYNC_BATCH,
     BatchTooLargeError,
@@ -25,6 +26,7 @@ from shared.health.service import (
     normalize_terra_metrics,
     terra_external_id,
 )
+from shared.request_limits import HealthKitSyncBodyLimitMiddleware
 from shared.health.tools import run_get_recent_health_data
 from shared.health.types import ACCEPTED_UNITS, CANONICAL_UNITS, SAMPLE_TYPES
 from shared.local_auth.store import use_memory_store
@@ -152,10 +154,13 @@ class ContractDocTests(unittest.TestCase):
         self.assertIn(
             f"| samples | required array, **{MAX_SYNC_BATCH} items max**", self.doc
         )
-        # The cap is enforced by the request model now, so it is a 422. The doc
-        # must not still promise a 400 for an oversized batch.
-        self.assertNotIn("| 400 |", self.doc)
+        # The sample-count cap is a 422. 400 is reserved for an invalid
+        # Content-Length; 413 is the 2 MiB body ceiling.
         self.assertIn("**422, not 400**", self.doc)
+        self.assertIn("| 400 |", self.doc)
+        self.assertIn("| 413 |", self.doc)
+        self.assertIn("2 MiB", self.doc)
+        self.assertIn(str(HEALTHKIT_SYNC_MAX_BODY_BYTES), self.doc)
 
     def test_doc_states_the_real_terra_id_length(self):
         digest = terra_external_id(
@@ -658,6 +663,300 @@ class TerraIngestIdempotencyTests(unittest.TestCase):
         self.assertEqual(replay_written, 0)
         self.assertEqual(replay_ignored, 2)
         self.assertEqual(len(health_store._memory.samples), 1)
+
+
+class _ProbeApp:
+    """Inner ASGI app that records whether it was invoked."""
+
+    def __init__(self):
+        self.called = False
+        self.bodies: list[bytes] = []
+
+    async def __call__(self, scope, receive, send):
+        self.called = True
+        message = await receive()
+        self.bodies.append(message.get("body", b""))
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b'{"ok":true}'})
+
+
+def _run_asgi(app, method, path, headers, chunks):
+    """Drive a raw ASGI HTTP request; return (status, body_bytes)."""
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers],
+        "client": ("127.0.0.1", 123),
+        "server": ("test", 80),
+    }
+    queue = list(chunks)
+    status_holder = {"status": None, "body": b""}
+
+    async def receive():
+        if queue:
+            body, more = queue.pop(0)
+            return {"type": "http.request", "body": body, "more_body": more}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            status_holder["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            status_holder["body"] += message.get("body", b"")
+
+    asyncio.run(app(scope, receive, send))
+    return status_holder["status"], status_holder["body"]
+
+
+class HealthKitBodyLimitMiddlewareTests(unittest.TestCase):
+    """Prove the ASGI guard rejects before the inner app / JSON parser runs."""
+
+    MARKER = b"SECRET_BODY_MARKER_SHOULD_NOT_ECHO"
+
+    def _wrapped(self):
+        inner = _ProbeApp()
+        return HealthKitSyncBodyLimitMiddleware(inner), inner
+
+    def test_oversized_content_length_is_413_and_never_calls_the_app(self):
+        wrapped, inner = self._wrapped()
+        with patch("json.loads") as loads:
+            status, body = _run_asgi(
+                wrapped,
+                "POST",
+                "/healthkit/sync",
+                [
+                    ("content-length", str(HEALTHKIT_SYNC_MAX_BODY_BYTES + 1)),
+                    ("content-type", "application/json"),
+                ],
+                [(self.MARKER, False)],
+            )
+        self.assertEqual(status, 413)
+        self.assertFalse(inner.called)
+        loads.assert_not_called()
+        self.assertNotIn(self.MARKER, body)
+
+    def test_invalid_content_length_is_400_and_does_not_echo_the_body(self):
+        wrapped, inner = self._wrapped()
+        status, body = _run_asgi(
+            wrapped,
+            "POST",
+            "/healthkit/sync",
+            [("content-length", "not-a-number"), ("content-type", "application/json")],
+            [(self.MARKER, False)],
+        )
+        self.assertEqual(status, 400)
+        self.assertFalse(inner.called)
+        self.assertNotIn(self.MARKER, body)
+
+    def test_chunked_body_over_the_ceiling_is_413_without_calling_the_app(self):
+        wrapped, inner = self._wrapped()
+        chunk = b"x" * (HEALTHKIT_SYNC_MAX_BODY_BYTES // 2 + 1)
+        with patch("json.loads") as loads:
+            status, body = _run_asgi(
+                wrapped,
+                "POST",
+                "/healthkit/sync",
+                [("content-type", "application/json")],
+                [(self.MARKER + chunk, True), (chunk, False)],
+            )
+        self.assertEqual(status, 413)
+        self.assertFalse(inner.called)
+        loads.assert_not_called()
+        self.assertNotIn(self.MARKER, body)
+
+    def test_body_just_under_the_ceiling_is_forwarded(self):
+        wrapped, inner = self._wrapped()
+        payload = b"y" * HEALTHKIT_SYNC_MAX_BODY_BYTES
+        status, _body = _run_asgi(
+            wrapped,
+            "POST",
+            "/healthkit/sync",
+            [("content-type", "application/json")],
+            [(payload, False)],
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(inner.called)
+        self.assertEqual(inner.bodies, [payload])
+
+    def test_guard_is_path_scoped_so_chat_is_not_limited(self):
+        wrapped, inner = self._wrapped()
+        huge = b"z" * (HEALTHKIT_SYNC_MAX_BODY_BYTES + 4096)
+        status, _body = _run_asgi(
+            wrapped,
+            "POST",
+            "/chat",
+            [("content-type", "application/json")],
+            [(huge, False)],
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(inner.called)
+
+    def test_websocket_scopes_pass_through_untouched(self):
+        seen = {"called": False}
+
+        async def inner(scope, receive, send):
+            seen["called"] = True
+            self.assertEqual(scope["type"], "websocket")
+
+        wrapped = HealthKitSyncBodyLimitMiddleware(inner)
+        asyncio.run(wrapped({"type": "websocket", "path": "/chat/stream"}, None, None))
+        self.assertTrue(seen["called"])
+
+
+class HealthKitSyncBodyLimitRouteTests(unittest.TestCase):
+    """TestClient proofs: 413 before parse, small sync still works, path-scoped."""
+
+    def setUp(self):
+        use_memory_store(True)
+        health_store.use_memory_store(True)
+        self._pool_init = patch("shared.db.init_pool", new_callable=AsyncMock)
+        self._pool_close = patch("shared.db.close_pool", new_callable=AsyncMock)
+        self._pool_init.start()
+        self._pool_close.start()
+        self.addCleanup(self._pool_init.stop)
+        self.addCleanup(self._pool_close.stop)
+        self.addCleanup(lambda: use_memory_store(False))
+        self.addCleanup(lambda: health_store.use_memory_store(False))
+
+    def _client(self):
+        from main import app
+        from routers.healthkit import router as healthkit_router
+
+        if not any(
+            getattr(route, "path", "").startswith("/healthkit") for route in app.routes
+        ):
+            app.include_router(healthkit_router)
+        return TestClient(app)
+
+    def _register(self, client, username: str, password: str = "password123"):  # pragma: allowlist secret
+        return client.post(
+            "/auth/register",
+            json={"username": username, "password": password},
+        )
+
+    def _auth(self, token: str) -> dict:
+        return {"Authorization": f"Bearer {token}"}
+
+    def _two_users(self, client):
+        a = self._register(client, "limit_a").json()
+        b = self._register(client, "limit_b").json()
+        return a["access_token"], b["access_token"]
+
+    def _sample(self, **overrides) -> dict:
+        start = datetime.now(timezone.utc) - timedelta(hours=1)
+        sample = {
+            "sample_id": "sample-1",
+            "type": "heart_rate",
+            "start_at": _iso(start),
+            "end_at": _iso(start),
+            "value": 62.0,
+            "unit": "count/min",
+            "source_bundle": "com.apple.health",
+            "source_name": "Test Watch",
+        }
+        sample.update(overrides)
+        return sample
+
+    def test_huge_content_length_is_413_and_pydantic_never_runs(self):
+        with _env():
+            with self._client() as client:
+                token, _ = self._two_users(client)
+                h = self._auth(token)
+                marker = "SECRET_BODY_MARKER_SHOULD_NOT_ECHO"
+                oversized = (
+                    marker.encode("utf-8")
+                    + b"x" * (HEALTHKIT_SYNC_MAX_BODY_BYTES + 1 - len(marker))
+                )
+                with patch("json.loads") as loads:
+                    with patch(
+                        "routers.healthkit.HealthKitSyncRequest.model_validate"
+                    ) as validate:
+                        response = client.post(
+                            "/healthkit/sync",
+                            headers={
+                                **h,
+                                "Content-Type": "application/json",
+                                "Content-Length": str(len(oversized)),
+                            },
+                            content=oversized,
+                        )
+                self.assertEqual(response.status_code, 413, response.text[:300])
+                validate.assert_not_called()
+                loads.assert_not_called()
+                self.assertNotIn(marker, response.text)
+
+    def test_chunked_oversize_body_is_413_without_parsing(self):
+        with _env():
+            with self._client() as client:
+                token, _ = self._two_users(client)
+                h = self._auth(token)
+                marker = b"SECRET_BODY_MARKER_SHOULD_NOT_ECHO"
+
+                def gen():
+                    yield marker
+                    yield b"x" * (HEALTHKIT_SYNC_MAX_BODY_BYTES // 2)
+                    yield b"x" * (HEALTHKIT_SYNC_MAX_BODY_BYTES // 2 + 1)
+
+                with patch("json.loads") as loads:
+                    with patch(
+                        "routers.healthkit.HealthKitSyncRequest.model_validate"
+                    ) as validate:
+                        response = client.post(
+                            "/healthkit/sync",
+                            headers={**h, "Content-Type": "application/json"},
+                            content=gen(),
+                        )
+                self.assertEqual(response.status_code, 413, response.text[:300])
+                validate.assert_not_called()
+                loads.assert_not_called()
+                self.assertNotIn(marker.decode("ascii"), response.text)
+
+    def test_body_just_under_the_ceiling_with_one_sample_still_syncs(self):
+        with _env():
+            with self._client() as client:
+                token, _ = self._two_users(client)
+                h = self._auth(token)
+                sample = self._sample(sample_id="under-ceiling")
+                skeleton = json.dumps({"samples": [sample], "pad": ""})
+                pad = HEALTHKIT_SYNC_MAX_BODY_BYTES - len(skeleton.encode("utf-8")) - 2
+                self.assertGreater(pad, 0)
+                payload = json.dumps({"samples": [sample], "pad": "x" * pad})
+                self.assertLessEqual(len(payload.encode("utf-8")), HEALTHKIT_SYNC_MAX_BODY_BYTES)
+                response = client.post(
+                    "/healthkit/sync",
+                    headers={**h, "Content-Type": "application/json"},
+                    content=payload.encode("utf-8"),
+                )
+                self.assertEqual(response.status_code, 200, response.text[:300])
+                self.assertEqual(response.json()["accepted"], 1)
+
+    def test_ordinary_json_route_is_not_blocked_by_the_healthkit_ceiling(self):
+        with _env():
+            with self._client() as client:
+                # Larger than a one-sample HealthKit payload; far under 2 MiB.
+                padding = "n" * 8000
+                response = client.post(
+                    "/auth/register",
+                    json={
+                        "username": "ordinary_json_user",
+                        "password": "password123",  # pragma: allowlist secret
+                        "display_name": padding,
+                    },
+                )
+                self.assertNotEqual(response.status_code, 413, response.text[:300])
+                self.assertEqual(response.status_code, 200, response.text[:300])
 
 
 if __name__ == "__main__":

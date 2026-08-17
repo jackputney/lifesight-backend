@@ -34,6 +34,7 @@ MAX_OUTPUT_TOKENS = 8192
 # is a 413 with the actual numbers, never a silent upstream call.
 MAX_REFINE_CAPTURES = 500
 MAX_REFINE_PROMPT_CHARS = 120_000
+AUTHOR_REFINE_MAX_CHARS = MAX_REFINE_PROMPT_CHARS
 
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 

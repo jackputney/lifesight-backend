@@ -22,6 +22,14 @@ from shared.health.types import (
 )
 
 MAX_SYNC_BATCH = 1000
+# MAX_SYNC_BATCH = 1000. A realistic sample JSON object is well under 1 KB
+# (id, type, two timestamps, value, unit, source). Worst-case with every
+# string at its Field max_length is still well under ~1 MB for 1000 samples:
+#   sample_id 200 + type 64 + start/end 64+64 + unit 32 + value_text 120
+#   + source_bundle 200 + source_name 200 + JSON keys/punctuation ≈ 1 KB
+#   → ~1 MB for the array, plus wrapper. 2 MiB is enough headroom for a
+#   max legal batch and far below a 42 MB / 300k-sample attack.
+HEALTHKIT_SYNC_MAX_BODY_BYTES = 2 * 1024 * 1024
 STATUS_WINDOW_DAYS = 30
 
 MAX_CONTEXT_DAYS = 30
@@ -320,6 +328,7 @@ async def build_health_context(user_id: str, sample_types: list[str], days: int)
 
 __all__ = [
     "BatchTooLargeError",
+    "HEALTHKIT_SYNC_MAX_BODY_BYTES",
     "MAX_HEALTH_CONTEXT_CHARS",
     "MAX_SYNC_BATCH",
     "NO_DIAGNOSIS_NOTE",

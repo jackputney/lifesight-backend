@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from shared import db
+from shared.ids import normalized_uuid
 
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 100
@@ -27,25 +28,6 @@ class ConflictError(Exception):
     def __init__(self, current: dict):
         self.current = current
         super().__init__("Document revision conflict")
-
-
-def normalized_uuid(value: Any) -> Optional[str]:
-    """Canonical UUID string, or None when the value is not a UUID at all.
-
-    Path parameters arrive as arbitrary strings. Without this guard a malformed
-    id reaches a `$1::uuid` bind, asyncpg raises DataError, and the request 500s
-    instead of taking the ordinary 404 path. Deliberately duplicated in
-    shared/author_pipeline/store.py rather than shared between the two author
-    surfaces, which otherwise import nothing from each other.
-    """
-    if isinstance(value, uuid.UUID):
-        return str(value)
-    if not isinstance(value, str):
-        return None
-    try:
-        return str(uuid.UUID(value))
-    except ValueError:
-        return None
 
 
 def clamp_pagination(limit: Optional[int], offset: Optional[int]) -> tuple[int, int]:

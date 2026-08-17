@@ -23,6 +23,7 @@ from typing import Any, Optional
 import asyncpg
 
 from shared import db
+from shared.ids import normalized_uuid
 
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 100
@@ -30,6 +31,7 @@ MAX_PAGE_LIMIT = 100
 # One dictation chunk. Generous for a long spoken paragraph, small enough that no
 # single request can bloat the table or the refine prompt on its own.
 MAX_CAPTURE_CHARS = 20_000
+AUTHOR_CAPTURE_MAX_CHARS = MAX_CAPTURE_CHARS
 
 # Concurrent appends in separate transactions can read the same MAX(sequence)
 # under READ COMMITTED and one loses the UNIQUE (session_id, sequence) race.
@@ -69,25 +71,6 @@ DECISION_STATUS = {
 
 class CaptureSequenceContention(Exception):
     """Every sequence-allocation attempt lost the UNIQUE (session_id, sequence) race."""
-
-
-def normalized_uuid(value: Any) -> Optional[str]:
-    """Canonical UUID string, or None when the value is not a UUID at all.
-
-    Path parameters arrive as arbitrary strings. Without this guard a malformed
-    id reaches a `$1::uuid` bind, asyncpg raises DataError, and the request 500s
-    instead of taking the ordinary 404 path. Deliberately duplicated in
-    shared/author_persistence/store.py rather than shared between the two author
-    surfaces, which otherwise import nothing from each other.
-    """
-    if isinstance(value, uuid.UUID):
-        return str(value)
-    if not isinstance(value, str):
-        return None
-    try:
-        return str(uuid.UUID(value))
-    except ValueError:
-        return None
 
 
 def clamp_pagination(limit: Optional[int], offset: Optional[int]) -> tuple[int, int]:
@@ -701,6 +684,10 @@ async def create_refinement(
 
     Captures are untouched: this only ever inserts derivative rows.
     """
+    session_id = normalized_uuid(session_id)
+    if session_id is None:
+        raise ValueError("session_id is not a UUID")
+
     if _mem() is not None:
         version = _memory_insert_version(
             session_id,

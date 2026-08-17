@@ -210,6 +210,26 @@ BEGIN
             FOREIGN KEY (session_id, user_id)
             REFERENCES author_sessions (id, user_id) ON DELETE CASCADE;
     END IF;
+
+    -- A decision row's user_id must match the flag it decides. Without a
+    -- composite FK, INSERT could file user B's decision against user A's flag.
+    -- derived_from_version_id / resulting_draft_version_id stay single-column
+    -- SET NULL pointers: they are same-user version chains, not owner keys.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'author_flags_id_user_uidx'
+    ) THEN
+        ALTER TABLE author_flags
+            ADD CONSTRAINT author_flags_id_user_uidx UNIQUE (id, user_id);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'author_flag_decisions_flag_user_fkey'
+    ) THEN
+        ALTER TABLE author_flag_decisions
+            ADD CONSTRAINT author_flag_decisions_flag_user_fkey
+            FOREIGN KEY (flag_id, user_id)
+            REFERENCES author_flags (id, user_id) ON DELETE CASCADE;
+    END IF;
 END;
 $$;
 

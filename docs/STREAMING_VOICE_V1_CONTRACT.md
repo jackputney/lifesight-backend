@@ -47,6 +47,12 @@ Each user may hold **at most 4** concurrent `/chat/stream` sockets. Every socket
 carries its own model stream and TTS session, so the cap is a resource guard,
 not a product rule — one socket per foreground app is the intended usage.
 
+This is a **per-process V1 limit**, not a global distributed rate limit. Each
+Railway replica (if more than one is ever run) keeps its own in-memory count;
+the cap does not coordinate across processes. Override with
+`CHAT_STREAM_MAX_CONNECTIONS_PER_USER` (integer, clamped 1–16; default **4** so
+the iOS contract does not silently change).
+
 A connection over the cap is accepted and then immediately closed; it never
 receives an `error` frame.
 

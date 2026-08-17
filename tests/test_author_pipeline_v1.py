@@ -811,6 +811,15 @@ class AuthorPipelineTests(unittest.TestCase):
                 self.assertEqual(owned.json()["conversation_id"], convo_a)
                 self.assertEqual(owned.json()["manuscript_id"], manuscript_a)
 
+                both_null = client.post(
+                    "/author/sessions",
+                    headers=ha,
+                    json={"conversation_id": None, "manuscript_id": None},
+                )
+                self.assertEqual(both_null.status_code, 200, both_null.text[:200])
+                self.assertIsNone(both_null.json()["conversation_id"])
+                self.assertIsNone(both_null.json()["manuscript_id"])
+
                 for body in (
                     {"conversation_id": convo_b},
                     {"conversation_id": str(uuid.uuid4())},
@@ -827,8 +836,8 @@ class AuthorPipelineTests(unittest.TestCase):
                     malformed = client.post("/author/sessions", headers=ha, json=body)
                     self.assertEqual(malformed.status_code, 400, malformed.text[:200])
 
-                # Only the bookkeeping session and the validated one were stored.
-                self.assertEqual(client.get("/author/sessions", headers=ha).json()["total"], 2)
+                # Bookkeeping + owned + explicit-null sessions.
+                self.assertEqual(client.get("/author/sessions", headers=ha).json()["total"], 3)
 
     # -- session lifecycle ---------------------------------------------------
 
@@ -1133,6 +1142,15 @@ class CaptureSequenceRetryTests(unittest.TestCase):
 
 class RefinePromptBudgetTests(unittest.TestCase):
     """One /refine call has a hard ceiling on how much it can send upstream."""
+
+    def test_reviewer_alias_names_match_the_ceilings(self):
+        self.assertEqual(
+            pipeline_store.AUTHOR_CAPTURE_MAX_CHARS, pipeline_store.MAX_CAPTURE_CHARS
+        )
+        self.assertEqual(
+            pipeline_refine.AUTHOR_REFINE_MAX_CHARS,
+            pipeline_refine.MAX_REFINE_PROMPT_CHARS,
+        )
 
     def _captures(self, count: int, chars: int) -> list[dict]:
         return [

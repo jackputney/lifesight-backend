@@ -26,7 +26,10 @@ The model must never silently modify its own system prompt.
 
 The database enforces the parts that matter, so a bug in either repo cannot
 bypass them: an immutability trigger, a reviewer-required CHECK, and a
-one-pending-proposal partial unique index (sections 4–6).
+one-pending-proposal partial unique index (sections 4–6). Application store
+functions (`get_summary`, `list_summaries`, `get_proposal`,
+`list_pending_proposals`) always filter by `user_id`; a second user's reads
+do not return another user's rows.
 
 ---
 
